@@ -6,6 +6,7 @@ pub(crate) fn get_main_list_model() -> SingleMainListModel {
         filled_header_row: false,
         header_row: false,
         focused_row: false,
+        thumbnail: Default::default(),
         val_int: Default::default(),
         val_str: Default::default(),
     }

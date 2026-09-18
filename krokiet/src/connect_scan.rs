@@ -24,7 +24,7 @@ use crossbeam_channel::Sender;
 use czkawka_core::common::progress_data::ProgressData;
 use czkawka_core::common::tool_data::CommonData;
 use czkawka_core::helpers::messages::MessageLimit;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Image, ModelRc, SharedString, VecModel};
 
 use crate::audio_player::AudioPlayer;
 use crate::common::{check_if_all_included_dirs_are_referenced, check_if_there_are_any_included_folders};
@@ -148,12 +148,28 @@ fn reset_selection_at_end(app: &MainWindow, active_tab: ActiveTab) {
     set_number_of_enabled_items(app, active_tab, 0);
 }
 
-fn insert_data_to_model(items: &Rc<VecModel<SingleMainListModel>>, data_model_str: ModelRc<SharedString>, data_model_int: ModelRc<i32>, filled_header_row: Option<bool>) {
+fn insert_data_to_model(
+    items: &Rc<VecModel<SingleMainListModel>>,
+    data_model_str: ModelRc<SharedString>,
+    data_model_int: ModelRc<i32>,
+    filled_header_row: Option<bool>,
+) {
+    insert_data_to_model_with_thumbnail(items, data_model_str, data_model_int, Image::default(), filled_header_row);
+}
+
+fn insert_data_to_model_with_thumbnail(
+    items: &Rc<VecModel<SingleMainListModel>>,
+    data_model_str: ModelRc<SharedString>,
+    data_model_int: ModelRc<i32>,
+    thumbnail: Image,
+    filled_header_row: Option<bool>,
+) {
     let main = SingleMainListModel {
         checked: false,
         header_row: filled_header_row.is_some(),
         filled_header_row: filled_header_row.unwrap_or(false),
         focused_row: false,
+        thumbnail,
         val_str: ModelRc::new(data_model_str),
         val_int: ModelRc::new(data_model_int),
     };
