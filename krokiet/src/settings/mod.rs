@@ -625,7 +625,7 @@ pub(crate) fn set_settings_to_gui(app: &MainWindow, custom_settings: &SettingsCu
     };
 
     if base_settings.settings_load_tabs_sizes_at_startup {
-        settings.set_duplicates_column_size(fnm(&[sel_px, size_px, name_px, path_px, mod_px], "duplicates"));
+        settings.set_duplicates_column_size(fnm(&[sel_px, size_px, name_px, path_px, 85.0, mod_px], "duplicates"));
         settings.set_empty_folders_column_size(fnm(&[sel_px, name_px, path_px, mod_px], "empty_folders"));
         settings.set_empty_files_column_size(fnm(&[sel_px, size_px, name_px, path_px, mod_px], "empty_files"));
         settings.set_temporary_files_column_size(fnm(&[sel_px, size_px, name_px, path_px, mod_px], "temporary_files"));

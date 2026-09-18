@@ -509,7 +509,7 @@ fn translate_items(app: &MainWindow) {
         ModelRc::new(VecModel::from(shared_string))
     };
 
-    settings.set_duplicates_column_name(fnm(&[&selection, &size, &file_name, &path, &mod_date]));
+    settings.set_duplicates_column_name(fnm(&[&selection, &size, &file_name, &path, &duration,&mod_date]));
     settings.set_empty_folders_column_name(fnm(&[&selection, &file_name, &path, &mod_date]));
     settings.set_empty_files_column_name(fnm(&[&selection, &size, &file_name, &path, &mod_date]));
     settings.set_temporary_files_column_name(fnm(&[&selection, &size, &file_name, &path, &mod_date]));
