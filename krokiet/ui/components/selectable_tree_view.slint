@@ -193,7 +193,12 @@ export component SelectableTableView inherits Rectangle {
                         }
 
                         for f[idx] in r.val_str: Text {
-                            width: root.column_sizes[idx + 1 + (root.thumbnailColumnIdx == 1 ? 1 : 0)];
+                            // previewImageIdx is backing data for the right-side preview,
+                            // not a visible table column.
+                            visible: idx != root.previewImageIdx;
+                            width: idx == root.previewImageIdx
+                                ? 0px
+                                : root.column_sizes[idx + 1 + (root.thumbnailColumnIdx == 1 ? 1 : 0)];
                             text: f;
                             font-size: FontSizes.normal;
                             vertical-alignment: center;

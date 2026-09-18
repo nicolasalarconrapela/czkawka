@@ -30,6 +30,7 @@ use crate::{ActiveTab, GuiState, MainWindow, flk};
 struct VideoRowData {
     duration_seconds: i32,
     thumbnail: Option<SharedPixelBuffer<Rgb8Pixel>>,
+    thumbnail_path: Option<PathBuf>,
 }
 
 pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
@@ -149,16 +150,16 @@ fn write_duplicate_results(
     let items = Rc::new(VecModel::default());
     for (ref_fe, vec_fe) in vector.into_iter().rev() {
         if let Some(ref_fe) = ref_fe {
-            let (duration_seconds, thumbnail) = video_data_for_entry(&video_data, &ref_fe);
-            let (data_model_str, data_model_int) = prepare_data_model_duplicates(ref_fe, duration_seconds);
+            let (duration_seconds, thumbnail, preview_path) = video_data_for_entry(&video_data, &ref_fe);
+            let (data_model_str, data_model_int) = prepare_data_model_duplicates(ref_fe, duration_seconds, &preview_path);
             insert_data_to_model_with_thumbnail(&items, data_model_str, data_model_int, thumbnail, Some(true));
         } else {
             insert_data_to_model(&items, ModelRc::new(VecModel::default()), ModelRc::new(VecModel::default()), Some(false));
         }
 
         for fe in vec_fe {
-            let (duration_seconds, thumbnail) = video_data_for_entry(&video_data, &fe);
-            let (data_model_str, data_model_int) = prepare_data_model_duplicates(fe, duration_seconds);
+            let (duration_seconds, thumbnail, preview_path) = video_data_for_entry(&video_data, &fe);
+            let (data_model_str, data_model_int) = prepare_data_model_duplicates(fe, duration_seconds, &preview_path);
             insert_data_to_model_with_thumbnail(&items, data_model_str, data_model_int, thumbnail, None);
         }
     }
@@ -193,7 +194,7 @@ fn write_duplicate_results(
     app.global::<GuiState>().set_info_text(messages_data.messages.into());
     reset_selection_at_end(app, ActiveTab::DuplicateFiles);
 }
-fn prepare_data_model_duplicates(fe: DuplicateEntry, duration_seconds: i32) -> (ModelRc<SharedString>, ModelRc<i32>) {
+fn prepare_data_model_duplicates(fe: DuplicateEntry, duration_seconds: i32, preview_path: &str) -> (ModelRc<SharedString>, ModelRc<i32>) {
     let (directory, file) = split_path(fe.get_path());
 
     let duration_text = if duration_seconds >= 0 {
@@ -208,6 +209,7 @@ fn prepare_data_model_duplicates(fe: DuplicateEntry, duration_seconds: i32) -> (
         directory.into(),
         duration_text.into(),
         get_dt_timestamp_string(fe.get_modified_date()).into(),
+        preview_path.into(),
     ];
     let data_model_str = VecModel::from_slice(&data_model_str_arr);
     let modification_split = split_u64_into_i32s(fe.get_modified_date());
@@ -307,28 +309,29 @@ fn build_video_row_data(
         .map(|seconds| seconds.round() as i32)
         .unwrap_or(-1);
 
-    let thumbnail = thumbnails_dir
-        .and_then(|dir| {
-            generate_thumbnail(
-                stop_flag,
-                entry.get_path(),
-                entry.size,
-                entry.get_modified_date(),
-                duration,
-                dir,
-                thumbnail_percentage,
-                false,
-                2,
-                true,
-            )
-            .ok()
-            .flatten()
-        })
-        .and_then(|thumbnail_path| load_thumbnail_buffer(&thumbnail_path));
+    let thumbnail_path = thumbnails_dir.and_then(|dir| {
+        generate_thumbnail(
+            stop_flag,
+            entry.get_path(),
+            entry.size,
+            entry.get_modified_date(),
+            duration,
+            dir,
+            thumbnail_percentage,
+            false,
+            2,
+            true,
+        )
+        .ok()
+        .flatten()
+    });
+
+    let thumbnail = thumbnail_path.as_deref().and_then(load_thumbnail_buffer);
 
     Some(VideoRowData {
         duration_seconds,
         thumbnail,
+        thumbnail_path,
     })
 }
 
@@ -341,13 +344,19 @@ fn load_thumbnail_buffer(path: &Path) -> Option<SharedPixelBuffer<Rgb8Pixel>> {
     Some(buffer)
 }
 
-fn video_data_for_entry(video_data: &HashMap<PathBuf, VideoRowData>, entry: &DuplicateEntry) -> (i32, Image) {
+fn video_data_for_entry(video_data: &HashMap<PathBuf, VideoRowData>, entry: &DuplicateEntry) -> (i32, Image, String) {
     let Some(data) = video_data.get(entry.get_path()) else {
-        return (-1, Image::default());
+        return (-1, Image::default(), String::new());
     };
 
     let thumbnail = data.thumbnail.clone().map(Image::from_rgb8).unwrap_or_default();
-    (data.duration_seconds, thumbnail)
+    let preview_path = data
+        .thumbnail_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    (data.duration_seconds, thumbnail, preview_path)
 }
 
 fn is_video_file(path: &Path) -> bool {

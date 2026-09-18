@@ -15,7 +15,14 @@ pub(crate) fn set_initial_scroll_list_data_indexes(app: &MainWindow) {
     // [Parent Idx, File Name Idx, (Additional)Preview Idx, Rect Left Idx, Width Idx, Height Idx]
     // Preview Idx is set only if there is non-standard preview like video
 
-    let duplicate_data: DataType = [StrDataDuplicateFiles::Path as i32, StrDataDuplicateFiles::Name as i32, -1, -1, -1, -1];
+    let duplicate_data: DataType = [
+        StrDataDuplicateFiles::Path as i32,
+        StrDataDuplicateFiles::Name as i32,
+        StrDataDuplicateFiles::PreviewPath as i32,
+        -1,
+        -1,
+        -1,
+    ];
     gs.set_duplicate_data_idx(create_model_from_model_vec(&duplicate_data));
 
     let empty_folders_data: DataType = [StrDataEmptyFolders::Path as i32, StrDataEmptyFolders::Name as i32, -1, -1, -1, -1];
