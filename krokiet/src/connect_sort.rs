@@ -24,7 +24,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                         .unwrap_or_else(|| panic!("Failed to get str index - {str_idx} on {} items", e.val_str.iter().count()))
                 };
 
-                common_sort_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
             }
             SortIdx::IntIdx(int_idx) => {
                 let sort_function = |e: &SingleMainListModel| {
@@ -34,7 +34,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                         .unwrap_or_else(|| panic!("Failed to get int index - {int_idx} on {} items", e.val_int.iter().count()))
                 };
 
-                common_sort_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
             }
             SortIdx::IntIdxPair(int_idx1, int_idx2) => {
                 let sort_function = |e: &SingleMainListModel| {
@@ -42,7 +42,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                     connect_i32_into_u64(items[int_idx1 as usize], items[int_idx2 as usize])
                 };
 
-                common_sort_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
             }
             SortIdx::Selection => {
                 if sort_column_mode == SortColumnMode::Ascending {
@@ -133,6 +133,46 @@ mod sorts {
 
         common_sort_function(model, active_tab, sort_function, false)
     }
+}
+
+fn sort_column_function<T: Ord>(
+    model: &ModelRc<SingleMainListModel>,
+    active_tab: ActiveTab,
+    sort_function: impl Fn(&SingleMainListModel) -> T,
+    reverse: bool,
+) -> ModelRc<SingleMainListModel> {
+    if matches!(active_tab, ActiveTab::DuplicateFiles) {
+        return sort_duplicate_groups_by_key(model, active_tab, sort_function, reverse);
+    }
+
+    common_sort_function(model, active_tab, sort_function, reverse)
+}
+
+fn sort_duplicate_groups_by_key<T: Ord>(
+    model: &ModelRc<SingleMainListModel>,
+    active_tab: ActiveTab,
+    sort_function: impl Fn(&SingleMainListModel) -> T,
+    reverse: bool,
+) -> ModelRc<SingleMainListModel> {
+    let mut grouped_items = group_by_header(model);
+
+    grouped_items.sort_by_cached_key(|(header, items)| {
+        let representative = if header.filled_header_row {
+            header
+        } else {
+            items.first().expect("Duplicate group must contain at least one item")
+        };
+
+        sort_function(representative)
+    });
+
+    if reverse {
+        grouped_items.reverse();
+    }
+
+    let new_model = convert_group_header_into_rc_model(grouped_items, model.row_count());
+    recalculate_small_selection_if_needed(&new_model, active_tab);
+    new_model
 }
 
 fn common_sort_function<T: Ord>(
