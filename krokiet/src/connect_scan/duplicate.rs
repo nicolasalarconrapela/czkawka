@@ -8,6 +8,7 @@ use std::thread;
 
 use czkawka_core::common::config_cache_path::get_config_cache_path;
 use czkawka_core::common::consts::DEFAULT_THREAD_SIZE;
+use czkawka_core::common::image::{ImgResizeOptions, check_if_can_display_image, get_dynamic_image_from_path};
 use czkawka_core::common::model::CheckingMethod;
 use czkawka_core::common::tool_data::CommonData;
 use czkawka_core::common::traits::{ResultEntry, Search};
@@ -15,6 +16,7 @@ use czkawka_core::common::video_utils::{VIDEO_THUMBNAILS_SUBFOLDER, VideoMetadat
 use czkawka_core::common::{format_time, split_path, split_path_compare};
 use czkawka_core::tools::duplicate;
 use czkawka_core::tools::duplicate::{DuplicateEntry, DuplicateFinder, DuplicateFinderParameters};
+use czkawka_core::re_exported::FirFilterType;
 use humansize::{BINARY, format_size};
 use rayon::prelude::*;
 use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel, Weak};
@@ -27,7 +29,7 @@ use crate::connect_scan::{
 use crate::{ActiveTab, GuiState, MainWindow, flk};
 
 #[derive(Clone)]
-struct VideoRowData {
+struct MediaRowData {
     duration_seconds: i32,
     thumbnail: Option<SharedPixelBuffer<Rgb8Pixel>>,
     thumbnail_path: Option<PathBuf>,
@@ -99,15 +101,15 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
                 vec.par_sort_unstable_by(|a, b| split_path_compare(a.path.as_path(), b.path.as_path()));
             }
 
-            // Read video metadata and build small thumbnails while we are still on
+            // Read media metadata and build small thumbnails while we are still on
             // the worker thread. Slint Image itself is not Send, so we keep the
             // thumbnails as SharedPixelBuffer here and turn them into Image objects
             // only after returning to the UI event loop.
             //
-            // Hash groups are byte-identical: one metadata/thumbnail extraction is
+            // Hash groups are byte-identical: one thumbnail decode/generation is
             // reused for every copy in the group. Name/Size/SizeName groups are not
-            // guaranteed to be identical, so those videos are handled individually.
-            let video_data = collect_video_data(
+            // guaranteed to be identical, so every media file is handled individually.
+            let media_data = collect_media_data(
                 &vector,
                 check_method,
                 &sd.stop_flag,
@@ -128,7 +130,7 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
             let messages_data = MessagesData { critical, messages };
 
             a.upgrade_in_event_loop(move |app| {
-                write_duplicate_results(&app, vector, video_data, messages_data, info, sd, stopped_search, duplicates_number, groups_number, lost_space);
+                write_duplicate_results(&app, vector, media_data, messages_data, info, sd, stopped_search, duplicates_number, groups_number, lost_space);
             })
         })
         .expect("Cannot start thread - not much we can do here");
@@ -136,7 +138,7 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
 fn write_duplicate_results(
     app: &MainWindow,
     vector: Vec<(Option<DuplicateEntry>, Vec<DuplicateEntry>)>,
-    video_data: HashMap<PathBuf, VideoRowData>,
+    media_data: HashMap<PathBuf, MediaRowData>,
     messages_data: MessagesData,
     info: duplicate::Info,
     sd: ScanData,
@@ -150,7 +152,7 @@ fn write_duplicate_results(
     let items = Rc::new(VecModel::default());
     for (ref_fe, vec_fe) in vector.into_iter().rev() {
         if let Some(ref_fe) = ref_fe {
-            let (duration_seconds, thumbnail, preview_path) = video_data_for_entry(&video_data, &ref_fe);
+            let (duration_seconds, thumbnail, preview_path) = media_data_for_entry(&media_data, &ref_fe);
             let (data_model_str, data_model_int) = prepare_data_model_duplicates(ref_fe, duration_seconds, &preview_path);
             insert_data_to_model_with_thumbnail(&items, data_model_str, data_model_int, thumbnail, Some(true));
         } else {
@@ -158,7 +160,7 @@ fn write_duplicate_results(
         }
 
         for fe in vec_fe {
-            let (duration_seconds, thumbnail, preview_path) = video_data_for_entry(&video_data, &fe);
+            let (duration_seconds, thumbnail, preview_path) = media_data_for_entry(&media_data, &fe);
             let (data_model_str, data_model_int) = prepare_data_model_duplicates(fe, duration_seconds, &preview_path);
             insert_data_to_model_with_thumbnail(&items, data_model_str, data_model_int, thumbnail, None);
         }
@@ -219,12 +221,12 @@ fn prepare_data_model_duplicates(fe: DuplicateEntry, duration_seconds: i32, prev
     (data_model_str, data_model_int)
 }
 
-fn collect_video_data(
+fn collect_media_data(
     groups: &[(Option<DuplicateEntry>, Vec<DuplicateEntry>)],
     checking_method: CheckingMethod,
     stop_flag: &Arc<AtomicBool>,
     thumbnail_percentage: u8,
-) -> HashMap<PathBuf, VideoRowData> {
+) -> HashMap<PathBuf, MediaRowData> {
     let mut result = HashMap::new();
     let thumbnail_percentage = thumbnail_percentage.clamp(1, 99);
 
@@ -240,7 +242,7 @@ fn collect_video_data(
                 continue;
             };
 
-            let Some(data) = build_video_row_data(
+            let Some(data) = build_media_row_data(
                 probe_entry,
                 stop_flag,
                 thumbnails_dir.as_deref(),
@@ -249,15 +251,24 @@ fn collect_video_data(
                 continue;
             };
 
+            // Videos reuse the generated cached JPEG for the whole byte-identical
+            // group. Images reuse the decoded 96x54 buffer, but every row keeps its
+            // own original file path for the right-side preview.
             if let Some(reference) = reference {
-                result.insert(reference.get_path().to_path_buf(), data.clone());
+                result.insert(
+                    reference.get_path().to_path_buf(),
+                    data_for_group_entry(&data, reference.get_path()),
+                );
             }
             for entry in entries {
-                result.insert(entry.get_path().to_path_buf(), data.clone());
+                result.insert(
+                    entry.get_path().to_path_buf(),
+                    data_for_group_entry(&data, entry.get_path()),
+                );
             }
         } else {
             if let Some(reference) = reference {
-                insert_video_row_data(
+                insert_media_row_data(
                     &mut result,
                     reference,
                     stop_flag,
@@ -267,7 +278,7 @@ fn collect_video_data(
             }
 
             for entry in entries {
-                insert_video_row_data(
+                insert_media_row_data(
                     &mut result,
                     entry,
                     stop_flag,
@@ -281,16 +292,39 @@ fn collect_video_data(
     result
 }
 
-fn insert_video_row_data(
-    result: &mut HashMap<PathBuf, VideoRowData>,
+fn data_for_group_entry(data: &MediaRowData, entry_path: &Path) -> MediaRowData {
+    let mut data = data.clone();
+    if data.duration_seconds < 0 {
+        // An image preview should point to the row that was actually selected,
+        // even though the 96x54 thumbnail buffer is shared inside a Hash group.
+        data.thumbnail_path = Some(entry_path.to_path_buf());
+    }
+    data
+}
+
+fn insert_media_row_data(
+    result: &mut HashMap<PathBuf, MediaRowData>,
     entry: &DuplicateEntry,
     stop_flag: &Arc<AtomicBool>,
     thumbnails_dir: Option<&Path>,
     thumbnail_percentage: u8,
 ) {
-    if let Some(data) = build_video_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage) {
+    if let Some(data) = build_media_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage) {
         result.insert(entry.get_path().to_path_buf(), data);
     }
+}
+
+fn build_media_row_data(
+    entry: &DuplicateEntry,
+    stop_flag: &Arc<AtomicBool>,
+    thumbnails_dir: Option<&Path>,
+    thumbnail_percentage: u8,
+) -> Option<MediaRowData> {
+    if is_video_file(entry.get_path()) {
+        return build_video_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage);
+    }
+
+    build_image_row_data(entry)
 }
 
 fn build_video_row_data(
@@ -298,11 +332,7 @@ fn build_video_row_data(
     stop_flag: &Arc<AtomicBool>,
     thumbnails_dir: Option<&Path>,
     thumbnail_percentage: u8,
-) -> Option<VideoRowData> {
-    if !is_video_file(entry.get_path()) {
-        return None;
-    }
-
+) -> Option<MediaRowData> {
     let duration = VideoMetadata::from_path(entry.get_path()).ok().and_then(|metadata| metadata.duration);
     let duration_seconds = duration
         .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= i32::MAX as f64)
@@ -328,10 +358,39 @@ fn build_video_row_data(
 
     let thumbnail = thumbnail_path.as_deref().and_then(load_thumbnail_buffer);
 
-    Some(VideoRowData {
+    Some(MediaRowData {
         duration_seconds,
         thumbnail,
         thumbnail_path,
+    })
+}
+
+fn build_image_row_data(entry: &DuplicateEntry) -> Option<MediaRowData> {
+    let path = entry.get_path();
+    let path_string = path.to_string_lossy();
+
+    if !check_if_can_display_image(path_string.as_ref()) {
+        return None;
+    }
+
+    let loaded = get_dynamic_image_from_path(
+        path_string.as_ref(),
+        Some(ImgResizeOptions {
+            max_width: 96,
+            max_height: 54,
+            filter: FirFilterType::Bilinear,
+        }),
+    )
+    .ok()?;
+
+    let image = loaded.image.to_rgb8();
+    let mut buffer = SharedPixelBuffer::<Rgb8Pixel>::new(image.width(), image.height());
+    buffer.make_mut_bytes().copy_from_slice(image.as_raw());
+
+    Some(MediaRowData {
+        duration_seconds: -1,
+        thumbnail: Some(buffer),
+        thumbnail_path: Some(path.to_path_buf()),
     })
 }
 
@@ -344,8 +403,8 @@ fn load_thumbnail_buffer(path: &Path) -> Option<SharedPixelBuffer<Rgb8Pixel>> {
     Some(buffer)
 }
 
-fn video_data_for_entry(video_data: &HashMap<PathBuf, VideoRowData>, entry: &DuplicateEntry) -> (i32, Image, String) {
-    let Some(data) = video_data.get(entry.get_path()) else {
+fn media_data_for_entry(media_data: &HashMap<PathBuf, MediaRowData>, entry: &DuplicateEntry) -> (i32, Image, String) {
+    let Some(data) = media_data.get(entry.get_path()) else {
         return (-1, Image::default(), String::new());
     };
 
