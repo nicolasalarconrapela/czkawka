@@ -74,8 +74,11 @@ export component SelectableTableView inherits Rectangle {
             HorizontalLayout {
                 spacing: 5px;
                 for title[idx] in root.columns: HorizontalLayout {
+                    // In Slint, `visible: false` does not collapse the item from a layout.
+                    // Give hidden optional columns zero width too, otherwise their old
+                    // width remains reserved in the header and the rows become misaligned.
                     visible: root.isColumnVisible(idx);
-                    width: root.column_sizes[idx];
+                    width: root.isColumnVisible(idx) ? root.column_sizes[idx] : 0px;
 
                     TouchArea {
                         pointer-event(event) => {
