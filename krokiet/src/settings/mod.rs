@@ -445,6 +445,7 @@ pub(crate) fn set_settings_to_gui(app: &MainWindow, custom_settings: &SettingsCu
     settings.set_duplicate_image_preview(custom_settings.duplicate_image_preview);
     settings.set_duplicate_show_preview_column(custom_settings.duplicate_show_preview_column);
     settings.set_duplicate_show_duration_column(custom_settings.duplicate_show_duration_column);
+    settings.set_duplicate_group_sorting(custom_settings.duplicate_group_sorting);
     settings.set_duplicate_use_prehash(custom_settings.duplicate_use_prehash);
     settings.set_duplicate_minimal_hash_cache_size(custom_settings.duplicate_minimal_hash_cache_size.to_string().into());
     settings.set_duplicate_minimal_prehash_cache_size(custom_settings.duplicate_minimal_prehash_cache_size.to_string().into());
@@ -714,6 +715,7 @@ pub(crate) fn collect_settings(app: &MainWindow) -> SettingsCustom {
     let duplicate_image_preview = settings.get_duplicate_image_preview();
     let duplicate_show_preview_column = settings.get_duplicate_show_preview_column();
     let duplicate_show_duration_column = settings.get_duplicate_show_duration_column();
+    let duplicate_group_sorting = settings.get_duplicate_group_sorting();
     let duplicate_use_prehash = settings.get_duplicate_use_prehash();
     let duplicate_minimal_hash_cache_size = settings.get_duplicate_minimal_hash_cache_size().parse::<i32>().unwrap_or(DEFAULT_MINIMUM_CACHE_SIZE);
     let duplicate_minimal_prehash_cache_size = settings
@@ -876,6 +878,7 @@ pub(crate) fn collect_settings(app: &MainWindow) -> SettingsCustom {
         duplicate_image_preview,
         duplicate_show_preview_column,
         duplicate_show_duration_column,
+        duplicate_group_sorting,
         duplicate_use_prehash,
         duplicate_minimal_hash_cache_size,
         duplicate_minimal_prehash_cache_size,

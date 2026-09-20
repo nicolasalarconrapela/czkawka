@@ -601,6 +601,11 @@ export component SettingsList inherits VerticalLayout {
                 model <=> Settings.duplicate_show_duration_column;
             }
 
+            CheckBoxComponent {
+                name: "Ordenar grupos completos al ordenar columnas";
+                model <=> Settings.duplicate_group_sorting;
+            }
+
             TextComponent {
                 name <=> Translations.settings_duplicate_minimal_hash_cache_size_text;
                 model <=> Settings.duplicate_minimal_hash_cache_size;
