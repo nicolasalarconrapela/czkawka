@@ -22,6 +22,13 @@ export component SelectableTableView inherits Rectangle {
     // Visual column index (including the selection column) used for an inline thumbnail.
     // -1 keeps the original text-only table behaviour.
     in-out property <int> thumbnailColumnIdx: -1;
+    // Keeps the visual thumbnail column in the model, but allows hiding it without
+    // changing any of the backing val_str/val_int indexes.
+    in-out property <bool> thumbnailColumnVisible: true;
+    // Optional val_str column that may be hidden without changing model indexes.
+    // Duplicate Files uses this for Duration (StrDataDuplicateFiles::Duration == 3).
+    in-out property <int> optionalTextColumnIdx: -1;
+    in-out property <bool> optionalTextColumnVisible: true;
     // Indexes into val_int for top-left crop and original dimensions
     in-out property <int> topLeftCropIdx;
     in-out property <int> originalWidthIdx: -1;
@@ -29,13 +36,33 @@ export component SelectableTableView inherits Rectangle {
     in-out property <int> start_shift_idx: -1;
     in-out property <int> last_selected_idx: -1;
     private property <int> context_menu_row_idx: -1;
-    out property <length> item_height: thumbnailColumnIdx >= 0 ? 58px : 23px;
+    out property <length> item_height: thumbnailColumnIdx >= 0 && thumbnailColumnVisible ? 58px : 23px;
     in-out property <SortColumnMode> sort_column_mode: SortColumnMode.None;
     in-out property <int> sort_column_idx: -1;
     in-out property <bool> sort_available: true;
 
 
-    out property <length> list_view_width: max(self.width - 25px, column_sizes[0] + column_sizes[1] + column_sizes[2] + column_sizes[3] + column_sizes[4] + column_sizes[5] + column_sizes[6] + column_sizes[7] + column_sizes[8] + column_sizes[9] + column_sizes[10] + column_sizes[11] + column_sizes[12]);
+    private property <length> all_column_width: column_sizes[0] + column_sizes[1] + column_sizes[2] + column_sizes[3] + column_sizes[4] + column_sizes[5] + column_sizes[6] + column_sizes[7] + column_sizes[8] + column_sizes[9] + column_sizes[10] + column_sizes[11] + column_sizes[12];
+    private property <int> optionalVisualColumnIdx: optionalTextColumnIdx < 0
+        ? -1
+        : optionalTextColumnIdx + 1 + (thumbnailColumnIdx >= 0 ? 1 : 0);
+    private property <length> hidden_thumbnail_width: thumbnailColumnIdx >= 0 && !thumbnailColumnVisible
+        ? column_sizes[thumbnailColumnIdx]
+        : 0px;
+    private property <length> hidden_optional_width: optionalVisualColumnIdx >= 0 && !optionalTextColumnVisible
+        ? column_sizes[optionalVisualColumnIdx]
+        : 0px;
+    out property <length> list_view_width: max(self.width - 25px, all_column_width - hidden_thumbnail_width - hidden_optional_width);
+
+    function isColumnVisible(idx: int) -> bool {
+        if (idx == root.thumbnailColumnIdx && !root.thumbnailColumnVisible) {
+            return false;
+        }
+        if (idx == root.optionalVisualColumnIdx && !root.optionalTextColumnVisible) {
+            return false;
+        }
+        return true;
+    }
 
     VerticalBox {
         padding: 0px;
@@ -47,6 +74,7 @@ export component SelectableTableView inherits Rectangle {
             HorizontalLayout {
                 spacing: 5px;
                 for title[idx] in root.columns: HorizontalLayout {
+                    visible: root.isColumnVisible(idx);
                     width: root.column_sizes[idx];
 
                     TouchArea {
@@ -185,7 +213,7 @@ export component SelectableTableView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 5px;
 
-                        if root.thumbnailColumnIdx == 1 : Image {
+                        if root.thumbnailColumnIdx == 1 && root.thumbnailColumnVisible : Image {
                             width: root.column_sizes[1];
                             height: parent.height - 4px;
                             source: r.thumbnail;
@@ -194,9 +222,12 @@ export component SelectableTableView inherits Rectangle {
 
                         for f[idx] in r.val_str: Text {
                             // previewImageIdx is backing data for the right-side preview,
-                            // not a visible table column.
-                            visible: idx != root.previewImageIdx;
+                            // not a visible table column. optionalTextColumnIdx remains in
+                            // the model too, so hiding it never shifts any indexes.
+                            visible: idx != root.previewImageIdx
+                                && (idx != root.optionalTextColumnIdx || root.optionalTextColumnVisible);
                             width: idx == root.previewImageIdx
+                                || (idx == root.optionalTextColumnIdx && !root.optionalTextColumnVisible)
                                 ? 0px
                                 : root.column_sizes[idx + 1 + (root.thumbnailColumnIdx == 1 ? 1 : 0)];
                             text: f;

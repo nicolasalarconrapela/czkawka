@@ -32,7 +32,15 @@ use crate::{ActiveTab, GuiState, MainWindow, flk};
 struct MediaRowData {
     duration_seconds: i32,
     thumbnail: Option<SharedPixelBuffer<Rgb8Pixel>>,
-    thumbnail_path: Option<PathBuf>,
+    preview_path: Option<PathBuf>,
+    preview_uses_original_file: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DuplicateMediaOptions {
+    show_preview_column: bool,
+    show_duration_column: bool,
+    show_side_preview: bool,
 }
 
 pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
@@ -109,11 +117,17 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
             // Hash groups are byte-identical: one thumbnail decode/generation is
             // reused for every copy in the group. Name/Size/SizeName groups are not
             // guaranteed to be identical, so every media file is handled individually.
+            let media_options = DuplicateMediaOptions {
+                show_preview_column: sd.custom_settings.duplicate_show_preview_column,
+                show_duration_column: sd.custom_settings.duplicate_show_duration_column,
+                show_side_preview: sd.custom_settings.duplicate_image_preview,
+            };
             let media_data = collect_media_data(
                 &vector,
                 check_method,
                 &sd.stop_flag,
                 sd.custom_settings.video_thumbnails_percentage,
+                media_options,
             );
 
             let info = tool.get_information();
@@ -226,14 +240,25 @@ fn collect_media_data(
     checking_method: CheckingMethod,
     stop_flag: &Arc<AtomicBool>,
     thumbnail_percentage: u8,
+    options: DuplicateMediaOptions,
 ) -> HashMap<PathBuf, MediaRowData> {
     let mut result = HashMap::new();
-    let thumbnail_percentage = thumbnail_percentage.clamp(1, 99);
 
-    let thumbnails_dir = get_config_cache_path().and_then(|config| {
-        let dir = config.cache_folder.join(VIDEO_THUMBNAILS_SUBFOLDER);
-        if fs::create_dir_all(&dir).is_ok() { Some(dir) } else { None }
-    });
+    if !options.show_preview_column && !options.show_duration_column && !options.show_side_preview {
+        return result;
+    }
+
+    let thumbnail_percentage = thumbnail_percentage.clamp(1, 99);
+    let need_video_thumbnail = options.show_preview_column || options.show_side_preview;
+
+    let thumbnails_dir = if need_video_thumbnail {
+        get_config_cache_path().and_then(|config| {
+            let dir = config.cache_folder.join(VIDEO_THUMBNAILS_SUBFOLDER);
+            if fs::create_dir_all(&dir).is_ok() { Some(dir) } else { None }
+        })
+    } else {
+        None
+    };
 
     for (reference, entries) in groups {
         if checking_method == CheckingMethod::Hash {
@@ -247,6 +272,7 @@ fn collect_media_data(
                 stop_flag,
                 thumbnails_dir.as_deref(),
                 thumbnail_percentage,
+                options,
             ) else {
                 continue;
             };
@@ -274,6 +300,7 @@ fn collect_media_data(
                     stop_flag,
                     thumbnails_dir.as_deref(),
                     thumbnail_percentage,
+                    options,
                 );
             }
 
@@ -284,6 +311,7 @@ fn collect_media_data(
                     stop_flag,
                     thumbnails_dir.as_deref(),
                     thumbnail_percentage,
+                    options,
                 );
             }
         }
@@ -294,10 +322,10 @@ fn collect_media_data(
 
 fn data_for_group_entry(data: &MediaRowData, entry_path: &Path) -> MediaRowData {
     let mut data = data.clone();
-    if data.duration_seconds < 0 {
-        // An image preview should point to the row that was actually selected,
-        // even though the 96x54 thumbnail buffer is shared inside a Hash group.
-        data.thumbnail_path = Some(entry_path.to_path_buf());
+    if data.preview_uses_original_file && data.preview_path.is_some() {
+        // Image thumbnails may be shared inside a byte-identical Hash group,
+        // but the right-side preview must point at the row that was selected.
+        data.preview_path = Some(entry_path.to_path_buf());
     }
     data
 }
@@ -308,8 +336,9 @@ fn insert_media_row_data(
     stop_flag: &Arc<AtomicBool>,
     thumbnails_dir: Option<&Path>,
     thumbnail_percentage: u8,
+    options: DuplicateMediaOptions,
 ) {
-    if let Some(data) = build_media_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage) {
+    if let Some(data) = build_media_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage, options) {
         result.insert(entry.get_path().to_path_buf(), data);
     }
 }
@@ -319,12 +348,13 @@ fn build_media_row_data(
     stop_flag: &Arc<AtomicBool>,
     thumbnails_dir: Option<&Path>,
     thumbnail_percentage: u8,
+    options: DuplicateMediaOptions,
 ) -> Option<MediaRowData> {
     if is_video_file(entry.get_path()) {
-        return build_video_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage);
+        return build_video_row_data(entry, stop_flag, thumbnails_dir, thumbnail_percentage, options);
     }
 
-    build_image_row_data(entry)
+    build_image_row_data(entry, options)
 }
 
 fn build_video_row_data(
@@ -332,40 +362,71 @@ fn build_video_row_data(
     stop_flag: &Arc<AtomicBool>,
     thumbnails_dir: Option<&Path>,
     thumbnail_percentage: u8,
+    options: DuplicateMediaOptions,
 ) -> Option<MediaRowData> {
-    let duration = VideoMetadata::from_path(entry.get_path()).ok().and_then(|metadata| metadata.duration);
+    let need_video_thumbnail = options.show_preview_column || options.show_side_preview;
+    let need_duration_metadata = options.show_duration_column || need_video_thumbnail;
+
+    let duration = if need_duration_metadata {
+        VideoMetadata::from_path(entry.get_path()).ok().and_then(|metadata| metadata.duration)
+    } else {
+        None
+    };
+
+    // If metadata was already needed for a thumbnail, keep the duration in the
+    // backing model too. That makes enabling the Duration column after the scan
+    // work without a rescan in the common thumbnail-enabled case.
     let duration_seconds = duration
         .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= i32::MAX as f64)
         .map(|seconds| seconds.round() as i32)
         .unwrap_or(-1);
 
-    let thumbnail_path = thumbnails_dir.and_then(|dir| {
-        generate_thumbnail(
-            stop_flag,
-            entry.get_path(),
-            entry.size,
-            entry.get_modified_date(),
-            duration,
-            dir,
-            thumbnail_percentage,
-            false,
-            2,
-            true,
-        )
-        .ok()
-        .flatten()
-    });
+    let generated_thumbnail_path = if need_video_thumbnail {
+        thumbnails_dir.and_then(|dir| {
+            generate_thumbnail(
+                stop_flag,
+                entry.get_path(),
+                entry.size,
+                entry.get_modified_date(),
+                duration,
+                dir,
+                thumbnail_percentage,
+                false,
+                2,
+                true,
+            )
+            .ok()
+            .flatten()
+        })
+    } else {
+        None
+    };
 
-    let thumbnail = thumbnail_path.as_deref().and_then(load_thumbnail_buffer);
+    let thumbnail = if options.show_preview_column {
+        generated_thumbnail_path.as_deref().and_then(load_thumbnail_buffer)
+    } else {
+        None
+    };
+
+    let preview_path = if options.show_side_preview {
+        generated_thumbnail_path
+    } else {
+        None
+    };
 
     Some(MediaRowData {
         duration_seconds,
         thumbnail,
-        thumbnail_path,
+        preview_path,
+        preview_uses_original_file: false,
     })
 }
 
-fn build_image_row_data(entry: &DuplicateEntry) -> Option<MediaRowData> {
+fn build_image_row_data(entry: &DuplicateEntry, options: DuplicateMediaOptions) -> Option<MediaRowData> {
+    if !options.show_preview_column && !options.show_side_preview {
+        return None;
+    }
+
     let path = entry.get_path();
     let path_string = path.to_string_lossy();
 
@@ -373,24 +434,30 @@ fn build_image_row_data(entry: &DuplicateEntry) -> Option<MediaRowData> {
         return None;
     }
 
-    let loaded = get_dynamic_image_from_path(
-        path_string.as_ref(),
-        Some(ImgResizeOptions {
-            max_width: 96,
-            max_height: 54,
-            filter: FirFilterType::Bilinear,
-        }),
-    )
-    .ok()?;
+    let thumbnail = if options.show_preview_column {
+        let loaded = get_dynamic_image_from_path(
+            path_string.as_ref(),
+            Some(ImgResizeOptions {
+                max_width: 96,
+                max_height: 54,
+                filter: FirFilterType::Bilinear,
+            }),
+        )
+        .ok()?;
 
-    let image = loaded.image.to_rgb8();
-    let mut buffer = SharedPixelBuffer::<Rgb8Pixel>::new(image.width(), image.height());
-    buffer.make_mut_bytes().copy_from_slice(image.as_raw());
+        let image = loaded.image.to_rgb8();
+        let mut buffer = SharedPixelBuffer::<Rgb8Pixel>::new(image.width(), image.height());
+        buffer.make_mut_bytes().copy_from_slice(image.as_raw());
+        Some(buffer)
+    } else {
+        None
+    };
 
     Some(MediaRowData {
         duration_seconds: -1,
-        thumbnail: Some(buffer),
-        thumbnail_path: Some(path.to_path_buf()),
+        thumbnail,
+        preview_path: options.show_side_preview.then(|| path.to_path_buf()),
+        preview_uses_original_file: true,
     })
 }
 
@@ -410,7 +477,7 @@ fn media_data_for_entry(media_data: &HashMap<PathBuf, MediaRowData>, entry: &Dup
 
     let thumbnail = data.thumbnail.clone().map(Image::from_rgb8).unwrap_or_default();
     let preview_path = data
-        .thumbnail_path
+        .preview_path
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();

@@ -591,6 +591,15 @@ export component SettingsList inherits VerticalLayout {
                 model <=> Settings.duplicate_image_preview;
             }
 
+            CheckBoxComponent {
+                name: "Mostrar columna de vista previa";
+                model <=> Settings.duplicate_show_preview_column;
+            }
+
+            CheckBoxComponent {
+                name: "Mostrar columna de duración";
+                model <=> Settings.duplicate_show_duration_column;
+            }
 
             TextComponent {
                 name <=> Translations.settings_duplicate_minimal_hash_cache_size_text;

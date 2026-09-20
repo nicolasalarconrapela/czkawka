@@ -73,6 +73,10 @@ pub struct SettingsCustom {
     #[serde(default = "ttrue")]
     pub duplicate_image_preview: bool,
     #[serde(default = "ttrue")]
+    pub duplicate_show_preview_column: bool,
+    #[serde(default = "ttrue")]
+    pub duplicate_show_duration_column: bool,
+    #[serde(default = "ttrue")]
     pub duplicate_use_prehash: bool,
     #[serde(default = "minimal_hash_cache_size")]
     pub duplicate_minimal_hash_cache_size: i32,
