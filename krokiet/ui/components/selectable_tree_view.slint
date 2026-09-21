@@ -8,10 +8,10 @@ import { PopupContextMenu } from "popup_context_menu.slint";
 export component SelectableTableView inherits Rectangle {
     in property <[string]> columns;
     in-out property <[SingleMainListModel]> values: [
-        {checked: false, focused_row: false, header_row: true, filled_header_row: false, val_str: ["kropkarz", "/Xd1", "24.10.2023"], val_int: []} ,
-        {checked: false, focused_row: false, header_row: false, filled_header_row: false, val_str: ["witasphere", "/Xd1/Imagerren2", "25.11.1991"], val_int: []} ,
-        {checked: false, focused_row: false, header_row: false, filled_header_row: false, val_str: ["witasphere", "/Xd1/Imagerren2", "25.11.1991"], val_int: []} ,
-        {checked: true, focused_row: false, header_row: false, filled_header_row: false, val_str: ["lokkaler", "/Xd1/Vide2", "01.23.1911"], val_int: []}
+        {checked: false, focused_row: false, header_row: true, filled_header_row: false, thumbnail: @image-url(""), val_str: ["kropkarz", "/Xd1", "24.10.2023"], val_int: []} ,
+        {checked: false, focused_row: false, header_row: false, filled_header_row: false, thumbnail: @image-url(""), val_str: ["witasphere", "/Xd1/Imagerren2", "25.11.1991"], val_int: []} ,
+        {checked: false, focused_row: false, header_row: false, filled_header_row: false, thumbnail: @image-url(""), val_str: ["witasphere", "/Xd1/Imagerren2", "25.11.1991"], val_int: []} ,
+        {checked: true, focused_row: false, header_row: false, filled_header_row: false, thumbnail: @image-url(""), val_str: ["lokkaler", "/Xd1/Vide2", "01.23.1911"], val_int: []}
     ];
     in-out property <[length]> column_sizes: [30px, 80px, 150px, 160px];
     private property <int> column_number: column_sizes.length + 1;
@@ -19,6 +19,9 @@ export component SelectableTableView inherits Rectangle {
     in-out property <int> parentPathIdx;
     in-out property <int> fileNameIdx;
     in-out property <int> previewImageIdx;
+    // Visual column index (including the selection column) used for an inline thumbnail.
+    // -1 keeps the original text-only table behaviour.
+    in-out property <int> thumbnailColumnIdx: -1;
     // Indexes into val_int for top-left crop and original dimensions
     in-out property <int> topLeftCropIdx;
     in-out property <int> originalWidthIdx: -1;
@@ -26,7 +29,7 @@ export component SelectableTableView inherits Rectangle {
     in-out property <int> start_shift_idx: -1;
     in-out property <int> last_selected_idx: -1;
     private property <int> context_menu_row_idx: -1;
-    out property <length> item_height: 23px;
+    out property <length> item_height: thumbnailColumnIdx >= 0 ? 58px : 23px;
     in-out property <SortColumnMode> sort_column_mode: SortColumnMode.None;
     in-out property <int> sort_column_idx: -1;
     in-out property <bool> sort_available: true;
@@ -48,8 +51,8 @@ export component SelectableTableView inherits Rectangle {
 
                     TouchArea {
                         pointer-event(event) => {
-                            if (!sort_available) {
-                                return; // TODO - this probably should be relaxed - it should be available to sort, lists that are not processing e.g. during duplicate scan, sorting empty folders should be possible
+                            if (!sort_available || idx == root.thumbnailColumnIdx) {
+                                return; // Thumbnail has no sortable backing value.
                             }
                             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
                                 // Clicked at header column, and already there was sorting in this column
@@ -65,7 +68,11 @@ export component SelectableTableView inherits Rectangle {
 
                                 sort_column_idx = idx;
 
-                                Callabler.change_sort_column_mode(sort_column_mode, idx);
+                                // The thumbnail is a visual-only column and is not present in val_str/val_int.
+                                // Translate the visible column index back to the model column index.
+                                Callabler.change_sort_column_mode(sort_column_mode,
+                                    root.thumbnailColumnIdx >= 0 && idx > root.thumbnailColumnIdx ? idx - 1 : idx
+                                );
                             }
                         }
                         Text {
@@ -177,8 +184,21 @@ export component SelectableTableView inherits Rectangle {
 
                     HorizontalLayout {
                         spacing: 5px;
+
+                        if root.thumbnailColumnIdx == 1 : Image {
+                            width: root.column_sizes[1];
+                            height: parent.height - 4px;
+                            source: r.thumbnail;
+                            image-fit: ImageFit.contain;
+                        }
+
                         for f[idx] in r.val_str: Text {
-                            width: root.column_sizes[idx + 1];
+                            // previewImageIdx is backing data for the right-side preview,
+                            // not a visible table column.
+                            visible: idx != root.previewImageIdx;
+                            width: idx == root.previewImageIdx
+                                ? 0px
+                                : root.column_sizes[idx + 1 + (root.thumbnailColumnIdx == 1 ? 1 : 0)];
                             text: f;
                             font-size: FontSizes.normal;
                             vertical-alignment: center;

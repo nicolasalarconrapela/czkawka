@@ -1,4 +1,4 @@
-use slint::{Model, ModelRc, SharedString, VecModel};
+use slint::{Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
 use crate::SingleMainListModel;
 use crate::common::connect_i32_into_u64;
@@ -11,6 +11,9 @@ pub struct SimplerSingleMainListModel {
     pub focused_row: bool,
     pub val_int: Vec<i32>,
     pub val_str: Vec<String>,
+    // Keep a Send + Sync representation of the inline thumbnail while file
+    // operations temporarily convert the Slint model into the simpler model.
+    pub thumbnail: Option<SharedPixelBuffer<Rgb8Pixel>>,
 }
 
 impl SimplerSingleMainListModel {
@@ -37,6 +40,7 @@ impl From<&SingleMainListModel> for SimplerSingleMainListModel {
             focused_row: model.focused_row,
             val_int: model.val_int.iter().collect(),
             val_str: model.val_str.iter().map(|e| e.to_string()).collect(),
+            thumbnail: model.thumbnail.to_rgb8(),
         }
     }
 }
@@ -49,6 +53,7 @@ impl From<SimplerSingleMainListModel> for SingleMainListModel {
             focused_row: val.focused_row,
             val_int: ModelRc::new(VecModel::from(val.val_int)),
             val_str: ModelRc::new(VecModel::from(val.val_str.into_iter().map(|s| s.into()).collect::<Vec<SharedString>>())),
+            thumbnail: val.thumbnail.map(Image::from_rgb8).unwrap_or_default(),
         }
     }
 }
