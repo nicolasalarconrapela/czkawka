@@ -453,6 +453,7 @@ mod tests {
             filled_header_row: false,
             header_row: false,
             focused_row: false,
+            thumbnail: Default::default(),
             val_str: ModelRc::new(VecModel::from(val_str.iter().map(|s| SharedString::from(*s)).collect::<Vec<_>>())),
             val_int: ModelRc::new(VecModel::from(val_int.to_vec())),
         }
@@ -473,16 +474,19 @@ mod tests {
             SharedString::from(size_str.as_str()),
             SharedString::from(name),
             SharedString::from(path),
+            SharedString::from("-"), // Duration
             SharedString::from(mod_str.as_str()),
+            SharedString::from(""), // PreviewPath
         ];
         let (sz1, sz2) = split_u64_into_i32s(size_bytes);
         let (md1, md2) = split_u64_into_i32s(mod_ts);
-        let val_int: [i32; MAX_INT_DATA_DUPLICATE_FILES] = [md1, md2, sz1, sz2];
+        let val_int: [i32; MAX_INT_DATA_DUPLICATE_FILES] = [md1, md2, sz1, sz2, -1];
         SingleMainListModel {
             checked: false,
             filled_header_row: false,
             header_row: false,
             focused_row: false,
+            thumbnail: Default::default(),
             val_str: ModelRc::new(VecModel::from(val_str.to_vec())),
             val_int: ModelRc::new(VecModel::from(val_int.to_vec())),
         }
