@@ -257,6 +257,21 @@ mod tests {
     use crate::test_common::get_model_vec;
     use crate::{ActiveTab, SingleMainListModel};
 
+    fn assert_main_list_model_eq(actual: &SingleMainListModel, expected: &SingleMainListModel) {
+        assert_eq!(actual.checked, expected.checked);
+        assert_eq!(actual.filled_header_row, expected.filled_header_row);
+        assert_eq!(actual.focused_row, expected.focused_row);
+        assert_eq!(actual.header_row, expected.header_row);
+        assert_eq!(
+            actual.val_int.iter().collect::<Vec<_>>(),
+            expected.val_int.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual.val_str.iter().collect::<Vec<_>>(),
+            expected.val_str.iter().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn group_by_header_splits_items_into_groups_correctly() {
         initialize_selection_struct();
@@ -272,14 +287,14 @@ mod tests {
         let grouped = group_by_header(&model);
 
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[0].0, model.row_data(0).unwrap());
+        assert_main_list_model_eq(&grouped[0].0, &model.row_data(0).unwrap());
         assert_eq!(grouped[0].1.len(), 2);
-        assert_eq!(grouped[0].1[0], model.row_data(1).unwrap());
-        assert_eq!(grouped[0].1[1], model.row_data(2).unwrap());
-        assert_eq!(grouped[1].0, model.row_data(3).unwrap());
+        assert_main_list_model_eq(&grouped[0].1[0], &model.row_data(1).unwrap());
+        assert_main_list_model_eq(&grouped[0].1[1], &model.row_data(2).unwrap());
+        assert_main_list_model_eq(&grouped[1].0, &model.row_data(3).unwrap());
         assert_eq!(grouped[1].1.len(), 2);
-        assert_eq!(grouped[1].1[0], model.row_data(4).unwrap());
-        assert_eq!(grouped[1].1[1], model.row_data(5).unwrap());
+        assert_main_list_model_eq(&grouped[1].1[0], &model.row_data(4).unwrap());
+        assert_main_list_model_eq(&grouped[1].1[1], &model.row_data(5).unwrap());
     }
 
     #[test]
@@ -337,12 +352,12 @@ mod tests {
         let combined_model = convert_group_header_into_rc_model(grouped, model.len());
 
         assert_eq!(combined_model.row_count(), 6);
-        assert_eq!(combined_model.row_data(0).unwrap(), model[0]);
-        assert_eq!(combined_model.row_data(1).unwrap(), model[1]);
-        assert_eq!(combined_model.row_data(2).unwrap(), model[2]);
-        assert_eq!(combined_model.row_data(3).unwrap(), model[3]);
-        assert_eq!(combined_model.row_data(4).unwrap(), model[4]);
-        assert_eq!(combined_model.row_data(5).unwrap(), model[5]);
+        assert_main_list_model_eq(&combined_model.row_data(0).unwrap(), &model[0]);
+        assert_main_list_model_eq(&combined_model.row_data(1).unwrap(), &model[1]);
+        assert_main_list_model_eq(&combined_model.row_data(2).unwrap(), &model[2]);
+        assert_main_list_model_eq(&combined_model.row_data(3).unwrap(), &model[3]);
+        assert_main_list_model_eq(&combined_model.row_data(4).unwrap(), &model[4]);
+        assert_main_list_model_eq(&combined_model.row_data(5).unwrap(), &model[5]);
     }
 
     #[test]
