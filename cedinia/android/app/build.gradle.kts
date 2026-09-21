@@ -25,7 +25,7 @@ android {
         targetSdk = 35
         // Increment versionCode for every Play Store upload.
         versionCode = 2
-        versionName = "12.0.7"
+        versionName = "12.0.8"
     }
 
     signingConfigs {
