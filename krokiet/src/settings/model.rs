@@ -70,8 +70,14 @@ pub struct SettingsCustom {
     pub ignore_other_file_systems: bool,
     #[serde(default)]
     pub thread_number: i32,
-    #[serde(default = "ttrue")]
+    #[serde(default)]
     pub duplicate_image_preview: bool,
+    #[serde(default)]
+    pub duplicate_show_preview_column: bool,
+    #[serde(default)]
+    pub duplicate_show_duration_column: bool,
+    #[serde(default)]
+    pub duplicate_group_sorting: bool,
     #[serde(default = "ttrue")]
     pub duplicate_use_prehash: bool,
     #[serde(default = "minimal_hash_cache_size")]

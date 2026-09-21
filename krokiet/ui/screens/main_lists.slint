@@ -53,8 +53,11 @@ export component MainList {
         topLeftCropIdx: GuiState.duplicate_data_idx[3];
         originalWidthIdx: GuiState.duplicate_data_idx[4];
         originalHeightIdx: GuiState.duplicate_data_idx[5];
-        thumbnailColumnIdx: 1;
         sort_available: !working;
+        thumbnailColumnIdx: 1;
+        thumbnailColumnVisible: Settings.duplicate_show_preview_column;
+        optionalTextColumnIdx: 3; // StrDataDuplicateFiles::Duration
+        optionalTextColumnVisible: Settings.duplicate_show_duration_column;
     }
 
     empty_folders := SelectableTableView {

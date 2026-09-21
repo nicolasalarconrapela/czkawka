@@ -443,6 +443,9 @@ pub(crate) fn set_settings_to_gui(app: &MainWindow, custom_settings: &SettingsCu
 
     settings.set_recursive_search(custom_settings.recursive_search);
     settings.set_duplicate_image_preview(custom_settings.duplicate_image_preview);
+    settings.set_duplicate_show_preview_column(custom_settings.duplicate_show_preview_column);
+    settings.set_duplicate_show_duration_column(custom_settings.duplicate_show_duration_column);
+    settings.set_duplicate_group_sorting(custom_settings.duplicate_group_sorting);
     settings.set_duplicate_use_prehash(custom_settings.duplicate_use_prehash);
     settings.set_duplicate_minimal_hash_cache_size(custom_settings.duplicate_minimal_hash_cache_size.to_string().into());
     settings.set_duplicate_minimal_prehash_cache_size(custom_settings.duplicate_minimal_prehash_cache_size.to_string().into());
@@ -614,18 +617,54 @@ pub(crate) fn set_settings_to_gui(app: &MainWindow, custom_settings: &SettingsCu
     let size_px = 75.0;
 
     let fnm = |default_model: &[f32], name: &str| {
-        let model = default_model.iter().map(|s| (*s).clamp(30.0, 2500.0));
-        let model = model
-            .into_iter()
+        let saved = custom_settings.column_sizes.get(name);
+        let model = default_model
+            .iter()
+            .map(|s| (*s).clamp(30.0, 2500.0))
             .enumerate()
-            .map(|(idx, data)| *custom_settings.column_sizes.get(name).cloned().unwrap_or_default().get(idx).unwrap_or(&data))
+            .map(|(idx, data)| {
+                // Duplicate Files gained Duration first and then the visual Preview column.
+                // Migrate older saved width arrays without shifting all following widths.
+                if name == "duplicates" {
+                    if let Some(saved) = saved {
+                        if saved.len() == 6 && default_model.len() == 7 {
+                            // Old layout: Selection, Size, Name, Path, Duration, Modification Date
+                            return match idx {
+                                0 => saved[0],
+                                1 => data, // new Preview column
+                                2 => saved[1],
+                                3 => saved[2],
+                                4 => saved[3],
+                                5 => saved[4],
+                                6 => saved[5],
+                                _ => data,
+                            };
+                        }
+                        if saved.len() == 5 && default_model.len() == 7 {
+                            // Older layout: Selection, Size, Name, Path, Modification Date
+                            return match idx {
+                                0 => saved[0],
+                                1 => data, // new Preview column
+                                2 => saved[1],
+                                3 => saved[2],
+                                4 => saved[3],
+                                5 => data, // new Duration column
+                                6 => saved[4],
+                                _ => data,
+                            };
+                        }
+                    }
+                }
+
+                saved.and_then(|values| values.get(idx)).copied().unwrap_or(data)
+            })
             .collect::<Vec<_>>();
 
         ModelRc::new(VecModel::from(model))
     };
 
     if base_settings.settings_load_tabs_sizes_at_startup {
-        settings.set_duplicates_column_size(fnm(&[sel_px, size_px, name_px, path_px, 85.0, mod_px], "duplicates"));
+        settings.set_duplicates_column_size(fnm(&[sel_px, 110.0, size_px, name_px, path_px, 105.0, mod_px], "duplicates"));
         settings.set_empty_folders_column_size(fnm(&[sel_px, name_px, path_px, mod_px], "empty_folders"));
         settings.set_empty_files_column_size(fnm(&[sel_px, size_px, name_px, path_px, mod_px], "empty_files"));
         settings.set_temporary_files_column_size(fnm(&[sel_px, size_px, name_px, path_px, mod_px], "temporary_files"));
@@ -674,6 +713,9 @@ pub(crate) fn collect_settings(app: &MainWindow) -> SettingsCustom {
     let thread_number = settings.get_thread_number().round() as i32;
 
     let duplicate_image_preview = settings.get_duplicate_image_preview();
+    let duplicate_show_preview_column = settings.get_duplicate_show_preview_column();
+    let duplicate_show_duration_column = settings.get_duplicate_show_duration_column();
+    let duplicate_group_sorting = settings.get_duplicate_group_sorting();
     let duplicate_use_prehash = settings.get_duplicate_use_prehash();
     let duplicate_minimal_hash_cache_size = settings.get_duplicate_minimal_hash_cache_size().parse::<i32>().unwrap_or(DEFAULT_MINIMUM_CACHE_SIZE);
     let duplicate_minimal_prehash_cache_size = settings
@@ -834,6 +876,9 @@ pub(crate) fn collect_settings(app: &MainWindow) -> SettingsCustom {
         ignore_other_file_systems,
         thread_number,
         duplicate_image_preview,
+        duplicate_show_preview_column,
+        duplicate_show_duration_column,
+        duplicate_group_sorting,
         duplicate_use_prehash,
         duplicate_minimal_hash_cache_size,
         duplicate_minimal_prehash_cache_size,

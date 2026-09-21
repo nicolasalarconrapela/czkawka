@@ -5,7 +5,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use crate::common::{SortIdx, connect_i32_into_u64};
 use crate::connect_row_selection::recalculate_small_selection_if_needed;
 use crate::connect_translation::translate_sort_mode;
-use crate::{ActiveTab, Callabler, GuiState, MainWindow, SingleMainListModel, SortColumnMode, SortMode, SortModel};
+use crate::{ActiveTab, Callabler, GuiState, MainWindow, Settings, SingleMainListModel, SortColumnMode, SortMode, SortModel};
 
 pub(crate) fn connect_sort_column(app: &MainWindow) {
     let a = app.as_weak();
@@ -13,6 +13,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
         let app = a.upgrade().expect("Failed to upgrade app :(");
         let active_tab = app.global::<GuiState>().get_active_tab();
         let model = active_tab.get_tool_model(&app);
+        let duplicate_group_sorting = active_tab == ActiveTab::DuplicateFiles && app.global::<Settings>().get_duplicate_group_sorting();
 
         let idx = active_tab.get_str_int_sort_idx(column_idx);
         let new_model = match idx {
@@ -24,7 +25,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                         .unwrap_or_else(|| panic!("Failed to get str index - {str_idx} on {} items", e.val_str.iter().count()))
                 };
 
-                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending, duplicate_group_sorting)
             }
             SortIdx::IntIdx(int_idx) => {
                 let sort_function = |e: &SingleMainListModel| {
@@ -34,7 +35,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                         .unwrap_or_else(|| panic!("Failed to get int index - {int_idx} on {} items", e.val_int.iter().count()))
                 };
 
-                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending, duplicate_group_sorting)
             }
             SortIdx::IntIdxPair(int_idx1, int_idx2) => {
                 let sort_function = |e: &SingleMainListModel| {
@@ -42,7 +43,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                     connect_i32_into_u64(items[int_idx1 as usize], items[int_idx2 as usize])
                 };
 
-                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending, duplicate_group_sorting)
             }
             SortIdx::Selection => {
                 if sort_column_mode == SortColumnMode::Ascending {
@@ -140,8 +141,9 @@ fn sort_column_function<T: Ord>(
     active_tab: ActiveTab,
     sort_function: impl Fn(&SingleMainListModel) -> T,
     reverse: bool,
+    duplicate_group_sorting: bool,
 ) -> ModelRc<SingleMainListModel> {
-    if matches!(active_tab, ActiveTab::DuplicateFiles) {
+    if duplicate_group_sorting {
         return sort_duplicate_groups_by_key(model, active_tab, sort_function, reverse);
     }
 
