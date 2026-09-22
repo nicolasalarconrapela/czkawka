@@ -43,20 +43,6 @@ struct DuplicateMediaOptions {
     show_side_preview: bool,
 }
 
-// TODO(fast-duplicate-engine): temporary legacy production path.
-//
-// The GUI still calls `DuplicateFinder` directly from this file while the new
-// `duplicate_engine` abstraction is validated in parallel. Once the new layer
-// has parity for all Krokiet duplicate settings, reference directories,
-// progress reporting and cancellation, route this scan through
-// `DuplicateEngine` and remove the direct `DuplicateFinder` orchestration from
-// `connect_scan/duplicate.rs`.
-//
-// Do NOT interpret this TODO as a plan to remove `CzkawkaEngine`: that adapter
-// should remain as the reference/fallback engine until the Fast Engine has been
-// proven stable over real datasets and destructive actions are protected by the
-// final exact-verification path.
-
 pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
     thread::Builder::new()
         .stack_size(DEFAULT_THREAD_SIZE)
