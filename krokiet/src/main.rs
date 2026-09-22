@@ -75,6 +75,8 @@ mod connect_stop;
 mod connect_tab_changed;
 mod connect_translation;
 mod create_calculate_task_size;
+#[cfg(any(test, feature = "fast_duplicates"))]
+mod duplicate_engine;
 mod file_actions;
 mod localizer_krokiet;
 mod model_operations;

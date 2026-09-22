@@ -28,6 +28,10 @@ num_enum = "0.7.5"
 regex = "1.11"
 arboard = "3"
 
+# Experimental duplicate engine. Kept optional so normal Krokiet builds do not
+# compile fclones until the fast engine is explicitly enabled.
+fclones = { version = "=0.35.0", default-features = false, optional = true }
+
 # Translations
 i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10"
@@ -57,6 +61,9 @@ slint-build = "=1.17.0"
 [features]
 default = ["winit_femtovg", "winit_software"]
 
+# Experimental side-by-side duplicate engine. It is not wired to the GUI yet.
+fast_duplicates = ["dep:fclones"]
+
 # Audio support
 audio = ["rodio"]
 
@@ -79,6 +86,9 @@ libavif = ["czkawka_core/libavif"]
 # Allows to use trash on Linux when using xdg-portal, needed by e.g. flatpak where normal trash access always fails
 # No-op on other OSes, it is slower and provides less helpful error messages
 xdg_portal_trash = ["czkawka_core/xdg_portal_trash"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
