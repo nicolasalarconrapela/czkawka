@@ -34,7 +34,10 @@ export global Settings {
     in-out property <bool> hide_hard_links: false;
     in-out property <float> thread_number: 4;
 
-    in-out property <bool> duplicate_image_preview;
+    in-out property <bool> duplicate_image_preview: false;
+    in-out property <bool> duplicate_show_preview_column: false;
+    in-out property <bool> duplicate_show_duration_column: false;
+    in-out property <bool> duplicate_group_sorting: false;
     in-out property <bool> duplicate_use_prehash;
     in-out property <string> duplicate_minimal_hash_cache_size;
     in-out property <string> duplicate_minimal_prehash_cache_size;
@@ -291,8 +294,8 @@ export global Settings {
     out property <length> mod_px: 125px;
     out property <length> size_px: 75px;
 
-    in-out property <[string]> duplicates_column_name: ["Selection", "Size", "File Name", "Path", "Modification Date"];
-    in-out property <[length]> duplicates_column_size: [35px, size_px, name_px, path_px, mod_px];
+    in-out property <[string]> duplicates_column_name: ["Selection", "Image Preview", "Size", "File Name", "Path", "Duration", "Modification Date"];
+    in-out property <[length]> duplicates_column_size: [35px, 110px, size_px, name_px, path_px, 105px, mod_px];
     in-out property <[string]> empty_folders_column_name: ["Selection", "Folder Name", "Path", "Modification Date"];
     in-out property <[length]> empty_folders_column_size: [35px, name_px, path_px, mod_px];
     in-out property <[string]> big_files_column_name: ["Selection", "Size", "File Name", "Path", "Modification Date"];

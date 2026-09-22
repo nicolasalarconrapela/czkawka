@@ -18,8 +18,9 @@ pub enum IntDataDuplicateFiles {
     ModificationDatePart2,
     SizePart1,
     SizePart2,
+    Duration,
 }
-pub const MAX_INT_DATA_DUPLICATE_FILES: usize = IntDataDuplicateFiles::SizePart2 as usize + 1;
+pub const MAX_INT_DATA_DUPLICATE_FILES: usize = IntDataDuplicateFiles::Duration as usize + 1;
 
 #[repr(u8)]
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
@@ -27,9 +28,11 @@ pub enum StrDataDuplicateFiles {
     Size,
     Name,
     Path,
+    Duration,
     ModificationDate,
+    PreviewPath,
 }
-pub const MAX_STR_DATA_DUPLICATE_FILES: usize = StrDataDuplicateFiles::ModificationDate as usize + 1;
+pub const MAX_STR_DATA_DUPLICATE_FILES: usize = StrDataDuplicateFiles::PreviewPath as usize + 1;
 
 // Empty Folders
 #[repr(u8)]
@@ -379,6 +382,8 @@ impl ActiveTab {
                     SortIdx::IntIdxPair(IntDataDuplicateFiles::ModificationDatePart1 as i32, IntDataDuplicateFiles::ModificationDatePart2 as i32)
                 }
                 StrDataDuplicateFiles::Size => SortIdx::IntIdxPair(IntDataDuplicateFiles::SizePart1 as i32, IntDataDuplicateFiles::SizePart2 as i32),
+                StrDataDuplicateFiles::Duration => SortIdx::IntIdx(IntDataDuplicateFiles::Duration as i32),
+                StrDataDuplicateFiles::PreviewPath => SortIdx::StrIdx(str_idx),
             },
             Self::BigFiles => match StrDataBigFiles::try_from(str_idx as u8).unwrap_or_else(|_| panic!("Invalid str idx {str_idx} for BigFiles")) {
                 StrDataBigFiles::Name | StrDataBigFiles::Path => SortIdx::StrIdx(str_idx),

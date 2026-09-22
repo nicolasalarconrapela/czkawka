@@ -5,7 +5,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use crate::common::{SortIdx, connect_i32_into_u64};
 use crate::connect_row_selection::recalculate_small_selection_if_needed;
 use crate::connect_translation::translate_sort_mode;
-use crate::{ActiveTab, Callabler, GuiState, MainWindow, SingleMainListModel, SortColumnMode, SortMode, SortModel};
+use crate::{ActiveTab, Callabler, GuiState, MainWindow, Settings, SingleMainListModel, SortColumnMode, SortMode, SortModel};
 
 pub(crate) fn connect_sort_column(app: &MainWindow) {
     let a = app.as_weak();
@@ -13,6 +13,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
         let app = a.upgrade().expect("Failed to upgrade app :(");
         let active_tab = app.global::<GuiState>().get_active_tab();
         let model = active_tab.get_tool_model(&app);
+        let duplicate_group_sorting = active_tab == ActiveTab::DuplicateFiles && app.global::<Settings>().get_duplicate_group_sorting();
 
         let idx = active_tab.get_str_int_sort_idx(column_idx);
         let new_model = match idx {
@@ -24,7 +25,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                         .unwrap_or_else(|| panic!("Failed to get str index - {str_idx} on {} items", e.val_str.iter().count()))
                 };
 
-                common_sort_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending, duplicate_group_sorting)
             }
             SortIdx::IntIdx(int_idx) => {
                 let sort_function = |e: &SingleMainListModel| {
@@ -34,7 +35,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                         .unwrap_or_else(|| panic!("Failed to get int index - {int_idx} on {} items", e.val_int.iter().count()))
                 };
 
-                common_sort_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending, duplicate_group_sorting)
             }
             SortIdx::IntIdxPair(int_idx1, int_idx2) => {
                 let sort_function = |e: &SingleMainListModel| {
@@ -42,7 +43,7 @@ pub(crate) fn connect_sort_column(app: &MainWindow) {
                     connect_i32_into_u64(items[int_idx1 as usize], items[int_idx2 as usize])
                 };
 
-                common_sort_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending)
+                sort_column_function(&model, active_tab, sort_function, sort_column_mode == SortColumnMode::Descending, duplicate_group_sorting)
             }
             SortIdx::Selection => {
                 if sort_column_mode == SortColumnMode::Ascending {
@@ -135,6 +136,47 @@ mod sorts {
     }
 }
 
+fn sort_column_function<T: Ord>(
+    model: &ModelRc<SingleMainListModel>,
+    active_tab: ActiveTab,
+    sort_function: impl Fn(&SingleMainListModel) -> T,
+    reverse: bool,
+    duplicate_group_sorting: bool,
+) -> ModelRc<SingleMainListModel> {
+    if duplicate_group_sorting {
+        return sort_duplicate_groups_by_key(model, active_tab, sort_function, reverse);
+    }
+
+    common_sort_function(model, active_tab, sort_function, reverse)
+}
+
+fn sort_duplicate_groups_by_key<T: Ord>(
+    model: &ModelRc<SingleMainListModel>,
+    active_tab: ActiveTab,
+    sort_function: impl Fn(&SingleMainListModel) -> T,
+    reverse: bool,
+) -> ModelRc<SingleMainListModel> {
+    let mut grouped_items = group_by_header(model);
+
+    grouped_items.sort_by_cached_key(|(header, items)| {
+        let representative = if header.filled_header_row {
+            header
+        } else {
+            items.first().expect("Duplicate group must contain at least one item")
+        };
+
+        sort_function(representative)
+    });
+
+    if reverse {
+        grouped_items.reverse();
+    }
+
+    let new_model = convert_group_header_into_rc_model(grouped_items, model.row_count());
+    recalculate_small_selection_if_needed(&new_model, active_tab);
+    new_model
+}
+
 fn common_sort_function<T: Ord>(
     model: &ModelRc<SingleMainListModel>,
     active_tab: ActiveTab,
@@ -215,6 +257,21 @@ mod tests {
     use crate::test_common::get_model_vec;
     use crate::{ActiveTab, SingleMainListModel};
 
+    fn assert_main_list_model_eq(actual: &SingleMainListModel, expected: &SingleMainListModel) {
+        assert_eq!(actual.checked, expected.checked);
+        assert_eq!(actual.filled_header_row, expected.filled_header_row);
+        assert_eq!(actual.focused_row, expected.focused_row);
+        assert_eq!(actual.header_row, expected.header_row);
+        assert_eq!(
+            actual.val_int.iter().collect::<Vec<_>>(),
+            expected.val_int.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual.val_str.iter().collect::<Vec<_>>(),
+            expected.val_str.iter().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn group_by_header_splits_items_into_groups_correctly() {
         initialize_selection_struct();
@@ -230,14 +287,14 @@ mod tests {
         let grouped = group_by_header(&model);
 
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[0].0, model.row_data(0).unwrap());
+        assert_main_list_model_eq(&grouped[0].0, &model.row_data(0).unwrap());
         assert_eq!(grouped[0].1.len(), 2);
-        assert_eq!(grouped[0].1[0], model.row_data(1).unwrap());
-        assert_eq!(grouped[0].1[1], model.row_data(2).unwrap());
-        assert_eq!(grouped[1].0, model.row_data(3).unwrap());
+        assert_main_list_model_eq(&grouped[0].1[0], &model.row_data(1).unwrap());
+        assert_main_list_model_eq(&grouped[0].1[1], &model.row_data(2).unwrap());
+        assert_main_list_model_eq(&grouped[1].0, &model.row_data(3).unwrap());
         assert_eq!(grouped[1].1.len(), 2);
-        assert_eq!(grouped[1].1[0], model.row_data(4).unwrap());
-        assert_eq!(grouped[1].1[1], model.row_data(5).unwrap());
+        assert_main_list_model_eq(&grouped[1].1[0], &model.row_data(4).unwrap());
+        assert_main_list_model_eq(&grouped[1].1[1], &model.row_data(5).unwrap());
     }
 
     #[test]
@@ -295,12 +352,12 @@ mod tests {
         let combined_model = convert_group_header_into_rc_model(grouped, model.len());
 
         assert_eq!(combined_model.row_count(), 6);
-        assert_eq!(combined_model.row_data(0).unwrap(), model[0]);
-        assert_eq!(combined_model.row_data(1).unwrap(), model[1]);
-        assert_eq!(combined_model.row_data(2).unwrap(), model[2]);
-        assert_eq!(combined_model.row_data(3).unwrap(), model[3]);
-        assert_eq!(combined_model.row_data(4).unwrap(), model[4]);
-        assert_eq!(combined_model.row_data(5).unwrap(), model[5]);
+        assert_main_list_model_eq(&combined_model.row_data(0).unwrap(), &model[0]);
+        assert_main_list_model_eq(&combined_model.row_data(1).unwrap(), &model[1]);
+        assert_main_list_model_eq(&combined_model.row_data(2).unwrap(), &model[2]);
+        assert_main_list_model_eq(&combined_model.row_data(3).unwrap(), &model[3]);
+        assert_main_list_model_eq(&combined_model.row_data(4).unwrap(), &model[4]);
+        assert_main_list_model_eq(&combined_model.row_data(5).unwrap(), &model[5]);
     }
 
     #[test]

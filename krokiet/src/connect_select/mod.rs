@@ -460,11 +460,18 @@ mod tests {
     use crate::test_common::get_model_vec;
 
     // Builds a DuplicateFiles row with the given size encoded in val_int.
-    // IntDataDuplicateFiles layout: [ModDatePart1, ModDatePart2, SizePart1, SizePart2]
+    // IntDataDuplicateFiles layout: [ModDatePart1, ModDatePart2, SizePart1, SizePart2, Duration]
     fn make_item_with_size(size: u64) -> SingleMainListModel {
         let (part1, part2) = split_u64_into_i32s(size);
-        let ints: [i32; MAX_INT_DATA_DUPLICATE_FILES] = [0, 0, part1, part2];
-        let strs: [SharedString; MAX_STR_DATA_DUPLICATE_FILES] = [SharedString::from(""), SharedString::from(""), SharedString::from(""), SharedString::from("")];
+        let ints: [i32; MAX_INT_DATA_DUPLICATE_FILES] = [0, 0, part1, part2, -1];
+        let strs: [SharedString; MAX_STR_DATA_DUPLICATE_FILES] = [
+            SharedString::from(""), // Size
+            SharedString::from(""), // Name
+            SharedString::from(""), // Path
+            SharedString::from("-"), // Duration
+            SharedString::from(""), // ModificationDate
+            SharedString::from(""), // PreviewPath
+        ];
         SingleMainListModel {
             val_int: ModelRc::new(VecModel::from(ints.to_vec())),
             val_str: ModelRc::new(VecModel::from(strs.to_vec())),
@@ -473,10 +480,17 @@ mod tests {
     }
 
     // Builds a DuplicateFiles row with the given path and name in val_str.
-    // StrDataDuplicateFiles layout: [Size_display, Name, Path, ModDate]
+    // StrDataDuplicateFiles layout: [Size, Name, Path, Duration, ModificationDate, PreviewPath]
     fn make_item_with_path(path: &str, name: &str) -> SingleMainListModel {
         let ints: [i32; MAX_INT_DATA_DUPLICATE_FILES] = [0; MAX_INT_DATA_DUPLICATE_FILES];
-        let strs: [SharedString; MAX_STR_DATA_DUPLICATE_FILES] = [SharedString::from(""), SharedString::from(name), SharedString::from(path), SharedString::from("")];
+        let strs: [SharedString; MAX_STR_DATA_DUPLICATE_FILES] = [
+            SharedString::from(""), // Size
+            SharedString::from(name),
+            SharedString::from(path),
+            SharedString::from("-"), // Duration
+            SharedString::from(""), // ModificationDate
+            SharedString::from(""), // PreviewPath
+        ];
         SingleMainListModel {
             val_int: ModelRc::new(VecModel::from(ints.to_vec())),
             val_str: ModelRc::new(VecModel::from(strs.to_vec())),
@@ -719,7 +733,7 @@ mod tests {
 
     #[test]
     fn select_all_except_longest_path_spares_item_with_longest_full_path() {
-        // StrDataDuplicateFiles: [Size_display, Name, Path, ModDate]
+        // StrDataDuplicateFiles: [Size, Name, Path, Duration, ModificationDate, PreviewPath]
         // Primary sort key: directory path length; secondary: filename length.
         let mut header = crate::test_common::get_main_list_model();
         header.header_row = true;

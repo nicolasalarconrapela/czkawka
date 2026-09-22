@@ -494,6 +494,7 @@ fn translate_items(app: &MainWindow) {
     let fps = flk!("column_fps");
     let codec = flk!("column_codec");
     let duration = flk!("column_duration");
+    let thumbnail = flk!("settings_video_thumbnails_preview");
     let type_of_error = flk!("column_type_of_error");
     let symlink_name = flk!("column_symlink_name");
     let symlink_folder = flk!("column_symlink_folder");
@@ -509,7 +510,7 @@ fn translate_items(app: &MainWindow) {
         ModelRc::new(VecModel::from(shared_string))
     };
 
-    settings.set_duplicates_column_name(fnm(&[&selection, &size, &file_name, &path, &mod_date]));
+    settings.set_duplicates_column_name(fnm(&[&selection, &thumbnail, &size, &file_name, &path, &duration, &mod_date]));
     settings.set_empty_folders_column_name(fnm(&[&selection, &file_name, &path, &mod_date]));
     settings.set_empty_files_column_name(fnm(&[&selection, &size, &file_name, &path, &mod_date]));
     settings.set_temporary_files_column_name(fnm(&[&selection, &size, &file_name, &path, &mod_date]));

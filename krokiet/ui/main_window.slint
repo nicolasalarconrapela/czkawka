@@ -1,505 +1,926 @@
 import { HorizontalBox, LineEdit, Palette, VerticalBox } from "std-widgets.slint";
+
 import { FontSizes } from "globals/fonts.slint";
+
 import { LeftSidePanel } from "screens/left_side_panel.slint";
+
 import { MainList } from "screens/main_lists.slint";
+
 import { ActiveTab, PopupRequest, ProgressToSend, SingleMainListModel } from "globals/common.slint";
+
 import { ActionButtons } from "screens/action_buttons.slint";
+
 import { Progress } from "screens/progress.slint";
+
 import { Settings } from "globals/settings.slint";
+
 import { Callabler } from "globals/callabler.slint";
+
 import { BottomPanel } from "screens/bottom_panel.slint";
+
 import { GuiState } from "globals/gui_state.slint";
+
 import { Preview } from "components/preview.slint";
+
 import { PopupNewDirectories } from "popups/popup_new_directories.slint";
+
 import { PopupDelete } from "popups/popup_delete.slint";
+
 import { PopupTrash } from "popups/popup_trash.slint";
+
 import { PopupMoveFolders } from "popups/popup_move_folders.slint";
+
 import { PopupSelectResults } from "popups/popup_select_results.slint";
+
 import { PopupCustomSelect } from "popups/popup_custom_select.slint";
+
 import { PopupRenameBadExtensions } from "popups/popup_rename_bad_extensions.slint";
+
 import { PopupRenameBadFileNames } from "popups/popup_rename_bad_file_names.slint";
+
 import { PopupRenameFile } from "popups/popup_rename_file.slint";
+
 import { PopupError } from "popups/popup_error.slint";
+
 import { PopupSave } from "popups/popup_save.slint";
+
 import { PopupSortResults } from "popups/popup_sort.slint";
+
 import { PopupActionConfirm } from "popups/popup_action_confirm.slint";
+
 import { PopupCropVideo } from "popups/popup_crop_video.slint";
+
 import { PopupReencodeVideo } from "popups/popup_optimize.slint";
+
 import { PopupCleanExif } from "popups/popup_clean_exif.slint";
+
 import { PopupCleanCache } from "popups/popup_clean_cache.slint";
+
 import { PopupOtherApps } from "popups/popup_other_apps.slint";
+
 import { ToolSettings } from "screens/tool_settings.slint";
+
 import { Translations } from "globals/translations.slint";
+
 import { ImageCompareOverlay } from "screens/image_compare.slint";
+
 import { ColorPalette } from "globals/color_palette.slint";
 
 export {Settings, Callabler, GuiState, Translations, Palette}
 
 export component MainWindow inherits Window {
+
     default-font-size: FontSizes.normal;
 
     callback scan_stopping;
+
     callback scan_starting(ActiveTab);
+
     callback folder_choose_requested(bool);
+
     callback file_choose_requested(bool);
+
     callback scan_ended(string);
+
     callback reset_selection(ActiveTab);
+
     callback initialize_popup_sizes();
+
     callback processing_ended(string);
 
     // Logic:
+
     // Opening popup is done via Rust call
+
     callback request_setup_action_popup(PopupRequest); // When opening popup we need to setup data in it, Slint -> Rust
+
     callback show_action_popup(PopupRequest, string); // After setup, we can show popup - Rust -> Slint - string is choosed folder - to avoid having multiple callbacks, string will be empty for things that do not need it
+
     callback show_rename_single_file_popup(int, string); // Single-row rename, Rust -> Slint - (row_idx, current_name) prefilled into the popup
+
     callback show_error_popup(string); // Generic error message popup, Rust -> Slint
 
     title <=> Translations.main_window_title_text;
 
     min-width: 300px;
+
     preferred-width: 800px;
+
     min-height: 300px;
+
     preferred-height: 600px;
+
     in-out property <string> text_summary_text: "";
+
     in-out property <bool> stop_requested: false;
+
     in-out property <bool> scanning: false;
+
     in-out property <bool> processing: false;
+
     in-out property <ProgressToSend> progress_datas: {
+
         current_progress: 15,
+
         all_progress: 20,
+
         step_name: "Cache",
+
     };
+
     in-out property <[SingleMainListModel]> duplicate_files_model: [];
+
     in-out property <[SingleMainListModel]> empty_folder_model: [];
+
     in-out property <[SingleMainListModel]> big_files_model: [];
+
     in-out property <[SingleMainListModel]> empty_files_model: [];
+
     in-out property <[SingleMainListModel]> temporary_files_model: [];
+
     in-out property <[SingleMainListModel]> similar_images_model: [];
+
     in-out property <[SingleMainListModel]> similar_videos_model: [];
+
     in-out property <[SingleMainListModel]> similar_music_model: [];
+
     in-out property <[SingleMainListModel]> invalid_symlinks_model: [];
+
     in-out property <[SingleMainListModel]> broken_files_model: [];
+
     in-out property <[SingleMainListModel]> bad_extensions_model: [];
+
     in-out property <[SingleMainListModel]> bad_names_model: [];
+
     in-out property <[SingleMainListModel]> exif_remover_model: [];
+
     in-out property <[SingleMainListModel]> video_optimizer_model: [];
 
     VerticalBox {
+
         HorizontalBox {
+
             vertical-stretch: 1.0;
+
             preferred-height: 300px;
+
             LeftSidePanel {
+
                 horizontal-stretch: 0.0;
+
                 changed_active_tab() => {
+
                     GuiState.preview_visible = false;
+
                     main_list.changed_active_tab();
+
                 }
+
             }
 
             VerticalLayout {
+
                 horizontal-stretch: 1.0;
+
                 min_width: 300px;
+
                 Rectangle {
+
                     vertical-stretch: 1.0;
+
                     main_list := MainList {
+
                         x: 0;
+
                         width: preview_or_tool_settings.visible ? parent.width / 2 : parent.width;
+
                         height: parent.height;
+
                         horizontal-stretch: 0.5;
+
                         working: root.scanning || root.processing;
+
                         duplicate_files_model <=> root.duplicate_files_model;
+
                         empty_folder_model <=> root.empty_folder_model;
+
                         big_files_model <=> root.big_files_model;
+
                         empty_files_model <=> root.empty_files_model;
+
                         temporary_files_model <=> root.temporary_files_model;
+
                         similar_images_model <=> root.similar_images_model;
+
                         similar_videos_model <=> root.similar_videos_model;
+
                         similar_music_model <=> root.similar_music_model;
+
                         invalid_symlinks_model <=> root.invalid_symlinks_model;
+
                         broken_files_model <=> root.broken_files_model;
+
                         bad_extensions_model <=> root.bad_extensions_model;
+
                         bad_names_model <=> root.bad_names_model;
+
                         exif_remover_model <=> root.exif_remover_model;
+
                         video_optimizer_model <=> root.video_optimizer_model;
 
                         show_clean_cache_popup() => {
+
                             clean_cache_popup_window.show_popup();
+
                         }
 
                         show_other_apps_popup() => {
+
                             other_apps_popup_window.show_popup();
+
                         }
+
                     }
 
                     preview_or_tool_settings := Rectangle {
+
                         visible: (GuiState.preview_visible || tool_settings.visible) && GuiState.is_tool_tab_active;
+
                         height: parent.height;
+
                         x: parent.width / 2;
+
                         width: self.visible ? parent.width / 2 : 0;
+
                         Preview {
+
                             height: parent.height;
+
                             width: parent.width;
+
                             visible: GuiState.preview_visible && !tool_settings.visible;
+
                             source: GuiState.preview_image;
+
                             image-fit: ImageFit.contain;
+
+                        }
+
+                        if GuiState.preview_visible && !tool_settings.visible: Rectangle {
+                            x: parent.width - 38px;
+                            y: 8px;
+                            width: 30px;
+                            height: 30px;
+                            border-radius: 4px;
+                            background: #333333;
+                            z: 20;
+
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: "×";
+                                color: #ffffff;
+                                font-size: 22px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            close_preview_touch := TouchArea {
+                                width: parent.width;
+                                height: parent.height;
+                                mouse-cursor: MouseCursor.pointer;
+
+                                clicked => {
+                                    GuiState.preview_visible = false;
+                                    GuiState.preview_image_path = "";
+                                }
+                            }
                         }
 
                         tool_settings := ToolSettings {
+
                             height: parent.height;
+
                             width: parent.width;
+
                             visible: GuiState.visible_tool_settings && GuiState.available_subsettings;
+
                         }
+
                     }
+
                 }
 
                 if root.scanning || root.processing: Progress {
+
                     horizontal-stretch: 0.0;
+
                     progress_datas <=> root.progress_datas;
+
                 }
+
             }
+
         }
 
         action_buttons := ActionButtons {
+
             duplicate_files_model <=> root.duplicate_files_model;
+
             empty_folder_model <=> root.empty_folder_model;
+
             big_files_model <=> root.big_files_model;
+
             empty_files_model <=> root.empty_files_model;
+
             temporary_files_model <=> root.temporary_files_model;
+
             similar_images_model <=> root.similar_images_model;
+
             similar_videos_model <=> root.similar_videos_model;
+
             similar_music_model <=> root.similar_music_model;
+
             invalid_symlinks_model <=> root.invalid_symlinks_model;
+
             broken_files_model <=> root.broken_files_model;
+
             bad_extensions_model <=> root.bad_extensions_model;
+
             bad_names_model <=> root.bad_names_model;
+
             exif_remover_model <=> root.exif_remover_model;
+
             video_optimizer_model <=> root.video_optimizer_model;
 
             vertical-stretch: 0.0;
+
             scanning <=> root.scanning;
+
             processing <=> root.processing;
+
             stop_requested <=> root.stop_requested;
+
             scan_stopping => {
+
                 text_summary_text = Translations.stopping_scan_text;
+
                 root.scan_stopping();
+
             }
+
             scan_starting(item) => {
+
                 text_summary_text = Translations.searching_text;
+
                 root.scan_starting(item);
+
                 main_list.scan_started(); // Need to clear sorting state
+
             }
+
             show_select_popup(x_offset, y_offset) => {
+
                 select_popup_window.x_offset = x_offset;
+
                 select_popup_window.y_offset = y_offset;
+
                 select_popup_window.show_popup();
+
             }
+
             show_action_popup(popup_request) => {
+
                 request_setup_action_popup(popup_request);
+
             }
+
             show_sort_popup(x_offset, y_offset) => {
+
                 sort_popup_window.x_offset = x_offset;
+
                 sort_popup_window.y_offset = y_offset;
+
                 sort_popup_window.show_popup();
+
             }
+
         }
 
         HorizontalLayout {
+
             spacing: 5px;
+
             text_summary := LineEdit {
+
                 text: text_summary_text;
+
                 read-only: true;
+
                 font-size: FontSizes.normal;
+
             }
 
             Text {
+
                 font-size: FontSizes.normal;
-                text: "Krokiet\n12.0.2";
+
+                text: "Krokiet\n12.0.21";
+
                 vertical-alignment: center;
+
                 horizontal-alignment: center;
+
             }
+
         }
 
         bottom_panel := BottomPanel {
+
             bottom_panel_visibility <=> action_buttons.bottom_panel_visibility;
+
             vertical-stretch: 0.0;
+
             folder_choose_requested(included_paths) => {
+
                 root.folder_choose_requested(included_paths)
+
             }
+
             file_choose_requested(included_paths) => {
+
                 root.file_choose_requested(included_paths)
+
             }
+
             show_manual_add_dialog(included_paths) => {
+
                 GuiState.choosing_include_directories = included_paths;
+
                 new_directory_popup_window.show_popup()
+
             }
+
         }
+
     }
 
     new_directory_popup_window := PopupNewDirectories {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     select_popup_window := PopupSelectResults {
+
         property <length> x_offset: 0;
+
         property <length> y_offset: 0;
+
         x: max(parent.x, parent.x + x_offset - self.item_width / 2.0);
+
         y: parent.y + y_offset - self.all_items_height - 5px;
+
         height: root.height;
+
         width: root.width;
+
         open_custom_select_popup() => {
+
             custom_select_popup_window.show_popup();
+
         }
+
     }
 
     custom_select_popup_window := PopupCustomSelect {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     delete_popup_window := PopupDelete {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     trash_popup_window := PopupTrash {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     move_popup_window := PopupMoveFolders {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     rename_extension_popup_window := PopupRenameBadExtensions {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     rename_bad_file_name_popup_window := PopupRenameBadFileNames {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     rename_file_popup_window := PopupRenameFile {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     error_popup_window := PopupError {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     save_popup_window := PopupSave {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     sort_popup_window := PopupSortResults {
+
         property <length> x_offset: 0;
+
         property <length> y_offset: 0;
+
         x: max(parent.x, parent.x + x_offset - self.item_width / 2.0);
+
         y: parent.y + y_offset - self.all_items_height - 5px;
+
         height: root.height;
+
         width: root.width;
+
     }
 
     clean_popup_window := PopupCleanExif {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
         title_text: Translations.clean_text;
 
         action_confirmed() => {
+
             Callabler.clean_exif_items();
+
         }
+
     }
 
     clean_cache_popup_window := PopupCleanCache {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
 
         start_cleaning() => {
+
             Callabler.start_cache_cleaning();
+
         }
 
         stop_cleaning() => {
+
             Callabler.stop_cache_cleaning();
+
         }
+
     }
 
     other_apps_popup_window := PopupOtherApps {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
     }
 
     crop_video_popup_window := PopupCropVideo {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
         title_text: Translations.crop_videos_text;
 
         action_confirmed() => {
+
             Callabler.crop_video_items();
+
         }
+
     }
 
     reencode_video_popup_window := PopupReencodeVideo {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
         title_text: Translations.reencode_videos_text;
 
         action_confirmed() => {
+
             Callabler.reencode_video_items();
+
         }
+
     }
 
     hardlink_popup_window := PopupActionConfirm {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
         title_text: Translations.hardlink_text;
+
         confirmation_text: Translations.hardlink_confirmation_text;
 
         action_confirmed => {
+
             Callabler.hardlink_items();
+
         }
+
     }
 
     softlink_popup_window := PopupActionConfirm {
+
         height: root.height;
+
         width: root.width;
+
         x: 0.0; y: 0.0;
+
         title_text: Translations.softlink_text;
+
         confirmation_text: Translations.softlink_confirmation_text;
 
         action_confirmed => {
+
             Callabler.softlink_items();
+
         }
+
     }
 
     if GuiState.compare_visible: ImageCompareOverlay {
+
         x: 0;
+
         y: 0;
+
         width: root.width;
+
         height: root.height;
+
         z: 500;
+
     }
 
     if GuiState.file_dialog_open: Rectangle {
+
         x: 0;
+
         y: 0;
+
         width: root.width;
+
         height: root.height;
+
         background: ColorPalette.scrim_background_color;
+
         z: 1000;
 
         // Absorb all keyboard events so nothing behind the overlay can be triggered
+
         fs := FocusScope {
+
             x: 0; y: 0;
+
             width: parent.width;
+
             height: parent.height;
+
             enabled: true;
+
             key-pressed(event) => { EventResult.accept }
+
             key-released(event) => { EventResult.accept }
+
         }
 
         // Absorb all pointer/mouse events so nothing behind the overlay can be clicked
+
         TouchArea {
+
             x: 0; y: 0;
+
             width: parent.width;
+
             height: parent.height;
+
             mouse-cursor: MouseCursor.default;
+
         }
 
         Text {
+
             width: parent.width;
+
             height: parent.height;
+
             text: Translations.file_dialog_open_text;
+
             font-size: FontSizes.header;
+
             color: ColorPalette.scrim_text_color;
+
             vertical-alignment: center;
+
             horizontal-alignment: center;
+
             wrap: TextWrap.word-wrap;
+
         }
 
         init => { fs.focus(); }
+
     }
 
     scan_ended(scan_text) => {
+
         text_summary_text = scan_text;
+
         root.scanning = false;
+
         root.stop_requested = false;
+
     }
 
     processing_ended(process_text) => {
+
         text_summary_text = process_text;
+
         root.processing = false;
+
         root.stop_requested = false;
+
     }
 
     reset_selection(active_tab) => {
+
         main_list.reset_selection(active_tab);
+
     }
 
     initialize_popup_sizes => {
+
         sort_popup_window.show_popup();
+
         sort_popup_window.close_popup();
+
         select_popup_window.show_popup();
+
         select_popup_window.close_popup();
+
     }
 
     show_action_popup(request, data) => {
+
         if (request == PopupRequest.Move) {
+
             move_popup_window.folder_name = data;
+
             move_popup_window.show_popup();
+
         } else if (request == PopupRequest.Delete) {
+
             delete_popup_window.show_popup();
+
         } else if (request == PopupRequest.Trash) {
+
             trash_popup_window.show_popup();
+
         } else if (request == PopupRequest.CleanExif) {
+
             clean_popup_window.show_popup();
+
         } else if (request == PopupRequest.OptimizeVideo) {
+
             if (data == "crop") {
+
                 crop_video_popup_window.show_popup();
+
             } else {
+
                 reencode_video_popup_window.show_popup();
+
             }
+
         } else if (request == PopupRequest.Symlink) {
+
             softlink_popup_window.show_popup();
+
         } else if (request == PopupRequest.RenameBadExtension) {
+
             rename_extension_popup_window.show_popup();
+
         } else if (request == PopupRequest.RenameBadFileName) {
+
             rename_bad_file_name_popup_window.show_popup();
+
         } else if (request == PopupRequest.Hardlink) {
+
             hardlink_popup_window.show_popup();
+
         } else if (request == PopupRequest.Save) {
+
             save_popup_window.show_popup();
+
         } else {
+
             debug("Unsupported popup request");
+
         }
+
     }
 
     show_rename_single_file_popup(idx, current_name) => {
+
         rename_file_popup_window.show_popup(idx, current_name);
+
     }
 
     show_error_popup(message) => {
+
         error_popup_window.show_popup(message);
+
     }
+
 }
