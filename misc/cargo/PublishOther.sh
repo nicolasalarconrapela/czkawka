@@ -1,5 +1,5 @@
 #!/bin/bash
-NUMBER="12.0.8"
+NUMBER="12.0.21"
 CZKAWKA_PATH="/home/rafal"
 
 cd "$CZKAWKA_PATH"
