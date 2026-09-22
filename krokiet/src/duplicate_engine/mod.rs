@@ -3,6 +3,13 @@
 //! Phase 1 deliberately does not replace the GUI's current `DuplicateFinder` path.
 //! It gives us two independently testable engines with one result format, so we can
 //! prove correctness before switching anything user-visible.
+//!
+//! Migration plan:
+//! 1. Keep `connect_scan/duplicate.rs` as the production path while tests mature.
+//! 2. Reach settings/progress/cancellation parity in this abstraction.
+//! 3. Route the GUI scan through `DuplicateEngine`.
+//! 4. Remove only the duplicated direct `DuplicateFinder` plumbing from the GUI
+//!    layer; keep `CzkawkaEngine` as a reference/fallback for comparison.
 
 mod compare;
 mod czkawka;

@@ -9,6 +9,11 @@ use czkawka_core::tools::duplicate::{DuplicateFinder, DuplicateFinderParameters}
 
 use super::types::{DuplicateEngine, DuplicateEngineError, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 
+// This adapter is intentionally NOT marked for removal. The temporary code is
+// the direct `DuplicateFinder` orchestration that still lives in
+// `connect_scan/duplicate.rs`. Keeping this engine gives us a known reference
+// implementation and a fallback while the Fast Engine is being validated.
+
 pub(crate) struct CzkawkaEngine;
 
 impl DuplicateEngine for CzkawkaEngine {
