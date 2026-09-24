@@ -29,8 +29,9 @@ pub(crate) use verify::{verify_group, verify_result};
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Once;
 
-    use czkawka_core::common::config_cache_path::set_config_cache_path_test;
+    use czkawka_core::common::config_cache_path::set_config_cache_path;
     use tempfile::tempdir;
 
     use super::*;
@@ -43,18 +44,17 @@ mod tests {
     /// The normal Krokiet `main()` initializes these paths, but Rust's test
     /// harness does not execute `main()`, so tests must initialize them.
     ///
-    /// Keep the directory alive for the whole test process instead of using a
-    /// `TempDir`: `czkawka_core` stores the paths in a process-global OnceCell,
-    /// and another test may use them after this function returns.
+    /// `czkawka_core` stores these paths in a process-global OnceCell, so the
+    /// initializer must only run once for the entire test binary.
     fn init_test_config_cache() {
-        let root = std::env::temp_dir().join(format!("krokiet-duplicate-engine-tests-{}", std::process::id()));
-        let cache_path = root.join("cache");
-        let config_path = root.join("config");
+        static INIT: Once = Once::new();
 
-        fs::create_dir_all(&cache_path).expect("failed to create test cache directory");
-        fs::create_dir_all(&config_path).expect("failed to create test config directory");
-
-        set_config_cache_path_test(cache_path, config_path);
+        INIT.call_once(|| {
+            // Use the public initializer from czkawka_core. The test-only helper
+            // in czkawka_core is not visible here because dependencies are not
+            // compiled with cfg(test) when testing Krokiet.
+            let _ = set_config_cache_path("KrokietTest", "KrokietTest");
+        });
     }
 
     #[test]
