@@ -1,9 +1,13 @@
+#[cfg(feature = "fast_duplicates")]
 use std::error::Error;
+#[cfg(feature = "fast_duplicates")]
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "fast_duplicates")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct DuplicateFile {
@@ -36,6 +40,7 @@ impl DuplicateGroup {
     }
 }
 
+#[cfg(feature = "fast_duplicates")]
 #[derive(Clone, Debug)]
 pub(crate) struct DuplicateScanRequest {
     pub paths: Vec<PathBuf>,
@@ -46,6 +51,7 @@ pub(crate) struct DuplicateScanRequest {
     pub one_file_system: bool,
 }
 
+#[cfg(feature = "fast_duplicates")]
 impl DuplicateScanRequest {
     pub(crate) fn for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
@@ -76,6 +82,7 @@ impl DuplicateScanRequest {
     }
 }
 
+#[cfg(feature = "fast_duplicates")]
 #[derive(Clone, Debug)]
 pub(crate) struct DuplicateScanResult {
     pub engine: &'static str,
@@ -83,31 +90,20 @@ pub(crate) struct DuplicateScanResult {
     pub elapsed: Duration,
 }
 
+#[cfg(feature = "fast_duplicates")]
 impl DuplicateScanResult {
     pub(crate) fn file_count(&self) -> usize {
         self.groups.iter().map(|group| group.files.len()).sum()
     }
-
-    /// Bytes that could be reclaimed by keeping one file per duplicate group.
-    /// This is only meaningful after the engine has produced content-duplicate groups.
-    pub(crate) fn reclaimable_bytes(&self) -> u64 {
-        self.groups
-            .iter()
-            .map(|group| {
-                let Some(first) = group.files.first() else {
-                    return 0;
-                };
-                first.size.saturating_mul(group.files.len().saturating_sub(1) as u64)
-            })
-            .sum()
-    }
 }
 
+#[cfg(feature = "fast_duplicates")]
 pub(crate) trait DuplicateEngine {
     fn name(&self) -> &'static str;
     fn scan(&self, request: &DuplicateScanRequest) -> Result<DuplicateScanResult, DuplicateEngineError>;
 }
 
+#[cfg(feature = "fast_duplicates")]
 #[derive(Debug)]
 pub(crate) enum DuplicateEngineError {
     Configuration(String),
@@ -115,6 +111,7 @@ pub(crate) enum DuplicateEngineError {
     Engine { engine: &'static str, message: String },
 }
 
+#[cfg(feature = "fast_duplicates")]
 impl DuplicateEngineError {
     pub(crate) fn engine(engine: &'static str, error: impl Display) -> Self {
         Self::Engine {
@@ -124,6 +121,7 @@ impl DuplicateEngineError {
     }
 }
 
+#[cfg(feature = "fast_duplicates")]
 impl Display for DuplicateEngineError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -134,6 +132,7 @@ impl Display for DuplicateEngineError {
     }
 }
 
+#[cfg(feature = "fast_duplicates")]
 impl Error for DuplicateEngineError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -143,6 +142,7 @@ impl Error for DuplicateEngineError {
     }
 }
 
+#[cfg(feature = "fast_duplicates")]
 impl From<io::Error> for DuplicateEngineError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
