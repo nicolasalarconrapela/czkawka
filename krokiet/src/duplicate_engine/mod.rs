@@ -22,7 +22,7 @@ pub(crate) use compare::{DuplicateComparison, compare_results};
 pub(crate) use czkawka::CzkawkaEngine;
 #[cfg(feature = "fast_duplicates")]
 pub(crate) use fclones::FclonesEngine;
-pub(crate) use types::{DuplicateEngine, DuplicateEngineError, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
+pub(crate) use types::{DuplicateEngine, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 pub(crate) use verify::{verify_group, verify_result};
 
 #[cfg(test)]
@@ -56,7 +56,13 @@ mod tests {
         if ok { "[OK]" } else { "[ERROR]" }
     }
 
-    fn mostrar_resultado_motor(nombre: &str, result: &DuplicateScanResult) {
+    fn mostrar_resultado_motor(result: &DuplicateScanResult) {
+        let nombre = match result.engine {
+            "czkawka" => "Czkawka",
+            "fclones" => "Fast Engine",
+            other => other,
+        };
+
         println!(
             "      {nombre:<12} | tiempo: {:>9.3?} | grupos: {:>3} | archivos duplicados: {:>3}",
             result.elapsed,
@@ -244,13 +250,13 @@ mod tests {
         println!("      Nota: el diagnostico interno de czkawka_core puede aparecer");
         println!("      en ingles entre estas lineas; el resumen final esta en espanol.");
         let old = CzkawkaEngine.scan(&request).expect("fallo el escaneo de Czkawka");
-        mostrar_resultado_motor("Czkawka", &old);
+        mostrar_resultado_motor(&old);
         let old_expected = old.groups.len() == 1 && old.file_count() == 2;
         println!("      Resultado esperado  : {}", estado(old_expected));
 
         paso(3, 5, "Ejecutando Fast Engine: fclones");
         let mut fast = FclonesEngine.scan(&request).expect("fallo el escaneo de fclones");
-        mostrar_resultado_motor("Fast Engine", &fast);
+        mostrar_resultado_motor(&fast);
         let fast_expected = fast.groups.len() == 1 && fast.file_count() == 2;
         println!("      Resultado esperado  : {}", estado(fast_expected));
 
@@ -282,8 +288,8 @@ mod tests {
         println!("------------------------------------------------------------");
         println!(" RESUMEN");
         println!("------------------------------------------------------------");
-        mostrar_resultado_motor("Czkawka", &old);
-        mostrar_resultado_motor("Fast Engine", &fast);
+        mostrar_resultado_motor(&old);
+        mostrar_resultado_motor(&fast);
         println!("      Paridad de resultados : {}", estado(same_results));
         println!("      Verificacion exacta   : {}", estado(exact_ok));
         println!();
@@ -331,11 +337,11 @@ mod tests {
 
         paso(1, 4, "Ejecutando Czkawka");
         let old = CzkawkaEngine.scan(&request).expect("fallo el escaneo de Czkawka");
-        mostrar_resultado_motor("Czkawka", &old);
+        mostrar_resultado_motor(&old);
 
         paso(2, 4, "Ejecutando Fast Engine (fclones)");
         let mut fast = FclonesEngine.scan(&request).expect("fallo el escaneo de fclones");
-        mostrar_resultado_motor("Fast Engine", &fast);
+        mostrar_resultado_motor(&fast);
 
         paso(3, 4, "Comparando resultados");
         let comparison = compare_results(&old, &fast);
