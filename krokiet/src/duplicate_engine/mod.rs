@@ -30,12 +30,31 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use czkawka_core::common::config_cache_path::set_config_cache_path_test;
     use tempfile::tempdir;
 
     use super::*;
 
     fn write_file(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).expect("failed to create test file");
+    }
+
+    /// `DuplicateFinder` may access Czkawka's cache during hash/prehash scans.
+    /// The normal Krokiet `main()` initializes these paths, but Rust's test
+    /// harness does not execute `main()`, so tests must initialize them.
+    ///
+    /// Keep the directory alive for the whole test process instead of using a
+    /// `TempDir`: `czkawka_core` stores the paths in a process-global OnceCell,
+    /// and another test may use them after this function returns.
+    fn init_test_config_cache() {
+        let root = std::env::temp_dir().join(format!("krokiet-duplicate-engine-tests-{}", std::process::id()));
+        let cache_path = root.join("cache");
+        let config_path = root.join("config");
+
+        fs::create_dir_all(&cache_path).expect("failed to create test cache directory");
+        fs::create_dir_all(&config_path).expect("failed to create test config directory");
+
+        set_config_cache_path_test(cache_path, config_path);
     }
 
     #[test]
@@ -82,6 +101,8 @@ mod tests {
     #[cfg(feature = "fast_duplicates")]
     #[test]
     fn czkawka_and_fclones_agree_on_basic_dataset() {
+        init_test_config_cache();
+
         let dir = tempdir().expect("failed to create temp dir");
 
         let duplicate = vec![0x42; 96 * 1024];
@@ -120,6 +141,8 @@ mod tests {
     #[test]
     #[ignore = "manual benchmark; set KROKIET_DUP_BENCH_PATH"]
     fn duplicate_engine_real_dataset_benchmark() {
+        init_test_config_cache();
+
         let path = std::env::var_os("KROKIET_DUP_BENCH_PATH").expect("set KROKIET_DUP_BENCH_PATH first");
         let request = DuplicateScanRequest::for_paths([path.into()]);
 
