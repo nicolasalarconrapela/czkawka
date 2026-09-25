@@ -1,5 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+
+#[cfg(all(test, feature = "fast_duplicates", feature = "verify_fastcmp", feature = "verify_memx"))]
 use std::time::Duration;
 
 use super::types::{DuplicateGroup, metadata_fingerprint};
@@ -9,12 +11,15 @@ use super::types::DuplicateScanResult;
 const VERIFY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_CANDIDATES_PER_BATCH: usize = 16;
 
+type BufferCompareFn = fn(&[u8], &[u8]) -> bool;
+
 /// Backend-independent exact byte verifier.
 ///
 /// Duplicate detection and exact verification are deliberately separate.
 /// fclones/Czkawka decide which files are candidates; an `ExactVerifier`
 /// decides whether a candidate group is truly byte-identical.
 pub(crate) trait ExactVerifier {
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool>;
@@ -46,75 +51,92 @@ impl ExactVerifier for StdBufferedVerifier {
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
         let mut workspace = VerificationWorkspace::new();
-        verify_group_std(group, &mut workspace)
+        verify_group_buffered(group, &mut workspace, std_buffers_equal)
     }
 
     #[cfg(feature = "fast_duplicates")]
     fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        let mut verified = 0;
-        let mut workspace = VerificationWorkspace::new();
-
-        for group in &mut result.groups {
-            if verify_group_std(group, &mut workspace)? {
-                verified += 1;
-            }
-        }
-
-        Ok(verified)
+        verify_result_buffered(result, std_buffers_equal)
     }
 }
 
-/// Optional verifier delegated to the external `biff` crate.
+/// Same exact I/O path as `StdBufferedVerifier`, but delegates comparison of
+/// each in-memory chunk to `fastcmp`.
 ///
-/// This implementation is intentionally isolated behind `verify_biff` so the
-/// dependency is only compiled when explicitly requested. fclones is not
-/// modified and has no dependency on biff.
-#[cfg(feature = "verify_biff")]
+/// This intentionally benchmarks only the memory-comparison primitive. fclones
+/// and the file-reading strategy remain untouched.
+#[cfg(feature = "verify_fastcmp")]
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct BiffVerifier;
+pub(crate) struct FastcmpVerifier;
 
-#[cfg(feature = "verify_biff")]
-impl ExactVerifier for BiffVerifier {
+#[cfg(feature = "verify_fastcmp")]
+impl ExactVerifier for FastcmpVerifier {
     fn name(&self) -> &'static str {
-        "biff"
+        "fastcmp"
     }
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
-        use biff::{ComparisonOptions, ComparisonResult, compare};
-
-        group.verified = false;
-        if group.files.len() < 2 {
-            return Ok(false);
-        }
-
-        let before = capture_group_fingerprints(group)?;
-        if !all_sizes_match(&before) {
-            return Ok(false);
-        }
-
-        let mut reference = File::open(&group.files[0].path)?;
-        let options = ComparisonOptions::default();
-
-        for candidate in group.files.iter().skip(1) {
-            reference.seek(SeekFrom::Start(0))?;
-            let candidate_file = File::open(&candidate.path)?;
-
-            match compare(&mut reference, candidate_file, &options) {
-                ComparisonResult::Identical => {}
-                ComparisonResult::Error(message) => {
-                    return Err(io::Error::other(format!("biff comparison failed: {message}")));
-                }
-                _ => return Ok(false),
-            }
-        }
-
-        if !group_fingerprints_unchanged(group, &before)? {
-            return Ok(false);
-        }
-
-        group.verified = true;
-        Ok(true)
+        let mut workspace = VerificationWorkspace::new();
+        verify_group_buffered(group, &mut workspace, fastcmp_buffers_equal)
     }
+
+    #[cfg(feature = "fast_duplicates")]
+    fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
+        verify_result_buffered(result, fastcmp_buffers_equal)
+    }
+}
+
+/// Same exact I/O path as `StdBufferedVerifier`, but delegates comparison of
+/// each in-memory chunk to `memx::memeq`.
+///
+/// `memx` can use optimized x86/x86-64 implementations while Krokiet keeps
+/// ownership of file handles, buffering, metadata stability checks and group
+/// semantics.
+#[cfg(feature = "verify_memx")]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MemxVerifier;
+
+#[cfg(feature = "verify_memx")]
+impl ExactVerifier for MemxVerifier {
+    fn name(&self) -> &'static str {
+        "memx"
+    }
+
+    fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
+        let mut workspace = VerificationWorkspace::new();
+        verify_group_buffered(group, &mut workspace, memx_buffers_equal)
+    }
+
+    #[cfg(feature = "fast_duplicates")]
+    fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
+        verify_result_buffered(result, memx_buffers_equal)
+    }
+}
+
+#[inline]
+fn std_buffers_equal(left: &[u8], right: &[u8]) -> bool {
+    left == right
+}
+
+#[cfg(feature = "verify_fastcmp")]
+#[inline]
+fn fastcmp_buffers_equal(left: &[u8], right: &[u8]) -> bool {
+    use fastcmp::Compare;
+
+    // fastcmp 1.0.1 uses generated wide pointer loads for slices up to
+    // 256 bytes. Keep tiny/tail comparisons on Rust slice equality so this
+    // experimental backend only exercises fastcmp's large-slice memcmp path.
+    if left.len() <= 256 || right.len() <= 256 {
+        left == right
+    } else {
+        left.feq(right)
+    }
+}
+
+#[cfg(feature = "verify_memx")]
+#[inline]
+fn memx_buffers_equal(left: &[u8], right: &[u8]) -> bool {
+    memx::memeq(left, right)
 }
 
 struct VerificationWorkspace {
@@ -181,7 +203,7 @@ fn group_fingerprints_unchanged(group: &DuplicateGroup, before: &[(u64, Option<s
     Ok(true)
 }
 
-fn verify_group_std(group: &mut DuplicateGroup, workspace: &mut VerificationWorkspace) -> io::Result<bool> {
+fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut VerificationWorkspace, compare: BufferCompareFn) -> io::Result<bool> {
     group.verified = false;
 
     if group.files.len() < 2 {
@@ -215,7 +237,7 @@ fn verify_group_std(group: &mut DuplicateGroup, workspace: &mut VerificationWork
                 candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
                 workspace.record_candidate_read(amount);
 
-                if workspace.reference_buffer[..amount] != workspace.candidate_buffer[..amount] {
+                if !compare(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
                     return Ok(false);
                 }
             }
@@ -232,6 +254,20 @@ fn verify_group_std(group: &mut DuplicateGroup, workspace: &mut VerificationWork
     Ok(true)
 }
 
+#[cfg(feature = "fast_duplicates")]
+fn verify_result_buffered(result: &mut DuplicateScanResult, compare: BufferCompareFn) -> io::Result<usize> {
+    let mut verified = 0;
+    let mut workspace = VerificationWorkspace::new();
+
+    for group in &mut result.groups {
+        if verify_group_buffered(group, &mut workspace, compare)? {
+            verified += 1;
+        }
+    }
+
+    Ok(verified)
+}
+
 /// Compatibility entry point used by the existing tests and benchmark.
 pub(crate) fn verify_group(group: &mut DuplicateGroup) -> io::Result<bool> {
     StdBufferedVerifier.verify_group(group)
@@ -246,6 +282,7 @@ pub(crate) fn verify_result(result: &mut DuplicateScanResult) -> io::Result<usiz
 /// Compatibility shim for older `mod.rs` revisions that re-export
 /// `verify_result` even without `fast_duplicates` enabled.
 #[cfg(not(feature = "fast_duplicates"))]
+#[allow(dead_code)]
 pub(crate) fn verify_result<T>(_result: &mut T) -> io::Result<usize> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -253,6 +290,7 @@ pub(crate) fn verify_result<T>(_result: &mut T) -> io::Result<usize> {
     ))
 }
 
+#[cfg(all(test, feature = "fast_duplicates", feature = "verify_fastcmp", feature = "verify_memx"))]
 fn median_duration(values: &mut [Duration]) -> Duration {
     values.sort_unstable();
     let middle = values.len() / 2;
@@ -267,7 +305,6 @@ fn median_duration(values: &mut [Duration]) -> Duration {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::Instant;
 
     use tempfile::tempdir;
 
@@ -280,6 +317,26 @@ mod tests {
                 .into_iter()
                 .map(|path| DuplicateFile::from_path(path).expect("metadata"))
                 .collect(),
+        )
+    }
+
+    fn create_equal_and_different_groups() -> (tempfile::TempDir, DuplicateGroup, DuplicateGroup) {
+        let dir = tempdir().expect("tempdir");
+        let identical = vec![0x47; 512 * 1024 + 19];
+        let mut different = identical.clone();
+        different[300_001] ^= 0x7F;
+
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        let c = dir.path().join("c.bin");
+        fs::write(&a, &identical).expect("write a");
+        fs::write(&b, &identical).expect("write b");
+        fs::write(&c, &different).expect("write c");
+
+        (
+            dir,
+            group_from_paths(vec![a.clone(), b]),
+            group_from_paths(vec![a, c]),
         )
     }
 
@@ -299,7 +356,7 @@ mod tests {
         let mut group = group_from_paths(paths);
         let mut workspace = VerificationWorkspace::new();
 
-        assert!(verify_group_std(&mut group, &mut workspace).expect("verify"));
+        assert!(verify_group_buffered(&mut group, &mut workspace, std_buffers_equal).expect("verify"));
         assert!(group.verified);
         assert_eq!(workspace.reference_bytes_read, size as u64);
         assert_eq!(workspace.candidate_bytes_read, (size as u64) * 5);
@@ -321,7 +378,7 @@ mod tests {
         let mut group = group_from_paths(paths);
         let mut workspace = VerificationWorkspace::new();
 
-        assert!(verify_group_std(&mut group, &mut workspace).expect("verify"));
+        assert!(verify_group_buffered(&mut group, &mut workspace, std_buffers_equal).expect("verify"));
         assert!(group.verified);
         assert_eq!(workspace.reference_bytes_read, (size as u64) * 2);
         assert_eq!(workspace.candidate_bytes_read, (size as u64) * 17);
@@ -346,43 +403,56 @@ mod tests {
         let mut group = group_from_paths(vec![reference_path, same_path, different_path]);
         let mut workspace = VerificationWorkspace::new();
 
-        assert!(!verify_group_std(&mut group, &mut workspace).expect("verify"));
+        assert!(!verify_group_buffered(&mut group, &mut workspace, std_buffers_equal).expect("verify"));
         assert!(!group.verified);
     }
 
-    #[cfg(feature = "verify_biff")]
+    #[cfg(feature = "verify_fastcmp")]
     #[test]
-    fn biff_verifier_matches_std_for_identical_and_different_files() {
-        let dir = tempdir().expect("tempdir");
-        let identical = vec![0x47; 512 * 1024 + 19];
-        let mut different = identical.clone();
-        different[300_001] ^= 0x7F;
-
-        let a = dir.path().join("a.bin");
-        let b = dir.path().join("b.bin");
-        let c = dir.path().join("c.bin");
-        fs::write(&a, &identical).expect("write a");
-        fs::write(&b, &identical).expect("write b");
-        fs::write(&c, &different).expect("write c");
-
+    fn fastcmp_verifier_matches_std_for_identical_and_different_files() {
+        let (_dir, equal_group, different_group) = create_equal_and_different_groups();
         let std = StdBufferedVerifier;
-        let biff = BiffVerifier;
+        let alternative = FastcmpVerifier;
 
-        let mut std_equal = group_from_paths(vec![a.clone(), b.clone()]);
-        let mut biff_equal = std_equal.clone();
+        assert_eq!(alternative.name(), "fastcmp");
+
+        let mut std_equal = equal_group.clone();
+        let mut alt_equal = equal_group;
         assert!(std.verify_group(&mut std_equal).expect("std equal"));
-        assert!(biff.verify_group(&mut biff_equal).expect("biff equal"));
+        assert!(alternative.verify_group(&mut alt_equal).expect("fastcmp equal"));
 
-        let mut std_different = group_from_paths(vec![a, c]);
-        let mut biff_different = std_different.clone();
+        let mut std_different = different_group.clone();
+        let mut alt_different = different_group;
         assert!(!std.verify_group(&mut std_different).expect("std different"));
-        assert!(!biff.verify_group(&mut biff_different).expect("biff different"));
+        assert!(!alternative.verify_group(&mut alt_different).expect("fastcmp different"));
     }
 
-    #[cfg(all(feature = "verify_biff", feature = "fast_duplicates"))]
+    #[cfg(feature = "verify_memx")]
+    #[test]
+    fn memx_verifier_matches_std_for_identical_and_different_files() {
+        let (_dir, equal_group, different_group) = create_equal_and_different_groups();
+        let std = StdBufferedVerifier;
+        let alternative = MemxVerifier;
+
+        assert_eq!(alternative.name(), "memx");
+
+        let mut std_equal = equal_group.clone();
+        let mut alt_equal = equal_group;
+        assert!(std.verify_group(&mut std_equal).expect("std equal"));
+        assert!(alternative.verify_group(&mut alt_equal).expect("memx equal"));
+
+        let mut std_different = different_group.clone();
+        let mut alt_different = different_group;
+        assert!(!std.verify_group(&mut std_different).expect("std different"));
+        assert!(!alternative.verify_group(&mut alt_different).expect("memx different"));
+    }
+
+    #[cfg(all(feature = "verify_fastcmp", feature = "verify_memx", feature = "fast_duplicates"))]
     #[test]
     #[ignore = "benchmark manual; definir KROKIET_DUP_BENCH_PATH"]
     fn exact_verifier_real_dataset_benchmark() {
+        use std::time::Instant;
+
         use crate::duplicate_engine::{DuplicateEngine, DuplicateScanRequest, FclonesEngine};
 
         let path = std::env::var_os("KROKIET_DUP_BENCH_PATH")
@@ -396,13 +466,13 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK DE VERIFICADORES EXACTOS");
+        println!(" KROKIET - BENCHMARK DE COMPARADORES EXACTOS");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
         println!("Detector      : fclones (sin modificar)");
-        println!("Comparacion   : StdBufferedVerifier vs BiffVerifier");
+        println!("Comparacion   : std slices vs fastcmp vs memx");
         println!("Rondas        : {runs}");
-        println!("Medicion      : SOLO etapa byte a byte");
+        println!("Medicion      : MISMO I/O; solo cambia comparador de buffers");
         println!();
 
         let request = DuplicateScanRequest::for_paths([path]);
@@ -414,26 +484,31 @@ mod tests {
         println!("Archivos      : {}", candidates.file_count());
 
         let std = StdBufferedVerifier;
-        let biff = BiffVerifier;
+        let fastcmp = FastcmpVerifier;
+        let memx = MemxVerifier;
+
+        let verifiers: [&dyn ExactVerifier; 3] = [&std, &fastcmp, &memx];
 
         // Warm-up: filesystem cache + verifier code paths. Not measured.
-        for verifier in [&std as &dyn ExactVerifier, &biff as &dyn ExactVerifier] {
+        for verifier in verifiers {
             let mut sample = candidates.clone();
             let verified = verifier.verify_result(&mut sample).expect("fallo el warm-up");
             assert_eq!(verified, sample.groups.len(), "warm-up fallo con {}", verifier.name());
         }
 
         let mut std_times = Vec::with_capacity(runs);
-        let mut biff_times = Vec::with_capacity(runs);
+        let mut fastcmp_times = Vec::with_capacity(runs);
+        let mut memx_times = Vec::with_capacity(runs);
 
         for round in 0..runs {
             println!();
             println!("RONDA {}/{}", round + 1, runs);
 
-            let order: [&dyn ExactVerifier; 2] = if round % 2 == 0 {
-                [&std, &biff]
-            } else {
-                [&biff, &std]
+            // Rotate the first verifier each round to reduce ordering/cache bias.
+            let order: [&dyn ExactVerifier; 3] = match round % 3 {
+                0 => [&std, &fastcmp, &memx],
+                1 => [&fastcmp, &memx, &std],
+                _ => [&memx, &std, &fastcmp],
             };
 
             for verifier in order {
@@ -447,30 +522,40 @@ mod tests {
 
                 match verifier.name() {
                     "std-buffered" => std_times.push(elapsed),
-                    "biff" => biff_times.push(elapsed),
+                    "fastcmp" => fastcmp_times.push(elapsed),
+                    "memx" => memx_times.push(elapsed),
                     other => panic!("verificador inesperado: {other}"),
                 }
             }
         }
 
         let std_median = median_duration(&mut std_times);
-        let biff_median = median_duration(&mut biff_times);
+        let fastcmp_median = median_duration(&mut fastcmp_times);
+        let memx_median = median_duration(&mut memx_times);
 
         println!();
         println!("------------------------------------------------------------");
         println!(" MEDIANA DE {runs} RONDA(S)");
         println!("------------------------------------------------------------");
         println!(" StdBufferedVerifier : {:.3?}", std_median);
-        println!(" BiffVerifier        : {:.3?}", biff_median);
+        println!(" FastcmpVerifier     : {:.3?}", fastcmp_median);
+        println!(" MemxVerifier        : {:.3?}", memx_median);
 
-        if std_median.as_secs_f64() > 0.0 && biff_median.as_secs_f64() > 0.0 {
-            if biff_median <= std_median {
-                println!(" Biff vs std         : {:.2}x mas rapido", std_median.as_secs_f64() / biff_median.as_secs_f64());
-            } else {
-                println!(" Biff vs std         : {:.2}x el tiempo", biff_median.as_secs_f64() / std_median.as_secs_f64());
-            }
+        print_relative_result("Fastcmp vs std", std_median, fastcmp_median);
+        print_relative_result("Memx vs std", std_median, memx_median);
+        println!("============================================================");
+    }
+
+    #[cfg(all(feature = "verify_fastcmp", feature = "verify_memx", feature = "fast_duplicates"))]
+    fn print_relative_result(label: &str, baseline: Duration, candidate: Duration) {
+        if baseline.as_secs_f64() <= 0.0 || candidate.as_secs_f64() <= 0.0 {
+            return;
         }
 
-        println!("============================================================");
+        if candidate <= baseline {
+            println!(" {label:<19}: {:.2}x mas rapido", baseline.as_secs_f64() / candidate.as_secs_f64());
+        } else {
+            println!(" {label:<19}: {:.2}x el tiempo", candidate.as_secs_f64() / baseline.as_secs_f64());
+        }
     }
 }
