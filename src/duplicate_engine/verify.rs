@@ -2,7 +2,9 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
-use super::types::{DuplicateGroup, DuplicateScanResult, metadata_fingerprint};
+use super::types::{DuplicateGroup, metadata_fingerprint};
+#[cfg(feature = "fast_duplicates")]
+use super::types::DuplicateScanResult;
 
 const VERIFY_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -30,6 +32,7 @@ pub(crate) fn verify_group(group: &mut DuplicateGroup) -> io::Result<bool> {
     Ok(true)
 }
 
+#[cfg(feature = "fast_duplicates")]
 pub(crate) fn verify_result(result: &mut DuplicateScanResult) -> io::Result<usize> {
     let mut verified = 0;
     for group in &mut result.groups {
