@@ -32,6 +32,11 @@ arboard = "3"
 # compile fclones until the fast engine is explicitly enabled.
 fclones = { version = "=0.35.0", default-features = false, optional = true }
 
+# Experimental exact byte-by-byte verifier.
+# Kept independent from fclones so duplicate detection and exact verification
+# can be benchmarked and replaced separately.
+biff = { version = "=0.2.5", optional = true }
+
 # Translations
 i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10"
@@ -63,6 +68,10 @@ default = ["winit_femtovg", "winit_software"]
 
 # Experimental side-by-side duplicate engine. It is not wired to the GUI yet.
 fast_duplicates = ["dep:fclones"]
+
+# Experimental exact verification backend.
+# Independent from fast_duplicates on purpose.
+verify_biff = ["dep:biff"]
 
 # Audio support
 audio = ["rodio"]
