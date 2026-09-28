@@ -14,6 +14,7 @@ use super::types::DuplicateScanResult;
 
 const VERIFY_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_CANDIDATES_PER_BATCH: usize = 16;
+const MAX_PINNED_FILES_PER_GROUP: usize = 256;
 
 // Win32 FILE_FLAG_SEQUENTIAL_SCAN. Kept local so the experiment does not need
 // another direct Windows dependency just to pass an OpenOptions hint.
@@ -181,6 +182,81 @@ fn open_for_verification(path: &Path, sequential_hint: bool) -> io::Result<File>
 
 fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut VerificationWorkspace) -> io::Result<bool> {
     verify_group_with_io_strategy(group, workspace, IO_BASELINE)
+}
+
+fn file_fingerprint(file: &File) -> io::Result<(u64, Option<std::time::SystemTime>)> {
+    let metadata = file.metadata()?;
+    Ok((metadata.len(), metadata.modified().ok()))
+}
+
+/// Experimental Phase 2 verifier.
+///
+/// It opens every file in a normal-sized duplicate group once, keeps those
+/// handles pinned for the whole comparison, captures fingerprints from those
+/// same handles, and reads the reference exactly once. This removes repeated
+/// path metadata lookups and removes the 16-candidate reference reread for
+/// groups that fit under the handle cap. Very large groups fall back to the
+/// proven batched verifier so we do not exhaust process handles.
+fn verify_group_pinned_handles(
+    group: &mut DuplicateGroup,
+    workspace: &mut VerificationWorkspace,
+    sequential_hint: bool,
+) -> io::Result<bool> {
+    group.verified = false;
+
+    if group.files.len() < 2 {
+        return Ok(false);
+    }
+
+    if group.files.len() > MAX_PINNED_FILES_PER_GROUP {
+        return verify_group_with_io_strategy(
+            group,
+            workspace,
+            VerifierIoStrategy { sequential_hint },
+        );
+    }
+
+    let mut files = group
+        .files
+        .iter()
+        .map(|entry| open_for_verification(&entry.path, sequential_hint))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let before = files.iter().map(file_fingerprint).collect::<io::Result<Vec<_>>>()?;
+    if !all_sizes_match(&before) {
+        return Ok(false);
+    }
+
+    let reference_size = before[0].0;
+    let (reference_file, candidate_files) = files.split_first_mut().expect("group length checked above");
+    let mut remaining = reference_size;
+
+    while remaining > 0 {
+        let amount = remaining.min(workspace.buffer_size() as u64) as usize;
+
+        reference_file.read_exact(&mut workspace.reference_buffer[..amount])?;
+        workspace.record_reference_read(amount);
+
+        for candidate_file in candidate_files.iter_mut() {
+            candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
+            workspace.record_candidate_read(amount);
+
+            if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+                return Ok(false);
+            }
+        }
+
+        remaining -= amount as u64;
+    }
+
+    for (file, before_fingerprint) in files.iter().zip(&before) {
+        if file_fingerprint(file)? != *before_fingerprint {
+            return Ok(false);
+        }
+    }
+
+    group.verified = true;
+    Ok(true)
 }
 
 fn verify_group_with_io_strategy(
@@ -717,6 +793,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pinned_handles_preserve_exactness_and_read_reference_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let size = VERIFY_BUFFER_SIZE + 4096;
+        let reference = vec![0xA7; size];
+        let mut different = reference.clone();
+        different[size - 3] ^= 0xFF;
+
+        let reference_path = dir.path().join("reference.bin");
+        let same_a_path = dir.path().join("same-a.bin");
+        let same_b_path = dir.path().join("same-b.bin");
+        let different_path = dir.path().join("different.bin");
+
+        fs::write(&reference_path, &reference).expect("write reference");
+        fs::write(&same_a_path, &reference).expect("write same a");
+        fs::write(&same_b_path, &reference).expect("write same b");
+        fs::write(&different_path, &different).expect("write different");
+
+        let mut equal = group_from_paths(vec![reference_path.clone(), same_a_path, same_b_path]);
+        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+        assert!(verify_group_pinned_handles(&mut equal, &mut workspace, true).expect("pinned equal verification"));
+        assert_eq!(workspace.reference_bytes_read, size as u64);
+        assert_eq!(workspace.candidate_bytes_read, (size as u64) * 2);
+
+        let mut unequal = group_from_paths(vec![reference_path, different_path]);
+        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+        assert!(!verify_group_pinned_handles(&mut unequal, &mut workspace, true).expect("pinned unequal verification"));
+    }
+
     #[cfg(feature = "fast_duplicates")]
     #[derive(Debug, Clone, Copy)]
     struct SyncIoVerifier {
@@ -740,29 +845,26 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "fast_duplicates", windows))]
+    #[cfg(feature = "fast_duplicates")]
     #[derive(Debug, Clone, Copy)]
-    struct OverlappedIoVerifier {
-        name: &'static str,
-        sequential_hint: bool,
-    }
+    struct PinnedHandleVerifier;
 
-    #[cfg(all(feature = "fast_duplicates", windows))]
-    impl ExactVerifier for OverlappedIoVerifier {
+    #[cfg(feature = "fast_duplicates")]
+    impl ExactVerifier for PinnedHandleVerifier {
         fn name(&self) -> &'static str {
-            self.name
+            "pinned-handles"
         }
 
         fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
             let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-            verify_group_overlapped(group, &mut workspace, self.sequential_hint)
+            verify_group_pinned_handles(group, &mut workspace, true)
         }
 
         fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
             let mut verified = 0;
             let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
             for group in &mut result.groups {
-                if verify_group_overlapped(group, &mut workspace, self.sequential_hint)? {
+                if verify_group_pinned_handles(group, &mut workspace, true)? {
                     verified += 1;
                 }
             }
@@ -789,19 +891,17 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK OVERLAPPED I/O WINDOWS");
+        println!(" KROKIET - BENCHMARK DE HANDLES FIJADOS");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
         println!("Detector      : fclones (sin modificar)");
         println!("Comparacion   : std slice equality exacta");
         println!("Buffer        : 1 MiB fijo");
         println!("Rondas        : {runs}");
-        println!("Baseline      : sync + FILE_FLAG_SEQUENTIAL_SCAN");
-        #[cfg(windows)]
-        println!("Candidatos    : overlapped / overlapped+sequential");
-        #[cfg(not(windows))]
-        println!("Candidatos    : overlapped solo esta disponible en Windows");
-        println!("Seguridad     : mismos fingerprints antes/despues");
+        println!("Baseline      : sync + FILE_FLAG_SEQUENTIAL_SCAN + batches de 16");
+        println!("Candidato     : handles fijados + referencia leida una sola vez");
+        println!("Limite        : hasta {MAX_PINNED_FILES_PER_GROUP} archivos por grupo; despues fallback seguro");
+        println!("Seguridad     : fingerprints del mismo handle antes/despues");
         println!();
 
         let request = DuplicateScanRequest::for_paths([path]);
@@ -817,21 +917,8 @@ mod tests {
             strategy: IO_SEQUENTIAL_HINT,
         };
 
-        #[cfg(windows)]
-        let overlapped = OverlappedIoVerifier {
-            name: "overlapped",
-            sequential_hint: false,
-        };
-        #[cfg(windows)]
-        let overlapped_seq = OverlappedIoVerifier {
-            name: "overlapped+seq",
-            sequential_hint: true,
-        };
-
-        #[cfg(windows)]
-        let verifiers: [&dyn ExactVerifier; 3] = [&baseline, &overlapped, &overlapped_seq];
-        #[cfg(not(windows))]
-        let verifiers: [&dyn ExactVerifier; 1] = [&baseline];
+        let pinned = PinnedHandleVerifier;
+        let verifiers: [&dyn ExactVerifier; 2] = [&baseline, &pinned];
 
         // Warm every strategy once, then rotate order each round so the same
         // backend is not systematically first or last in the OS cache state.
@@ -883,10 +970,10 @@ mod tests {
 
         let baseline_median = medians[0];
         println!("------------------------------------------------------------");
-        println!(" Mejor I/O     : {} ({:.3?})", verifiers[best_index].name(), best_median);
+        println!(" Mejor estrategia: {} ({:.3?})", verifiers[best_index].name(), best_median);
         if baseline_median.as_secs_f64() > 0.0 && best_median.as_secs_f64() > 0.0 {
             println!(
-                " Mejor vs seq   : {:.3}x mas rapido",
+                " Mejor vs baseline: {:.3}x mas rapido",
                 baseline_median.as_secs_f64() / best_median.as_secs_f64()
             );
         }
