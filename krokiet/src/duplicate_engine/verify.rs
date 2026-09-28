@@ -5,8 +5,6 @@ use std::path::Path;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-use rayon::prelude::*;
-
 #[cfg(all(test, feature = "fast_duplicates"))]
 use std::time::Duration;
 
@@ -25,28 +23,15 @@ const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerifierIoStrategy {
     sequential_hint: bool,
-    parallel_candidates: bool,
 }
 
-const IO_BASELINE: VerifierIoStrategy = VerifierIoStrategy {
-    sequential_hint: false,
-    parallel_candidates: false,
-};
+const IO_BASELINE: VerifierIoStrategy = VerifierIoStrategy { sequential_hint: false };
+const IO_SEQUENTIAL_HINT: VerifierIoStrategy = VerifierIoStrategy { sequential_hint: true };
 
-const IO_SEQUENTIAL_HINT: VerifierIoStrategy = VerifierIoStrategy {
-    sequential_hint: true,
-    parallel_candidates: false,
-};
-
-const IO_PARALLEL_CANDIDATES: VerifierIoStrategy = VerifierIoStrategy {
-    sequential_hint: false,
-    parallel_candidates: true,
-};
-
-const IO_PARALLEL_SEQUENTIAL: VerifierIoStrategy = VerifierIoStrategy {
-    sequential_hint: true,
-    parallel_candidates: true,
-};
+// Win32 FILE_FLAG_OVERLAPPED. Phase 1.9 uses real asynchronous ReadFile calls
+// with explicit offsets while keeping fclones completely untouched.
+#[cfg(windows)]
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
 /// Backend-independent exact byte verifier.
 ///
@@ -86,12 +71,12 @@ impl ExactVerifier for StdBufferedVerifier {
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
         let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-        verify_group_with_io_strategy(group, &mut workspace, IO_BASELINE)
+        verify_group_with_io_strategy(group, &mut workspace, IO_SEQUENTIAL_HINT)
     }
 
     #[cfg(feature = "fast_duplicates")]
     fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, IO_BASELINE)
+        verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, IO_SEQUENTIAL_HINT)
     }
 }
 
@@ -104,7 +89,7 @@ struct VerificationWorkspace {
     buffer_size: usize,
     reference_buffer: Vec<u8>,
     candidate_buffer: Vec<u8>,
-    parallel_candidate_buffers: Vec<Vec<u8>>,
+    overlapped_candidate_buffers: Vec<Vec<u8>>,
 
     #[cfg(test)]
     reference_bytes_read: u64,
@@ -119,7 +104,7 @@ impl VerificationWorkspace {
             buffer_size,
             reference_buffer: vec![0_u8; buffer_size],
             candidate_buffer: vec![0_u8; buffer_size],
-            parallel_candidate_buffers: Vec::new(),
+            overlapped_candidate_buffers: Vec::new(),
             #[cfg(test)]
             reference_bytes_read: 0,
             #[cfg(test)]
@@ -131,9 +116,9 @@ impl VerificationWorkspace {
         self.buffer_size
     }
 
-    fn ensure_parallel_candidate_buffers(&mut self, count: usize) {
-        while self.parallel_candidate_buffers.len() < count {
-            self.parallel_candidate_buffers.push(vec![0_u8; self.buffer_size]);
+    fn ensure_overlapped_candidate_buffers(&mut self, count: usize) {
+        while self.overlapped_candidate_buffers.len() < count {
+            self.overlapped_candidate_buffers.push(vec![0_u8; self.buffer_size]);
         }
     }
 
@@ -225,10 +210,6 @@ fn verify_group_with_io_strategy(
             .map(|candidate| open_for_verification(&candidate.path, strategy.sequential_hint))
             .collect::<io::Result<Vec<_>>>()?;
 
-        if strategy.parallel_candidates {
-            workspace.ensure_parallel_candidate_buffers(candidate_files.len());
-        }
-
         let mut remaining = reference_size;
         while remaining > 0 {
             let amount = remaining.min(workspace.buffer_size() as u64) as usize;
@@ -236,38 +217,278 @@ fn verify_group_with_io_strategy(
             reference_file.read_exact(&mut workspace.reference_buffer[..amount])?;
             workspace.record_reference_read(amount);
 
-            if strategy.parallel_candidates {
-                let reference_buffer = &workspace.reference_buffer[..amount];
-                let candidate_buffers = &mut workspace.parallel_candidate_buffers[..candidate_files.len()];
+            for candidate_file in &mut candidate_files {
+                candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
+                workspace.record_candidate_read(amount);
 
-                let results = candidate_files
-                    .par_iter_mut()
-                    .zip(candidate_buffers.par_iter_mut())
-                    .map(|(candidate_file, candidate_buffer)| -> io::Result<bool> {
-                        candidate_file.read_exact(&mut candidate_buffer[..amount])?;
-                        Ok(buffers_equal(reference_buffer, &candidate_buffer[..amount]))
-                    })
-                    .collect::<Vec<_>>();
-
-                workspace.record_candidate_read(amount * candidate_files.len());
-
-                for result in results {
-                    if !result? {
-                        return Ok(false);
-                    }
-                }
-            } else {
-                for candidate_file in &mut candidate_files {
-                    candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
-                    workspace.record_candidate_read(amount);
-
-                    if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
-                        return Ok(false);
-                    }
+                if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+                    return Ok(false);
                 }
             }
 
             remaining -= amount as u64;
+        }
+    }
+
+    if !group_fingerprints_unchanged(group, &before)? {
+        return Ok(false);
+    }
+
+    group.verified = true;
+    Ok(true)
+}
+
+#[cfg(windows)]
+mod overlapped_windows {
+    use std::ffi::c_void;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+    use std::ptr;
+
+    use super::{FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN};
+
+    const ERROR_IO_PENDING: u32 = 997;
+    const TRUE: i32 = 1;
+
+    type Handle = *mut c_void;
+
+    // ABI-compatible subset of Win32 OVERLAPPED. The anonymous union in the
+    // Windows definition contains either (Offset, OffsetHigh) or a pointer;
+    // the verifier only needs explicit file offsets.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: Handle,
+    }
+
+    impl Default for Overlapped {
+        fn default() -> Self {
+            Self {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                h_event: ptr::null_mut(),
+            }
+        }
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReadFile(
+            file: Handle,
+            buffer: *mut c_void,
+            bytes_to_read: u32,
+            bytes_read: *mut u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(file: Handle, overlapped: *mut Overlapped, bytes_transferred: *mut u32, wait: i32) -> i32;
+        fn CreateEventW(attributes: *const c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    #[derive(Debug)]
+    struct EventHandle(Handle);
+
+    impl EventHandle {
+        fn new() -> io::Result<Self> {
+            // Manual-reset events make the completion state explicit. ReadFile
+            // resets the event when a new overlapped operation begins.
+            let handle = unsafe { CreateEventW(ptr::null(), TRUE, 0, ptr::null()) };
+            if handle.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(Self(handle))
+            }
+        }
+    }
+
+    impl Drop for EventHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct OverlappedFile {
+        file: File,
+        event: EventHandle,
+    }
+
+    impl OverlappedFile {
+        pub(super) fn open(path: &Path, sequential_hint: bool) -> io::Result<Self> {
+            let mut options = OpenOptions::new();
+            options.read(true);
+
+            let mut flags = FILE_FLAG_OVERLAPPED;
+            if sequential_hint {
+                flags |= FILE_FLAG_SEQUENTIAL_SCAN;
+            }
+            options.custom_flags(flags);
+
+            Ok(Self {
+                file: options.open(path)?,
+                event: EventHandle::new()?,
+            })
+        }
+
+        pub(super) fn issue_read(&self, buffer: &mut [u8], offset: u64, overlapped: &mut Overlapped) -> io::Result<()> {
+            debug_assert!(!buffer.is_empty());
+            debug_assert!(u32::try_from(buffer.len()).is_ok());
+
+            *overlapped = Overlapped {
+                offset: offset as u32,
+                offset_high: (offset >> 32) as u32,
+                h_event: self.event.0,
+                ..Overlapped::default()
+            };
+
+            let result = unsafe {
+                ReadFile(
+                    self.file.as_raw_handle().cast(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    ptr::null_mut(),
+                    overlapped,
+                )
+            };
+
+            if result == 0 {
+                // GetLastError must be captured immediately after ReadFile.
+                let error = unsafe { GetLastError() };
+                if error != ERROR_IO_PENDING {
+                    return Err(io::Error::from_raw_os_error(error as i32));
+                }
+            }
+
+            Ok(())
+        }
+
+        pub(super) fn finish_read(&self, overlapped: &mut Overlapped, expected: usize) -> io::Result<()> {
+            let mut transferred = 0_u32;
+            let result = unsafe {
+                GetOverlappedResult(
+                    self.file.as_raw_handle().cast(),
+                    overlapped,
+                    &mut transferred,
+                    TRUE,
+                )
+            };
+
+            if result == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            if transferred as usize != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("overlapped read returned {transferred} of {expected} bytes"),
+                ));
+            }
+
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn verify_group_overlapped(
+    group: &mut DuplicateGroup,
+    workspace: &mut VerificationWorkspace,
+    sequential_hint: bool,
+) -> io::Result<bool> {
+    use overlapped_windows::{Overlapped, OverlappedFile};
+
+    group.verified = false;
+
+    if group.files.len() < 2 {
+        return Ok(false);
+    }
+
+    let before = capture_group_fingerprints(group)?;
+    if !all_sizes_match(&before) {
+        return Ok(false);
+    }
+
+    let reference_size = before[0].0;
+    let reference_file = OverlappedFile::open(&group.files[0].path, sequential_hint)?;
+
+    for candidate_batch in group.files[1..].chunks(MAX_CANDIDATES_PER_BATCH) {
+        let candidate_files = candidate_batch
+            .iter()
+            .map(|candidate| OverlappedFile::open(&candidate.path, sequential_hint))
+            .collect::<io::Result<Vec<_>>>()?;
+
+        workspace.ensure_overlapped_candidate_buffers(candidate_files.len());
+        let mut operations = vec![Overlapped::default(); candidate_files.len() + 1];
+
+        let mut offset = 0_u64;
+        while offset < reference_size {
+            let amount = (reference_size - offset).min(workspace.buffer_size() as u64) as usize;
+            let mut issued = 0_usize;
+            let mut first_error: Option<io::Error> = None;
+
+            // Every issued operation is completed below before any buffer or
+            // OVERLAPPED record can be reused or dropped. This is required by
+            // the Win32 asynchronous-I/O contract.
+            if let Err(error) = reference_file.issue_read(&mut workspace.reference_buffer[..amount], offset, &mut operations[0]) {
+                first_error = Some(error);
+            } else {
+                issued = 1;
+
+                for (index, candidate_file) in candidate_files.iter().enumerate() {
+                    let candidate_buffer = &mut workspace.overlapped_candidate_buffers[index][..amount];
+                    match candidate_file.issue_read(candidate_buffer, offset, &mut operations[index + 1]) {
+                        Ok(()) => issued += 1,
+                        Err(error) => {
+                            first_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Drain all reads that were successfully issued, even when a later
+            // issue failed. That keeps the buffers valid until Windows is done.
+            for operation_index in 0..issued {
+                let result = if operation_index == 0 {
+                    reference_file.finish_read(&mut operations[0], amount)
+                } else {
+                    candidate_files[operation_index - 1].finish_read(&mut operations[operation_index], amount)
+                };
+
+                if let Err(error) = result {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+
+            workspace.record_reference_read(amount);
+            workspace.record_candidate_read(amount * candidate_files.len());
+
+            let reference = &workspace.reference_buffer[..amount];
+            for candidate_buffer in workspace.overlapped_candidate_buffers.iter().take(candidate_files.len()) {
+                if !buffers_equal(reference, &candidate_buffer[..amount]) {
+                    return Ok(false);
+                }
+            }
+
+            offset += amount as u64;
         }
     }
 
@@ -460,14 +681,8 @@ mod tests {
     #[test]
     fn io_strategies_preserve_exactness() {
         let (_dir, equal_group, different_group) = create_equal_and_different_groups();
-        let strategies = [
-            IO_BASELINE,
-            IO_SEQUENTIAL_HINT,
-            IO_PARALLEL_CANDIDATES,
-            IO_PARALLEL_SEQUENTIAL,
-        ];
 
-        for strategy in strategies {
+        for strategy in [IO_BASELINE, IO_SEQUENTIAL_HINT] {
             let mut equal = equal_group.clone();
             let mut equal_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
             assert!(
@@ -482,17 +697,35 @@ mod tests {
                 "different files passed with {strategy:?}"
             );
         }
+
+        #[cfg(windows)]
+        for sequential_hint in [false, true] {
+            let mut equal = equal_group.clone();
+            let mut equal_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            assert!(
+                verify_group_overlapped(&mut equal, &mut equal_workspace, sequential_hint).expect("overlapped equal verification"),
+                "equal files failed with overlapped sequential_hint={sequential_hint}"
+            );
+
+            let mut different = different_group.clone();
+            let mut different_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            assert!(
+                !verify_group_overlapped(&mut different, &mut different_workspace, sequential_hint)
+                    .expect("overlapped different verification"),
+                "different files passed with overlapped sequential_hint={sequential_hint}"
+            );
+        }
     }
 
     #[cfg(feature = "fast_duplicates")]
     #[derive(Debug, Clone, Copy)]
-    struct IoStrategyVerifier {
+    struct SyncIoVerifier {
         name: &'static str,
         strategy: VerifierIoStrategy,
     }
 
     #[cfg(feature = "fast_duplicates")]
-    impl ExactVerifier for IoStrategyVerifier {
+    impl ExactVerifier for SyncIoVerifier {
         fn name(&self) -> &'static str {
             self.name
         }
@@ -504,6 +737,36 @@ mod tests {
 
         fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
             verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, self.strategy)
+        }
+    }
+
+    #[cfg(all(feature = "fast_duplicates", windows))]
+    #[derive(Debug, Clone, Copy)]
+    struct OverlappedIoVerifier {
+        name: &'static str,
+        sequential_hint: bool,
+    }
+
+    #[cfg(all(feature = "fast_duplicates", windows))]
+    impl ExactVerifier for OverlappedIoVerifier {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
+            let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            verify_group_overlapped(group, &mut workspace, self.sequential_hint)
+        }
+
+        fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
+            let mut verified = 0;
+            let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            for group in &mut result.groups {
+                if verify_group_overlapped(group, &mut workspace, self.sequential_hint)? {
+                    verified += 1;
+                }
+            }
+            Ok(verified)
         }
     }
 
@@ -526,14 +789,18 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK DE ESTRATEGIAS DE I/O EXACTO");
+        println!(" KROKIET - BENCHMARK OVERLAPPED I/O WINDOWS");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
         println!("Detector      : fclones (sin modificar)");
         println!("Comparacion   : std slice equality exacta");
         println!("Buffer        : 1 MiB fijo");
         println!("Rondas        : {runs}");
-        println!("Estrategias   : baseline / sequential hint / paralelo / ambos");
+        println!("Baseline      : sync + FILE_FLAG_SEQUENTIAL_SCAN");
+        #[cfg(windows)]
+        println!("Candidatos    : overlapped / overlapped+sequential");
+        #[cfg(not(windows))]
+        println!("Candidatos    : overlapped solo esta disponible en Windows");
         println!("Seguridad     : mismos fingerprints antes/despues");
         println!();
 
@@ -545,28 +812,29 @@ mod tests {
         println!("Grupos        : {}", candidates.groups.len());
         println!("Archivos      : {}", candidates.file_count());
 
-        let verifiers = [
-            IoStrategyVerifier {
-                name: "baseline",
-                strategy: IO_BASELINE,
-            },
-            IoStrategyVerifier {
-                name: "seq-hint",
-                strategy: IO_SEQUENTIAL_HINT,
-            },
-            IoStrategyVerifier {
-                name: "parallel",
-                strategy: IO_PARALLEL_CANDIDATES,
-            },
-            IoStrategyVerifier {
-                name: "parallel+seq",
-                strategy: IO_PARALLEL_SEQUENTIAL,
-            },
-        ];
+        let baseline = SyncIoVerifier {
+            name: "seq-sync",
+            strategy: IO_SEQUENTIAL_HINT,
+        };
 
-        // Warm every strategy once, then rotate the execution order each round.
-        // The benchmark intentionally compares strategies on the same candidate
-        // groups; fclones is run only once.
+        #[cfg(windows)]
+        let overlapped = OverlappedIoVerifier {
+            name: "overlapped",
+            sequential_hint: false,
+        };
+        #[cfg(windows)]
+        let overlapped_seq = OverlappedIoVerifier {
+            name: "overlapped+seq",
+            sequential_hint: true,
+        };
+
+        #[cfg(windows)]
+        let verifiers: [&dyn ExactVerifier; 3] = [&baseline, &overlapped, &overlapped_seq];
+        #[cfg(not(windows))]
+        let verifiers: [&dyn ExactVerifier; 1] = [&baseline];
+
+        // Warm every strategy once, then rotate order each round so the same
+        // backend is not systematically first or last in the OS cache state.
         for verifier in &verifiers {
             let mut sample = candidates.clone();
             let verified = verifier.verify_result(&mut sample).expect("fallo el warm-up");
@@ -581,7 +849,7 @@ mod tests {
 
             for offset in 0..verifiers.len() {
                 let index = (round + offset) % verifiers.len();
-                let verifier = &verifiers[index];
+                let verifier = verifiers[index];
                 let mut sample = candidates.clone();
 
                 let started = Instant::now();
@@ -589,7 +857,7 @@ mod tests {
                 let elapsed = started.elapsed();
 
                 assert_eq!(verified, sample.groups.len(), "{} no verifico todos los grupos", verifier.name());
-                println!("  {:<14}: {:.3?} | {verified}/{} grupos [OK]", verifier.name(), elapsed, sample.groups.len());
+                println!("  {:<16}: {:.3?} | {verified}/{} grupos [OK]", verifier.name(), elapsed, sample.groups.len());
                 times[index].push(elapsed);
             }
         }
@@ -604,7 +872,7 @@ mod tests {
         println!(" MEDIANA DE {runs} RONDA(S)");
         println!("------------------------------------------------------------");
         for (verifier, median) in verifiers.iter().zip(&medians) {
-            println!(" {:<14}: {:.3?}", verifier.name(), median);
+            println!(" {:<16}: {:.3?}", verifier.name(), median);
         }
 
         let (best_index, best_median) = medians
@@ -613,13 +881,13 @@ mod tests {
             .min_by_key(|(_, duration)| duration.as_nanos())
             .expect("benchmark sin resultados");
 
-        let baseline = medians[0];
+        let baseline_median = medians[0];
         println!("------------------------------------------------------------");
         println!(" Mejor I/O     : {} ({:.3?})", verifiers[best_index].name(), best_median);
-        if baseline.as_secs_f64() > 0.0 && best_median.as_secs_f64() > 0.0 {
+        if baseline_median.as_secs_f64() > 0.0 && best_median.as_secs_f64() > 0.0 {
             println!(
-                " Mejor vs base : {:.3}x mas rapido",
-                baseline.as_secs_f64() / best_median.as_secs_f64()
+                " Mejor vs seq   : {:.3}x mas rapido",
+                baseline_median.as_secs_f64() / best_median.as_secs_f64()
             );
         }
         println!("============================================================");
