@@ -1,5 +1,11 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
+use rayon::prelude::*;
 
 #[cfg(all(test, feature = "fast_duplicates"))]
 use std::time::Duration;
@@ -8,8 +14,39 @@ use super::types::{DuplicateGroup, metadata_fingerprint};
 #[cfg(feature = "fast_duplicates")]
 use super::types::DuplicateScanResult;
 
-const VERIFY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const VERIFY_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_CANDIDATES_PER_BATCH: usize = 16;
+
+// Win32 FILE_FLAG_SEQUENTIAL_SCAN. Kept local so the experiment does not need
+// another direct Windows dependency just to pass an OpenOptions hint.
+#[cfg(windows)]
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifierIoStrategy {
+    sequential_hint: bool,
+    parallel_candidates: bool,
+}
+
+const IO_BASELINE: VerifierIoStrategy = VerifierIoStrategy {
+    sequential_hint: false,
+    parallel_candidates: false,
+};
+
+const IO_SEQUENTIAL_HINT: VerifierIoStrategy = VerifierIoStrategy {
+    sequential_hint: true,
+    parallel_candidates: false,
+};
+
+const IO_PARALLEL_CANDIDATES: VerifierIoStrategy = VerifierIoStrategy {
+    sequential_hint: false,
+    parallel_candidates: true,
+};
+
+const IO_PARALLEL_SEQUENTIAL: VerifierIoStrategy = VerifierIoStrategy {
+    sequential_hint: true,
+    parallel_candidates: true,
+};
 
 /// Backend-independent exact byte verifier.
 ///
@@ -49,12 +86,12 @@ impl ExactVerifier for StdBufferedVerifier {
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
         let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-        verify_group_buffered(group, &mut workspace)
+        verify_group_with_io_strategy(group, &mut workspace, IO_BASELINE)
     }
 
     #[cfg(feature = "fast_duplicates")]
     fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        verify_result_buffered(result, VERIFY_BUFFER_SIZE)
+        verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, IO_BASELINE)
     }
 }
 
@@ -67,6 +104,7 @@ struct VerificationWorkspace {
     buffer_size: usize,
     reference_buffer: Vec<u8>,
     candidate_buffer: Vec<u8>,
+    parallel_candidate_buffers: Vec<Vec<u8>>,
 
     #[cfg(test)]
     reference_bytes_read: u64,
@@ -81,6 +119,7 @@ impl VerificationWorkspace {
             buffer_size,
             reference_buffer: vec![0_u8; buffer_size],
             candidate_buffer: vec![0_u8; buffer_size],
+            parallel_candidate_buffers: Vec::new(),
             #[cfg(test)]
             reference_bytes_read: 0,
             #[cfg(test)]
@@ -90,6 +129,12 @@ impl VerificationWorkspace {
 
     fn buffer_size(&self) -> usize {
         self.buffer_size
+    }
+
+    fn ensure_parallel_candidate_buffers(&mut self, count: usize) {
+        while self.parallel_candidate_buffers.len() < count {
+            self.parallel_candidate_buffers.push(vec![0_u8; self.buffer_size]);
+        }
     }
 
     #[cfg(test)]
@@ -134,7 +179,30 @@ fn group_fingerprints_unchanged(group: &DuplicateGroup, before: &[(u64, Option<s
     Ok(true)
 }
 
+fn open_for_verification(path: &Path, sequential_hint: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(windows)]
+    if sequential_hint {
+        options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+    }
+
+    #[cfg(not(windows))]
+    let _ = sequential_hint;
+
+    options.open(path)
+}
+
 fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut VerificationWorkspace) -> io::Result<bool> {
+    verify_group_with_io_strategy(group, workspace, IO_BASELINE)
+}
+
+fn verify_group_with_io_strategy(
+    group: &mut DuplicateGroup,
+    workspace: &mut VerificationWorkspace,
+    strategy: VerifierIoStrategy,
+) -> io::Result<bool> {
     group.verified = false;
 
     if group.files.len() < 2 {
@@ -147,15 +215,19 @@ fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut Verificatio
     }
 
     let reference_size = before[0].0;
-    let mut reference_file = File::open(&group.files[0].path)?;
+    let mut reference_file = open_for_verification(&group.files[0].path, strategy.sequential_hint)?;
 
     for candidate_batch in group.files[1..].chunks(MAX_CANDIDATES_PER_BATCH) {
         reference_file.seek(SeekFrom::Start(0))?;
 
         let mut candidate_files = candidate_batch
             .iter()
-            .map(|candidate| File::open(&candidate.path))
+            .map(|candidate| open_for_verification(&candidate.path, strategy.sequential_hint))
             .collect::<io::Result<Vec<_>>>()?;
+
+        if strategy.parallel_candidates {
+            workspace.ensure_parallel_candidate_buffers(candidate_files.len());
+        }
 
         let mut remaining = reference_size;
         while remaining > 0 {
@@ -164,12 +236,34 @@ fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut Verificatio
             reference_file.read_exact(&mut workspace.reference_buffer[..amount])?;
             workspace.record_reference_read(amount);
 
-            for candidate_file in &mut candidate_files {
-                candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
-                workspace.record_candidate_read(amount);
+            if strategy.parallel_candidates {
+                let reference_buffer = &workspace.reference_buffer[..amount];
+                let candidate_buffers = &mut workspace.parallel_candidate_buffers[..candidate_files.len()];
 
-                if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
-                    return Ok(false);
+                let results = candidate_files
+                    .par_iter_mut()
+                    .zip(candidate_buffers.par_iter_mut())
+                    .map(|(candidate_file, candidate_buffer)| -> io::Result<bool> {
+                        candidate_file.read_exact(&mut candidate_buffer[..amount])?;
+                        Ok(buffers_equal(reference_buffer, &candidate_buffer[..amount]))
+                    })
+                    .collect::<Vec<_>>();
+
+                workspace.record_candidate_read(amount * candidate_files.len());
+
+                for result in results {
+                    if !result? {
+                        return Ok(false);
+                    }
+                }
+            } else {
+                for candidate_file in &mut candidate_files {
+                    candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
+                    workspace.record_candidate_read(amount);
+
+                    if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+                        return Ok(false);
+                    }
                 }
             }
 
@@ -186,12 +280,16 @@ fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut Verificatio
 }
 
 #[cfg(feature = "fast_duplicates")]
-fn verify_result_buffered(result: &mut DuplicateScanResult, buffer_size: usize) -> io::Result<usize> {
+fn verify_result_with_io_strategy(
+    result: &mut DuplicateScanResult,
+    buffer_size: usize,
+    strategy: VerifierIoStrategy,
+) -> io::Result<usize> {
     let mut verified = 0;
     let mut workspace = VerificationWorkspace::new(buffer_size);
 
     for group in &mut result.groups {
-        if verify_group_buffered(group, &mut workspace)? {
+        if verify_group_with_io_strategy(group, &mut workspace, strategy)? {
             verified += 1;
         }
     }
@@ -359,26 +457,53 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "fast_duplicates")]
-    #[derive(Debug, Clone, Copy)]
-    struct BufferSizedVerifier {
-        name: &'static str,
-        buffer_size: usize,
+    #[test]
+    fn io_strategies_preserve_exactness() {
+        let (_dir, equal_group, different_group) = create_equal_and_different_groups();
+        let strategies = [
+            IO_BASELINE,
+            IO_SEQUENTIAL_HINT,
+            IO_PARALLEL_CANDIDATES,
+            IO_PARALLEL_SEQUENTIAL,
+        ];
+
+        for strategy in strategies {
+            let mut equal = equal_group.clone();
+            let mut equal_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            assert!(
+                verify_group_with_io_strategy(&mut equal, &mut equal_workspace, strategy).expect("equal verification"),
+                "equal files failed with {strategy:?}"
+            );
+
+            let mut different = different_group.clone();
+            let mut different_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            assert!(
+                !verify_group_with_io_strategy(&mut different, &mut different_workspace, strategy).expect("different verification"),
+                "different files passed with {strategy:?}"
+            );
+        }
     }
 
     #[cfg(feature = "fast_duplicates")]
-    impl ExactVerifier for BufferSizedVerifier {
+    #[derive(Debug, Clone, Copy)]
+    struct IoStrategyVerifier {
+        name: &'static str,
+        strategy: VerifierIoStrategy,
+    }
+
+    #[cfg(feature = "fast_duplicates")]
+    impl ExactVerifier for IoStrategyVerifier {
         fn name(&self) -> &'static str {
             self.name
         }
 
         fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
-            let mut workspace = VerificationWorkspace::new(self.buffer_size);
-            verify_group_buffered(group, &mut workspace)
+            let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+            verify_group_with_io_strategy(group, &mut workspace, self.strategy)
         }
 
         fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-            verify_result_buffered(result, self.buffer_size)
+            verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, self.strategy)
         }
     }
 
@@ -401,14 +526,15 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK DE I/O DEL VERIFICADOR EXACTO");
+        println!(" KROKIET - BENCHMARK DE ESTRATEGIAS DE I/O EXACTO");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
         println!("Detector      : fclones (sin modificar)");
         println!("Comparacion   : std slice equality exacta");
-        println!("Buffers       : 1, 2, 4, 8 y 16 MiB");
+        println!("Buffer        : 1 MiB fijo");
         println!("Rondas        : {runs}");
-        println!("Medicion      : MISMO comparador; solo cambia tamano de I/O");
+        println!("Estrategias   : baseline / sequential hint / paralelo / ambos");
+        println!("Seguridad     : mismos fingerprints antes/despues");
         println!();
 
         let request = DuplicateScanRequest::for_paths([path]);
@@ -420,30 +546,27 @@ mod tests {
         println!("Archivos      : {}", candidates.file_count());
 
         let verifiers = [
-            BufferSizedVerifier {
-                name: "std-1MiB",
-                buffer_size: 1 * 1024 * 1024,
+            IoStrategyVerifier {
+                name: "baseline",
+                strategy: IO_BASELINE,
             },
-            BufferSizedVerifier {
-                name: "std-2MiB",
-                buffer_size: 2 * 1024 * 1024,
+            IoStrategyVerifier {
+                name: "seq-hint",
+                strategy: IO_SEQUENTIAL_HINT,
             },
-            BufferSizedVerifier {
-                name: "std-4MiB",
-                buffer_size: 4 * 1024 * 1024,
+            IoStrategyVerifier {
+                name: "parallel",
+                strategy: IO_PARALLEL_CANDIDATES,
             },
-            BufferSizedVerifier {
-                name: "std-8MiB",
-                buffer_size: 8 * 1024 * 1024,
-            },
-            BufferSizedVerifier {
-                name: "std-16MiB",
-                buffer_size: 16 * 1024 * 1024,
+            IoStrategyVerifier {
+                name: "parallel+seq",
+                strategy: IO_PARALLEL_SEQUENTIAL,
             },
         ];
 
-        // Warm-up every path once. This benchmark intentionally measures the
-        // warm-cache verifier path, matching the previous verifier benchmarks.
+        // Warm every strategy once, then rotate the execution order each round.
+        // The benchmark intentionally compares strategies on the same candidate
+        // groups; fclones is run only once.
         for verifier in &verifiers {
             let mut sample = candidates.clone();
             let verified = verifier.verify_result(&mut sample).expect("fallo el warm-up");
@@ -456,7 +579,6 @@ mod tests {
             println!();
             println!("RONDA {}/{}", round + 1, runs);
 
-            // Rotate the first verifier every round to reduce ordering/cache bias.
             for offset in 0..verifiers.len() {
                 let index = (round + offset) % verifiers.len();
                 let verifier = &verifiers[index];
@@ -467,7 +589,7 @@ mod tests {
                 let elapsed = started.elapsed();
 
                 assert_eq!(verified, sample.groups.len(), "{} no verifico todos los grupos", verifier.name());
-                println!("  {:<12}: {:.3?} | {verified}/{} grupos [OK]", verifier.name(), elapsed, sample.groups.len());
+                println!("  {:<14}: {:.3?} | {verified}/{} grupos [OK]", verifier.name(), elapsed, sample.groups.len());
                 times[index].push(elapsed);
             }
         }
@@ -482,7 +604,7 @@ mod tests {
         println!(" MEDIANA DE {runs} RONDA(S)");
         println!("------------------------------------------------------------");
         for (verifier, median) in verifiers.iter().zip(&medians) {
-            println!(" {:<12}: {:.3?}", verifier.name(), median);
+            println!(" {:<14}: {:.3?}", verifier.name(), median);
         }
 
         let (best_index, best_median) = medians
@@ -491,22 +613,14 @@ mod tests {
             .min_by_key(|(_, duration)| duration.as_nanos())
             .expect("benchmark sin resultados");
 
+        let baseline = medians[0];
         println!("------------------------------------------------------------");
-        println!(" Mejor buffer : {} ({:.3?})", verifiers[best_index].name(), best_median);
-
-        let baseline = medians[0]; // 1 MiB: current production baseline.
+        println!(" Mejor I/O     : {} ({:.3?})", verifiers[best_index].name(), best_median);
         if baseline.as_secs_f64() > 0.0 && best_median.as_secs_f64() > 0.0 {
-            if *best_median <= baseline {
-                println!(
-                    " Mejor vs 1MiB: {:.3}x mas rapido",
-                    baseline.as_secs_f64() / best_median.as_secs_f64()
-                );
-            } else {
-                println!(
-                    " Mejor vs 1MiB: {:.3}x el tiempo",
-                    best_median.as_secs_f64() / baseline.as_secs_f64()
-                );
-            }
+            println!(
+                " Mejor vs base : {:.3}x mas rapido",
+                baseline.as_secs_f64() / best_median.as_secs_f64()
+            );
         }
         println!("============================================================");
     }
