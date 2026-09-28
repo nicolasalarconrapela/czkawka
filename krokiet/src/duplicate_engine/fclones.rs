@@ -11,12 +11,20 @@ use super::types::{
 
 pub(crate) struct FclonesEngine;
 
-impl DuplicateEngine for FclonesEngine {
-    fn name(&self) -> &'static str {
-        "fclones"
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataMode {
+    /// Preserve the old adapter behaviour for controlled A/B benchmarks.
+    Eager,
+    /// Defer path metadata until the exact verifier already has the file open.
+    Deferred,
+}
 
-    fn scan(&self, request: &DuplicateScanRequest) -> Result<DuplicateScanResult, DuplicateEngineError> {
+impl FclonesEngine {
+    fn scan_with_metadata_mode(
+        &self,
+        request: &DuplicateScanRequest,
+        metadata_mode: MetadataMode,
+    ) -> Result<DuplicateScanResult, DuplicateEngineError> {
         request.validate()?;
         let started = Instant::now();
 
@@ -46,11 +54,18 @@ impl DuplicateEngine for FclonesEngine {
                     .into_iter()
                     .map(|file| {
                         let path = file.path.to_path_buf();
-                        let modified_date = fs::metadata(&path).map(|metadata| modified_unix_seconds(&metadata)).unwrap_or(0);
-                        DuplicateFile {
-                            path,
-                            size: file.len.0,
-                            modified_date,
+                        let size = file.len.0;
+
+                        match metadata_mode {
+                            MetadataMode::Deferred => DuplicateFile::from_scanned_size(path, size),
+                            MetadataMode::Eager => {
+                                let modified_date = fs::metadata(&path).map(|metadata| modified_unix_seconds(&metadata)).unwrap_or(0);
+                                DuplicateFile {
+                                    path,
+                                    size,
+                                    modified_date,
+                                }
+                            }
                         }
                     })
                     .collect();
@@ -63,5 +78,26 @@ impl DuplicateEngine for FclonesEngine {
             groups,
             elapsed: started.elapsed(),
         })
+    }
+
+    /// Test-only baseline that reproduces the adapter behaviour used before
+    /// Phase 2.1. It lets the benchmark compare the metadata handoff without
+    /// changing the fclones algorithm or the exact verifier.
+    #[cfg(test)]
+    pub(crate) fn scan_with_eager_metadata(
+        &self,
+        request: &DuplicateScanRequest,
+    ) -> Result<DuplicateScanResult, DuplicateEngineError> {
+        self.scan_with_metadata_mode(request, MetadataMode::Eager)
+    }
+}
+
+impl DuplicateEngine for FclonesEngine {
+    fn name(&self) -> &'static str {
+        "fclones"
+    }
+
+    fn scan(&self, request: &DuplicateScanRequest) -> Result<DuplicateScanResult, DuplicateEngineError> {
+        self.scan_with_metadata_mode(request, MetadataMode::Deferred)
     }
 }

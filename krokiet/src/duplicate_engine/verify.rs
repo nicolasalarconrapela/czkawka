@@ -57,11 +57,12 @@ pub(crate) trait ExactVerifier {
     }
 }
 
-/// Production baseline for exact verification.
+/// Production exact verifier.
 ///
-/// It keeps Krokiet's optimized grouped I/O strategy and uses Rust slice
-/// equality for the in-memory comparison. For large byte slices this is the
-/// baseline we want to keep measuring; no external comparison crate is needed.
+/// It keeps normal-sized duplicate groups open for the whole comparison, reads
+/// the reference once, uses 1 MiB buffers and Rust slice equality, and on
+/// Windows requests sequential access. Groups above the handle cap fall back
+/// to the proven batched implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct StdBufferedVerifier;
 
@@ -72,12 +73,21 @@ impl ExactVerifier for StdBufferedVerifier {
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
         let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-        verify_group_with_io_strategy(group, &mut workspace, IO_SEQUENTIAL_HINT)
+        verify_group_pinned_handles(group, &mut workspace, true)
     }
 
     #[cfg(feature = "fast_duplicates")]
     fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, IO_SEQUENTIAL_HINT)
+        let mut verified = 0;
+        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+
+        for group in &mut result.groups {
+            if verify_group_pinned_handles(group, &mut workspace, true)? {
+                verified += 1;
+            }
+        }
+
+        Ok(verified)
     }
 }
 
@@ -156,12 +166,22 @@ fn all_sizes_match(fingerprints: &[(u64, Option<std::time::SystemTime>)]) -> boo
     fingerprints.iter().all(|fingerprint| fingerprint.0 == reference_size)
 }
 
-fn group_fingerprints_unchanged(group: &DuplicateGroup, before: &[(u64, Option<std::time::SystemTime>)]) -> io::Result<bool> {
+fn group_fingerprints_unchanged(group: &mut DuplicateGroup, before: &[(u64, Option<std::time::SystemTime>)]) -> io::Result<bool> {
+    let mut final_metadata = Vec::with_capacity(group.files.len());
+
     for (file, before_fingerprint) in group.files.iter().zip(before) {
-        if metadata_fingerprint(&file.path)? != *before_fingerprint {
+        let metadata = std::fs::metadata(&file.path)?;
+        let after_fingerprint = (metadata.len(), metadata.modified().ok());
+        if after_fingerprint != *before_fingerprint {
             return Ok(false);
         }
+        final_metadata.push(metadata);
     }
+
+    for (file, metadata) in group.files.iter_mut().zip(&final_metadata) {
+        file.refresh_from_metadata(metadata);
+    }
+
     Ok(true)
 }
 
@@ -249,10 +269,18 @@ fn verify_group_pinned_handles(
         remaining -= amount as u64;
     }
 
+    let mut final_metadata = Vec::with_capacity(files.len());
     for (file, before_fingerprint) in files.iter().zip(&before) {
-        if file_fingerprint(file)? != *before_fingerprint {
+        let metadata = file.metadata()?;
+        let after_fingerprint = (metadata.len(), metadata.modified().ok());
+        if after_fingerprint != *before_fingerprint {
             return Ok(false);
         }
+        final_metadata.push(metadata);
+    }
+
+    for (file, metadata) in group.files.iter_mut().zip(&final_metadata) {
+        file.refresh_from_metadata(metadata);
     }
 
     group.verified = true;
@@ -822,54 +850,32 @@ mod tests {
         assert!(!verify_group_pinned_handles(&mut unequal, &mut workspace, true).expect("pinned unequal verification"));
     }
 
-    #[cfg(feature = "fast_duplicates")]
-    #[derive(Debug, Clone, Copy)]
-    struct SyncIoVerifier {
-        name: &'static str,
-        strategy: VerifierIoStrategy,
-    }
+    #[test]
+    fn deferred_metadata_is_finalized_by_exact_verifier() {
+        let dir = tempdir().expect("tempdir");
+        let data = vec![0x51; 96 * 1024 + 31];
+        let left = dir.path().join("left.bin");
+        let right = dir.path().join("right.bin");
+        fs::write(&left, &data).expect("write left");
+        fs::write(&right, &data).expect("write right");
 
-    #[cfg(feature = "fast_duplicates")]
-    impl ExactVerifier for SyncIoVerifier {
-        fn name(&self) -> &'static str {
-            self.name
-        }
+        let expected_left = DuplicateFile::from_path(left.clone()).expect("left metadata");
+        let expected_right = DuplicateFile::from_path(right.clone()).expect("right metadata");
 
-        fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
-            let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-            verify_group_with_io_strategy(group, &mut workspace, self.strategy)
-        }
+        let mut group = DuplicateGroup::new(vec![
+            DuplicateFile::from_scanned_size(left, data.len() as u64),
+            DuplicateFile::from_scanned_size(right, data.len() as u64),
+        ]);
 
-        fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-            verify_result_with_io_strategy(result, VERIFY_BUFFER_SIZE, self.strategy)
-        }
-    }
+        assert_eq!(group.files[0].modified_date, 0);
+        assert_eq!(group.files[1].modified_date, 0);
 
-    #[cfg(feature = "fast_duplicates")]
-    #[derive(Debug, Clone, Copy)]
-    struct PinnedHandleVerifier;
-
-    #[cfg(feature = "fast_duplicates")]
-    impl ExactVerifier for PinnedHandleVerifier {
-        fn name(&self) -> &'static str {
-            "pinned-handles"
-        }
-
-        fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool> {
-            let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-            verify_group_pinned_handles(group, &mut workspace, true)
-        }
-
-        fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-            let mut verified = 0;
-            let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-            for group in &mut result.groups {
-                if verify_group_pinned_handles(group, &mut workspace, true)? {
-                    verified += 1;
-                }
-            }
-            Ok(verified)
-        }
+        assert!(StdBufferedVerifier.verify_group(&mut group).expect("exact verification"));
+        assert!(group.verified);
+        assert_eq!(group.files[0].size, expected_left.size);
+        assert_eq!(group.files[1].size, expected_right.size);
+        assert_eq!(group.files[0].modified_date, expected_left.modified_date);
+        assert_eq!(group.files[1].modified_date, expected_right.modified_date);
     }
 
     #[cfg(feature = "fast_duplicates")]
@@ -878,7 +884,7 @@ mod tests {
     fn exact_verifier_real_dataset_benchmark() {
         use std::time::Instant;
 
-        use crate::duplicate_engine::{DuplicateEngine, DuplicateScanRequest, FclonesEngine};
+        use crate::duplicate_engine::{compare_results, DuplicateEngine, DuplicateScanRequest, FclonesEngine};
 
         let path = std::env::var_os("KROKIET_DUP_BENCH_PATH")
             .expect("debes definir KROKIET_DUP_BENCH_PATH antes de ejecutar el benchmark");
@@ -891,90 +897,115 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK DE HANDLES FIJADOS");
+        println!(" KROKIET - BENCHMARK HANDOFF FCLONES -> EXACT VERIFIER");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
-        println!("Detector      : fclones (sin modificar)");
-        println!("Comparacion   : std slice equality exacta");
-        println!("Buffer        : 1 MiB fijo");
+        println!("Detector      : fclones 0.35.0, mismo algoritmo");
+        println!("Verifier      : pinned handles + 1 MiB + exact slice equality");
         println!("Rondas        : {runs}");
-        println!("Baseline      : sync + FILE_FLAG_SEQUENTIAL_SCAN + batches de 16");
-        println!("Candidato     : handles fijados + referencia leida una sola vez");
-        println!("Limite        : hasta {MAX_PINNED_FILES_PER_GROUP} archivos por grupo; despues fallback seguro");
-        println!("Seguridad     : fingerprints del mismo handle antes/despues");
+        println!("Baseline      : metadata eager tras fclones");
+        println!("Candidato     : metadata diferida al handle del verifier");
+        println!("Seguridad     : byte a byte + fingerprint antes/despues");
         println!();
 
         let request = DuplicateScanRequest::for_paths([path]);
-        let candidates = FclonesEngine.scan(&request).expect("fallo el escaneo de fclones");
-        assert!(!candidates.groups.is_empty(), "el dataset no contiene grupos duplicados");
 
-        println!("Fast Engine   : {:.3?}", candidates.elapsed);
-        println!("Grupos        : {}", candidates.groups.len());
-        println!("Archivos      : {}", candidates.file_count());
+        // Correctness warm-up: both adapters must produce the same groups and
+        // both results must pass the same exact verifier.
+        let mut eager_warm = FclonesEngine
+            .scan_with_eager_metadata(&request)
+            .expect("fallo el warm-up eager");
+        let mut deferred_warm = FclonesEngine.scan(&request).expect("fallo el warm-up deferred");
+        let comparison = compare_results(&eager_warm, &deferred_warm);
+        assert!(comparison.identical(), "eager y deferred devolvieron grupos distintos: {comparison:#?}");
+        assert!(!deferred_warm.groups.is_empty(), "el dataset no contiene grupos duplicados");
 
-        let baseline = SyncIoVerifier {
-            name: "seq-sync",
-            strategy: IO_SEQUENTIAL_HINT,
-        };
+        let eager_groups = eager_warm.groups.len();
+        let deferred_groups = deferred_warm.groups.len();
+        let eager_verified = StdBufferedVerifier
+            .verify_result(&mut eager_warm)
+            .expect("fallo la verificacion eager del warm-up");
+        let deferred_verified = StdBufferedVerifier
+            .verify_result(&mut deferred_warm)
+            .expect("fallo la verificacion deferred del warm-up");
+        assert_eq!(eager_verified, eager_groups);
+        assert_eq!(deferred_verified, deferred_groups);
 
-        let pinned = PinnedHandleVerifier;
-        let verifiers: [&dyn ExactVerifier; 2] = [&baseline, &pinned];
+        println!("Warm-up       : grupos identicos y verificacion exacta [OK]");
+        println!("Grupos        : {}", deferred_warm.groups.len());
+        println!("Archivos      : {}", deferred_warm.file_count());
 
-        // Warm every strategy once, then rotate order each round so the same
-        // backend is not systematically first or last in the OS cache state.
-        for verifier in &verifiers {
-            let mut sample = candidates.clone();
-            let verified = verifier.verify_result(&mut sample).expect("fallo el warm-up");
-            assert_eq!(verified, sample.groups.len(), "warm-up fallo con {}", verifier.name());
-        }
-
-        let mut times: Vec<Vec<Duration>> = verifiers.iter().map(|_| Vec::with_capacity(runs)).collect();
+        let names = ["eager-metadata", "deferred-metadata"];
+        let mut scan_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        let mut verify_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        let mut total_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
 
         for round in 0..runs {
             println!();
             println!("RONDA {}/{}", round + 1, runs);
 
-            for offset in 0..verifiers.len() {
-                let index = (round + offset) % verifiers.len();
-                let verifier = verifiers[index];
-                let mut sample = candidates.clone();
+            for offset in 0..names.len() {
+                let index = (round + offset) % names.len();
+                let total_started = Instant::now();
 
-                let started = Instant::now();
-                let verified = verifier.verify_result(&mut sample).expect("fallo la verificacion");
-                let elapsed = started.elapsed();
+                let mut result = if index == 0 {
+                    FclonesEngine
+                        .scan_with_eager_metadata(&request)
+                        .expect("fallo el escaneo eager")
+                } else {
+                    FclonesEngine.scan(&request).expect("fallo el escaneo deferred")
+                };
+                let scan_elapsed = result.elapsed;
+                let groups = result.groups.len();
 
-                assert_eq!(verified, sample.groups.len(), "{} no verifico todos los grupos", verifier.name());
-                println!("  {:<16}: {:.3?} | {verified}/{} grupos [OK]", verifier.name(), elapsed, sample.groups.len());
-                times[index].push(elapsed);
+                let verify_started = Instant::now();
+                let verified = StdBufferedVerifier
+                    .verify_result(&mut result)
+                    .expect("fallo la verificacion exacta");
+                let verify_elapsed = verify_started.elapsed();
+                let total_elapsed = total_started.elapsed();
+
+                assert_eq!(verified, groups, "{} no verifico todos los grupos", names[index]);
+                assert!(result.groups.iter().all(|group| group.verified));
+
+                println!(
+                    "  {:<18}: scan {:>10.3?} | verify {:>10.3?} | total {:>10.3?} | {verified}/{groups} [OK]",
+                    names[index], scan_elapsed, verify_elapsed, total_elapsed
+                );
+
+                scan_times[index].push(scan_elapsed);
+                verify_times[index].push(verify_elapsed);
+                total_times[index].push(total_elapsed);
             }
         }
 
-        let mut medians = Vec::with_capacity(verifiers.len());
-        for values in &mut times {
-            medians.push(median_duration(values));
+        let mut scan_medians = [Duration::ZERO; 2];
+        let mut verify_medians = [Duration::ZERO; 2];
+        let mut total_medians = [Duration::ZERO; 2];
+        for index in 0..names.len() {
+            scan_medians[index] = median_duration(&mut scan_times[index]);
+            verify_medians[index] = median_duration(&mut verify_times[index]);
+            total_medians[index] = median_duration(&mut total_times[index]);
         }
 
         println!();
         println!("------------------------------------------------------------");
         println!(" MEDIANA DE {runs} RONDA(S)");
         println!("------------------------------------------------------------");
-        for (verifier, median) in verifiers.iter().zip(&medians) {
-            println!(" {:<16}: {:.3?}", verifier.name(), median);
+        for index in 0..names.len() {
+            println!(
+                " {:<18}: scan {:>10.3?} | verify {:>10.3?} | total {:>10.3?}",
+                names[index], scan_medians[index], verify_medians[index], total_medians[index]
+            );
         }
 
-        let (best_index, best_median) = medians
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, duration)| duration.as_nanos())
-            .expect("benchmark sin resultados");
-
-        let baseline_median = medians[0];
+        let baseline = total_medians[0];
+        let candidate = total_medians[1];
         println!("------------------------------------------------------------");
-        println!(" Mejor estrategia: {} ({:.3?})", verifiers[best_index].name(), best_median);
-        if baseline_median.as_secs_f64() > 0.0 && best_median.as_secs_f64() > 0.0 {
+        if baseline.as_secs_f64() > 0.0 && candidate.as_secs_f64() > 0.0 {
             println!(
-                " Mejor vs baseline: {:.3}x mas rapido",
-                baseline_median.as_secs_f64() / best_median.as_secs_f64()
+                " Deferred vs eager: {:.3}x (pipeline seguro)",
+                baseline.as_secs_f64() / candidate.as_secs_f64()
             );
         }
         println!("============================================================");
