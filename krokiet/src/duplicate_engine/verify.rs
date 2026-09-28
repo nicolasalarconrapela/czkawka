@@ -604,22 +604,197 @@ fn verify_group_overlapped(
     Ok(true)
 }
 
+/// Refines fclones prefix/suffix candidate groups into exact byte-identical
+/// duplicate groups.
+///
+/// Unlike `verify_result`, this function does not assume that every member of
+/// an input group is identical. A prefix/suffix candidate group may contain
+/// multiple exact equivalence classes or false positives. The refiner splits
+/// those classes, drops singletons and marks only byte-identical groups as
+/// verified.
 #[cfg(feature = "fast_duplicates")]
-fn verify_result_with_io_strategy(
-    result: &mut DuplicateScanResult,
-    buffer_size: usize,
-    strategy: VerifierIoStrategy,
-) -> io::Result<usize> {
-    let mut verified = 0;
-    let mut workspace = VerificationWorkspace::new(buffer_size);
+fn refine_result_exact(result: &mut DuplicateScanResult) -> io::Result<usize> {
+    let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+    let input_groups = std::mem::take(&mut result.groups);
+    let mut refined_groups = Vec::new();
 
-    for group in &mut result.groups {
-        if verify_group_with_io_strategy(group, &mut workspace, strategy)? {
-            verified += 1;
+    for group in input_groups {
+        refined_groups.extend(refine_group_exact(group, &mut workspace, true)?);
+    }
+
+    let verified_groups = refined_groups.len();
+    result.groups = refined_groups;
+    Ok(verified_groups)
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn refine_group_exact(
+    mut group: DuplicateGroup,
+    workspace: &mut VerificationWorkspace,
+    sequential_hint: bool,
+) -> io::Result<Vec<DuplicateGroup>> {
+    if group.files.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    if group.files.len() > MAX_PINNED_FILES_PER_GROUP {
+        return refine_group_exact_pairwise(group, workspace, sequential_hint);
+    }
+
+    let mut files = group
+        .files
+        .iter()
+        .map(|entry| open_for_verification(&entry.path, sequential_hint))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let before = files.iter().map(file_fingerprint).collect::<io::Result<Vec<_>>>()?;
+    let mut by_size = std::collections::BTreeMap::<u64, Vec<usize>>::new();
+    for (index, fingerprint) in before.iter().enumerate() {
+        by_size.entry(fingerprint.0).or_default().push(index);
+    }
+
+    let mut exact_classes: Vec<Vec<usize>> = Vec::new();
+
+    for (size, indices) in by_size {
+        if indices.len() < 2 {
+            continue;
+        }
+
+        let mut remaining = indices;
+        while remaining.len() >= 2 {
+            let reference_index = remaining[0];
+            files[reference_index].seek(SeekFrom::Start(0))?;
+            for &candidate_index in &remaining[1..] {
+                files[candidate_index].seek(SeekFrom::Start(0))?;
+            }
+
+            let mut active = remaining[1..].to_vec();
+            let mut remaining_bytes = size;
+
+            while remaining_bytes > 0 && !active.is_empty() {
+                let amount = remaining_bytes.min(workspace.buffer_size() as u64) as usize;
+
+                files[reference_index].read_exact(&mut workspace.reference_buffer[..amount])?;
+                workspace.record_reference_read(amount);
+
+                let mut still_matching = Vec::with_capacity(active.len());
+                for candidate_index in active {
+                    files[candidate_index].read_exact(&mut workspace.candidate_buffer[..amount])?;
+                    workspace.record_candidate_read(amount);
+
+                    if buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+                        still_matching.push(candidate_index);
+                    }
+                }
+
+                active = still_matching;
+                remaining_bytes -= amount as u64;
+            }
+
+            if !active.is_empty() {
+                let mut class = Vec::with_capacity(active.len() + 1);
+                class.push(reference_index);
+                class.extend(active.iter().copied());
+                exact_classes.push(class);
+            }
+
+            // Remove the reference and every exact match. Candidates that
+            // differed remain to seed or join another exact class.
+            remaining.retain(|index| *index != reference_index && !active.contains(index));
         }
     }
 
-    Ok(verified)
+    let mut final_metadata = Vec::with_capacity(files.len());
+    for (file, before_fingerprint) in files.iter().zip(&before) {
+        let metadata = file.metadata()?;
+        let after_fingerprint = (metadata.len(), metadata.modified().ok());
+        if after_fingerprint != *before_fingerprint {
+            return Ok(Vec::new());
+        }
+        final_metadata.push(metadata);
+    }
+
+    for (entry, metadata) in group.files.iter_mut().zip(&final_metadata) {
+        entry.refresh_from_metadata(metadata);
+    }
+
+    let mut refined = Vec::with_capacity(exact_classes.len());
+    for class in exact_classes {
+        let files = class.into_iter().map(|index| group.files[index].clone()).collect();
+        refined.push(DuplicateGroup { files, verified: true });
+    }
+
+    Ok(refined)
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn refine_group_exact_pairwise(
+    mut group: DuplicateGroup,
+    workspace: &mut VerificationWorkspace,
+    sequential_hint: bool,
+) -> io::Result<Vec<DuplicateGroup>> {
+    // Large-group fallback: use only two open handles at a time so an unusual
+    // group cannot exhaust the process handle budget. This path is slower but
+    // preserves exactness and can still split false-positive candidate groups.
+    // The whole group gets a before/after fingerprint check because handles are
+    // intentionally not pinned for the complete fallback operation.
+    let before = capture_group_fingerprints(&group)?;
+    let mut remaining = (0..group.files.len()).collect::<Vec<_>>();
+    let mut exact_classes: Vec<Vec<usize>> = Vec::new();
+
+    while remaining.len() >= 2 {
+        let reference_index = remaining[0];
+        let mut matches = Vec::new();
+
+        for &candidate_index in &remaining[1..] {
+            if before[reference_index].0 != before[candidate_index].0 {
+                continue;
+            }
+
+            let mut reference_file = open_for_verification(&group.files[reference_index].path, sequential_hint)?;
+            let mut candidate_file = open_for_verification(&group.files[candidate_index].path, sequential_hint)?;
+            let mut remaining_bytes = before[reference_index].0;
+            let mut equal = true;
+
+            while remaining_bytes > 0 {
+                let amount = remaining_bytes.min(workspace.buffer_size() as u64) as usize;
+                reference_file.read_exact(&mut workspace.reference_buffer[..amount])?;
+                candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
+                workspace.record_reference_read(amount);
+                workspace.record_candidate_read(amount);
+
+                if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+                    equal = false;
+                    break;
+                }
+                remaining_bytes -= amount as u64;
+            }
+
+            if equal {
+                matches.push(candidate_index);
+            }
+        }
+
+        if !matches.is_empty() {
+            let mut class = Vec::with_capacity(matches.len() + 1);
+            class.push(reference_index);
+            class.extend(matches.iter().copied());
+            exact_classes.push(class);
+        }
+
+        remaining.retain(|index| *index != reference_index && !matches.contains(index));
+    }
+
+    if !group_fingerprints_unchanged(&mut group, &before)? {
+        return Ok(Vec::new());
+    }
+
+    let mut refined = Vec::with_capacity(exact_classes.len());
+    for class in exact_classes {
+        let files = class.into_iter().map(|index| group.files[index].clone()).collect();
+        refined.push(DuplicateGroup { files, verified: true });
+    }
+    Ok(refined)
 }
 
 /// Compatibility entry point used by the existing tests and benchmark.
@@ -880,6 +1055,51 @@ mod tests {
 
     #[cfg(feature = "fast_duplicates")]
     #[test]
+    fn prefix_suffix_candidates_are_split_by_exact_content() {
+        use crate::duplicate_engine::{compare_results, DuplicateEngine, DuplicateScanRequest, FclonesEngine};
+
+        let dir = tempdir().expect("tempdir");
+        let size = 2 * 1024 * 1024 + 123;
+        let middle = 1024 * 1024;
+        let base = vec![0x33; size];
+
+        // All five files have the same size, prefix and suffix. Only their
+        // middle bytes differ. Full-hash fclones sees two duplicate classes and
+        // one singleton; the prefix/suffix scan may place all five together.
+        let mut class_a = base.clone();
+        class_a[middle] = 0x44;
+        let mut class_b = base.clone();
+        class_b[middle] = 0x55;
+        let mut singleton = base;
+        singleton[middle] = 0x66;
+
+        fs::write(dir.path().join("a-1.bin"), &class_a).expect("write a1");
+        fs::write(dir.path().join("a-2.bin"), &class_a).expect("write a2");
+        fs::write(dir.path().join("b-1.bin"), &class_b).expect("write b1");
+        fs::write(dir.path().join("b-2.bin"), &class_b).expect("write b2");
+        fs::write(dir.path().join("singleton.bin"), &singleton).expect("write singleton");
+
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let mut full_hash = FclonesEngine.scan(&request).expect("full-hash scan");
+        let mut candidates = FclonesEngine
+            .scan_prefix_suffix_candidates(&request)
+            .expect("prefix/suffix candidate scan");
+
+        let full_verified = StdBufferedVerifier.verify_result(&mut full_hash).expect("full exact verification");
+        assert_eq!(full_verified, full_hash.groups.len());
+        assert_eq!(full_hash.groups.len(), 2);
+
+        let refined = refine_result_exact(&mut candidates).expect("candidate exact refinement");
+        assert_eq!(refined, candidates.groups.len());
+        assert_eq!(candidates.groups.len(), 2);
+        assert!(candidates.groups.iter().all(|group| group.verified));
+
+        let comparison = compare_results(&full_hash, &candidates);
+        assert!(comparison.identical(), "exact refinement disagreed with full-hash fclones: {comparison:#?}");
+    }
+
+    #[cfg(feature = "fast_duplicates")]
+    #[test]
     #[ignore = "benchmark manual; definir KROKIET_DUP_BENCH_PATH"]
     fn exact_verifier_real_dataset_benchmark() {
         use std::time::Instant;
@@ -897,94 +1117,110 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK HANDOFF FCLONES -> EXACT VERIFIER");
+        println!(" KROKIET - BENCHMARK FCLONES PREFILTER + EXACT REFINE");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
-        println!("Detector      : fclones 0.35.0, mismo algoritmo");
-        println!("Verifier      : pinned handles + 1 MiB + exact slice equality");
+        println!("Baseline      : fclones full hash + pinned exact verify");
+        println!("Candidato     : size/prefix/suffix + exact byte refinement");
+        println!("Buffer        : 1 MiB");
         println!("Rondas        : {runs}");
-        println!("Baseline      : metadata eager tras fclones");
-        println!("Candidato     : metadata diferida al handle del verifier");
-        println!("Seguridad     : byte a byte + fingerprint antes/despues");
+        println!("Seguridad     : solo grupos byte-identicos terminan verified=true");
         println!();
 
         let request = DuplicateScanRequest::for_paths([path]);
 
-        // Correctness warm-up: both adapters must produce the same groups and
-        // both results must pass the same exact verifier.
-        let mut eager_warm = FclonesEngine
-            .scan_with_eager_metadata(&request)
-            .expect("fallo el warm-up eager");
-        let mut deferred_warm = FclonesEngine.scan(&request).expect("fallo el warm-up deferred");
-        let comparison = compare_results(&eager_warm, &deferred_warm);
-        assert!(comparison.identical(), "eager y deferred devolvieron grupos distintos: {comparison:#?}");
-        assert!(!deferred_warm.groups.is_empty(), "el dataset no contiene grupos duplicados");
+        // Correctness warm-up. The optimized candidate pipeline is allowed to
+        // produce extra groups before refinement, but after exact refinement it
+        // must be identical to fclones full-hash + exact verification.
+        let mut baseline_warm = FclonesEngine.scan(&request).expect("fallo full-hash warm-up");
+        let baseline_warm_groups = baseline_warm.groups.len();
+        let baseline_verified = StdBufferedVerifier
+            .verify_result(&mut baseline_warm)
+            .expect("fallo exact verify baseline warm-up");
+        assert_eq!(baseline_verified, baseline_warm_groups);
 
-        let eager_groups = eager_warm.groups.len();
-        let deferred_groups = deferred_warm.groups.len();
-        let eager_verified = StdBufferedVerifier
-            .verify_result(&mut eager_warm)
-            .expect("fallo la verificacion eager del warm-up");
-        let deferred_verified = StdBufferedVerifier
-            .verify_result(&mut deferred_warm)
-            .expect("fallo la verificacion deferred del warm-up");
-        assert_eq!(eager_verified, eager_groups);
-        assert_eq!(deferred_verified, deferred_groups);
+        let mut candidate_warm = FclonesEngine
+            .scan_prefix_suffix_candidates(&request)
+            .expect("fallo prefilter warm-up");
+        let prefilter_groups = candidate_warm.groups.len();
+        let prefilter_files = candidate_warm.file_count();
+        let refined_warm = refine_result_exact(&mut candidate_warm).expect("fallo exact refine warm-up");
+        assert_eq!(refined_warm, candidate_warm.groups.len());
 
-        println!("Warm-up       : grupos identicos y verificacion exacta [OK]");
-        println!("Grupos        : {}", deferred_warm.groups.len());
-        println!("Archivos      : {}", deferred_warm.file_count());
+        let comparison = compare_results(&baseline_warm, &candidate_warm);
+        assert!(comparison.identical(), "warm-up produjo resultados distintos: {comparison:#?}");
 
-        let names = ["eager-metadata", "deferred-metadata"];
+        println!("Warm-up       : resultados exactos identicos [OK]");
+        println!("Prefilter     : {prefilter_groups} grupos / {prefilter_files} archivos candidatos");
+        println!("Final exacto  : {} grupos / {} archivos", candidate_warm.groups.len(), candidate_warm.file_count());
+
+        let names = ["full-hash+verify", "prefilter+refine"];
         let mut scan_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
-        let mut verify_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        let mut exact_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
         let mut total_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
 
         for round in 0..runs {
             println!();
             println!("RONDA {}/{}", round + 1, runs);
 
-            for offset in 0..names.len() {
-                let index = (round + offset) % names.len();
+            for offset in 0..2 {
+                let index = (round + offset) % 2;
                 let total_started = Instant::now();
 
-                let mut result = if index == 0 {
-                    FclonesEngine
-                        .scan_with_eager_metadata(&request)
-                        .expect("fallo el escaneo eager")
+                let (mut result, pre_groups, pre_files) = if index == 0 {
+                    let result = FclonesEngine.scan(&request).expect("fallo fclones full hash");
+                    let groups = result.groups.len();
+                    let files = result.file_count();
+                    (result, groups, files)
                 } else {
-                    FclonesEngine.scan(&request).expect("fallo el escaneo deferred")
+                    let result = FclonesEngine
+                        .scan_prefix_suffix_candidates(&request)
+                        .expect("fallo fclones prefilter");
+                    let groups = result.groups.len();
+                    let files = result.file_count();
+                    (result, groups, files)
                 };
-                let scan_elapsed = result.elapsed;
-                let groups = result.groups.len();
 
-                let verify_started = Instant::now();
-                let verified = StdBufferedVerifier
-                    .verify_result(&mut result)
-                    .expect("fallo la verificacion exacta");
-                let verify_elapsed = verify_started.elapsed();
+                let scan_elapsed = result.elapsed;
+                let exact_started = Instant::now();
+                let exact_groups = if index == 0 {
+                    let expected = result.groups.len();
+                    let verified = StdBufferedVerifier.verify_result(&mut result).expect("fallo exact verify baseline");
+                    assert_eq!(verified, expected);
+                    verified
+                } else {
+                    refine_result_exact(&mut result).expect("fallo exact refine candidate")
+                };
+                let exact_elapsed = exact_started.elapsed();
                 let total_elapsed = total_started.elapsed();
 
-                assert_eq!(verified, groups, "{} no verifico todos los grupos", names[index]);
+                if index == 1 {
+                    let comparison = compare_results(&baseline_warm, &result);
+                    assert!(comparison.identical(), "prefilter exacto difiere del baseline: {comparison:#?}");
+                }
+
                 assert!(result.groups.iter().all(|group| group.verified));
+                scan_times[index].push(scan_elapsed);
+                exact_times[index].push(exact_elapsed);
+                total_times[index].push(total_elapsed);
 
                 println!(
-                    "  {:<18}: scan {:>10.3?} | verify {:>10.3?} | total {:>10.3?} | {verified}/{groups} [OK]",
-                    names[index], scan_elapsed, verify_elapsed, total_elapsed
+                    "  {:<17}: scan {:>10.3?} | exact {:>10.3?} | total {:>10.3?} | pre {pre_groups:>3}g/{pre_files:>3}f -> {exact_groups:>3}g/{:>3}f [OK]",
+                    names[index],
+                    scan_elapsed,
+                    exact_elapsed,
+                    total_elapsed,
+                    result.file_count(),
                 );
-
-                scan_times[index].push(scan_elapsed);
-                verify_times[index].push(verify_elapsed);
-                total_times[index].push(total_elapsed);
             }
         }
 
         let mut scan_medians = [Duration::ZERO; 2];
-        let mut verify_medians = [Duration::ZERO; 2];
+        let mut exact_medians = [Duration::ZERO; 2];
         let mut total_medians = [Duration::ZERO; 2];
-        for index in 0..names.len() {
+        for index in 0..2 {
             scan_medians[index] = median_duration(&mut scan_times[index]);
-            verify_medians[index] = median_duration(&mut verify_times[index]);
+            exact_medians[index] = median_duration(&mut exact_times[index]);
             total_medians[index] = median_duration(&mut total_times[index]);
         }
 
@@ -992,20 +1228,17 @@ mod tests {
         println!("------------------------------------------------------------");
         println!(" MEDIANA DE {runs} RONDA(S)");
         println!("------------------------------------------------------------");
-        for index in 0..names.len() {
+        for index in 0..2 {
             println!(
-                " {:<18}: scan {:>10.3?} | verify {:>10.3?} | total {:>10.3?}",
-                names[index], scan_medians[index], verify_medians[index], total_medians[index]
+                " {:<17}: scan {:>10.3?} | exact {:>10.3?} | total {:>10.3?}",
+                names[index], scan_medians[index], exact_medians[index], total_medians[index]
             );
         }
-
-        let baseline = total_medians[0];
-        let candidate = total_medians[1];
         println!("------------------------------------------------------------");
-        if baseline.as_secs_f64() > 0.0 && candidate.as_secs_f64() > 0.0 {
+        if total_medians[1].as_secs_f64() > 0.0 {
             println!(
-                " Deferred vs eager: {:.3}x (pipeline seguro)",
-                baseline.as_secs_f64() / candidate.as_secs_f64()
+                " Prefilter vs full: {:.3}x (pipeline seguro)",
+                total_medians[0].as_secs_f64() / total_medians[1].as_secs_f64()
             );
         }
         println!("============================================================");

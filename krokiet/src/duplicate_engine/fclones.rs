@@ -1,29 +1,18 @@
-use std::fs;
 use std::time::Instant;
 
 use fclones::config::GroupConfig;
 use fclones::log::StdLog;
 use fclones::{FileLen, Path as FclonesPath, group_files};
 
-use super::types::{
-    DuplicateEngine, DuplicateEngineError, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult, modified_unix_seconds,
-};
+use super::types::{DuplicateEngine, DuplicateEngineError, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 
 pub(crate) struct FclonesEngine;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetadataMode {
-    /// Preserve the old adapter behaviour for controlled A/B benchmarks.
-    Eager,
-    /// Defer path metadata until the exact verifier already has the file open.
-    Deferred,
-}
-
 impl FclonesEngine {
-    fn scan_with_metadata_mode(
+    fn scan_with_content_hash(
         &self,
         request: &DuplicateScanRequest,
-        metadata_mode: MetadataMode,
+        skip_content_hash: bool,
     ) -> Result<DuplicateScanResult, DuplicateEngineError> {
         request.validate()?;
         let started = Instant::now();
@@ -40,7 +29,10 @@ impl FclonesEngine {
         config.cache = request.use_cache;
         config.one_fs = request.one_file_system;
         config.match_links = false;
-        config.skip_content_hash = false;
+        // Production still keeps fclones' full-content hash in Phase 2.2. The
+        // test-only candidate path skips only this final stage, preserving the
+        // size + prefix + suffix filters before our independent exact refiner.
+        config.skip_content_hash = skip_content_hash;
 
         let mut log = StdLog::new();
         log.no_progress = true;
@@ -52,22 +44,7 @@ impl FclonesEngine {
                 let files = group
                     .files
                     .into_iter()
-                    .map(|file| {
-                        let path = file.path.to_path_buf();
-                        let size = file.len.0;
-
-                        match metadata_mode {
-                            MetadataMode::Deferred => DuplicateFile::from_scanned_size(path, size),
-                            MetadataMode::Eager => {
-                                let modified_date = fs::metadata(&path).map(|metadata| modified_unix_seconds(&metadata)).unwrap_or(0);
-                                DuplicateFile {
-                                    path,
-                                    size,
-                                    modified_date,
-                                }
-                            }
-                        }
-                    })
+                    .map(|file| DuplicateFile::from_scanned_size(file.path.to_path_buf(), file.len.0))
                     .collect();
                 DuplicateGroup::new(files)
             })
@@ -80,15 +57,18 @@ impl FclonesEngine {
         })
     }
 
-    /// Test-only baseline that reproduces the adapter behaviour used before
-    /// Phase 2.1. It lets the benchmark compare the metadata handoff without
-    /// changing the fclones algorithm or the exact verifier.
+    /// Experimental Phase 2.2 candidate scan.
+    ///
+    /// fclones still performs its size, prefix and suffix stages, but does not
+    /// perform the final full-content hash. The returned groups are therefore
+    /// candidates only and MUST pass `refine_result_exact` before they can be
+    /// treated as duplicates.
     #[cfg(test)]
-    pub(crate) fn scan_with_eager_metadata(
+    pub(crate) fn scan_prefix_suffix_candidates(
         &self,
         request: &DuplicateScanRequest,
     ) -> Result<DuplicateScanResult, DuplicateEngineError> {
-        self.scan_with_metadata_mode(request, MetadataMode::Eager)
+        self.scan_with_content_hash(request, true)
     }
 }
 
@@ -98,6 +78,6 @@ impl DuplicateEngine for FclonesEngine {
     }
 
     fn scan(&self, request: &DuplicateScanRequest) -> Result<DuplicateScanResult, DuplicateEngineError> {
-        self.scan_with_metadata_mode(request, MetadataMode::Deferred)
+        self.scan_with_content_hash(request, false)
     }
 }
