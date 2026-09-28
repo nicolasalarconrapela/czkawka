@@ -494,16 +494,16 @@ mod tests {
         println!("------------------------------------------------------------");
         println!(" Mejor buffer : {} ({:.3?})", verifiers[best_index].name(), best_median);
 
-        let baseline = medians[2]; // 4 MiB: current production baseline.
+        let baseline = medians[0]; // 1 MiB: current production baseline.
         if baseline.as_secs_f64() > 0.0 && best_median.as_secs_f64() > 0.0 {
             if *best_median <= baseline {
                 println!(
-                    " Mejor vs 4MiB: {:.3}x mas rapido",
+                    " Mejor vs 1MiB: {:.3}x mas rapido",
                     baseline.as_secs_f64() / best_median.as_secs_f64()
                 );
             } else {
                 println!(
-                    " Mejor vs 4MiB: {:.3}x el tiempo",
+                    " Mejor vs 1MiB: {:.3}x el tiempo",
                     best_median.as_secs_f64() / baseline.as_secs_f64()
                 );
             }
