@@ -25,6 +25,25 @@ impl DuplicateFile {
             path,
         })
     }
+
+    /// Builds a duplicate candidate from metadata already supplied by the scanner.
+    ///
+    /// `modified_date` is intentionally left as `0` here. The exact verifier
+    /// refreshes both size and modification date from the same open file handle
+    /// that it uses for byte-for-byte verification. This avoids an extra
+    /// path-based `fs::metadata` call after fclones has finished scanning.
+    pub(crate) fn from_scanned_size(path: PathBuf, size: u64) -> Self {
+        Self {
+            path,
+            size,
+            modified_date: 0,
+        }
+    }
+
+    pub(crate) fn refresh_from_metadata(&mut self, metadata: &fs::Metadata) {
+        self.size = metadata.len();
+        self.modified_date = modified_unix_seconds(metadata);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

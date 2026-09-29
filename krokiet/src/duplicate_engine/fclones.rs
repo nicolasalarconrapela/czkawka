@@ -1,13 +1,10 @@
-use std::fs;
 use std::time::Instant;
 
 use fclones::config::GroupConfig;
 use fclones::log::StdLog;
 use fclones::{FileLen, Path as FclonesPath, group_files};
 
-use super::types::{
-    DuplicateEngine, DuplicateEngineError, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult, modified_unix_seconds,
-};
+use super::types::{DuplicateEngine, DuplicateEngineError, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 
 pub(crate) struct FclonesEngine;
 
@@ -32,6 +29,10 @@ impl DuplicateEngine for FclonesEngine {
         config.cache = request.use_cache;
         config.one_fs = request.one_file_system;
         config.match_links = false;
+
+        // Keep fclones' full-content hash as the production candidate filter.
+        // The independent ExactVerifier still performs the final byte-for-byte
+        // confirmation, so correctness never depends on hash equality alone.
         config.skip_content_hash = false;
 
         let mut log = StdLog::new();
@@ -44,15 +45,7 @@ impl DuplicateEngine for FclonesEngine {
                 let files = group
                     .files
                     .into_iter()
-                    .map(|file| {
-                        let path = file.path.to_path_buf();
-                        let modified_date = fs::metadata(&path).map(|metadata| modified_unix_seconds(&metadata)).unwrap_or(0);
-                        DuplicateFile {
-                            path,
-                            size: file.len.0,
-                            modified_date,
-                        }
-                    })
+                    .map(|file| DuplicateFile::from_scanned_size(file.path.to_path_buf(), file.len.0))
                     .collect();
                 DuplicateGroup::new(files)
             })
