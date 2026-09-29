@@ -8,12 +8,12 @@ use super::types::{DuplicateEngine, DuplicateEngineError, DuplicateFile, Duplica
 
 pub(crate) struct FclonesEngine;
 
-impl FclonesEngine {
-    fn scan_with_content_hash(
-        &self,
-        request: &DuplicateScanRequest,
-        skip_content_hash: bool,
-    ) -> Result<DuplicateScanResult, DuplicateEngineError> {
+impl DuplicateEngine for FclonesEngine {
+    fn name(&self) -> &'static str {
+        "fclones"
+    }
+
+    fn scan(&self, request: &DuplicateScanRequest) -> Result<DuplicateScanResult, DuplicateEngineError> {
         request.validate()?;
         let started = Instant::now();
 
@@ -29,10 +29,11 @@ impl FclonesEngine {
         config.cache = request.use_cache;
         config.one_fs = request.one_file_system;
         config.match_links = false;
-        // Production still keeps fclones' full-content hash in Phase 2.2. The
-        // test-only candidate path skips only this final stage, preserving the
-        // size + prefix + suffix filters before our independent exact refiner.
-        config.skip_content_hash = skip_content_hash;
+
+        // Keep fclones' full-content hash as the production candidate filter.
+        // The independent ExactVerifier still performs the final byte-for-byte
+        // confirmation, so correctness never depends on hash equality alone.
+        config.skip_content_hash = false;
 
         let mut log = StdLog::new();
         log.no_progress = true;
@@ -55,29 +56,5 @@ impl FclonesEngine {
             groups,
             elapsed: started.elapsed(),
         })
-    }
-
-    /// Experimental Phase 2.2 candidate scan.
-    ///
-    /// fclones still performs its size, prefix and suffix stages, but does not
-    /// perform the final full-content hash. The returned groups are therefore
-    /// candidates only and MUST pass `refine_result_exact` before they can be
-    /// treated as duplicates.
-    #[cfg(test)]
-    pub(crate) fn scan_prefix_suffix_candidates(
-        &self,
-        request: &DuplicateScanRequest,
-    ) -> Result<DuplicateScanResult, DuplicateEngineError> {
-        self.scan_with_content_hash(request, true)
-    }
-}
-
-impl DuplicateEngine for FclonesEngine {
-    fn name(&self) -> &'static str {
-        "fclones"
-    }
-
-    fn scan(&self, request: &DuplicateScanRequest) -> Result<DuplicateScanResult, DuplicateEngineError> {
-        self.scan_with_content_hash(request, false)
     }
 }
