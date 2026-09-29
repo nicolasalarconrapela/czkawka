@@ -26,20 +26,10 @@ const PRODUCTION_GROUP_THREADS: usize = 6;
 #[cfg(feature = "fast_duplicates")]
 const MIN_GROUPS_FOR_PARALLEL_VERIFY: usize = 8;
 
-// Win32 FILE_FLAG_SEQUENTIAL_SCAN. Kept local so the experiment does not need
-// another direct Windows dependency just to pass an OpenOptions hint.
+// Win32 FILE_FLAG_SEQUENTIAL_SCAN. Kept local so the exact verifier does not
+// need another direct Windows dependency just to pass an OpenOptions hint.
 #[cfg(windows)]
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VerifierIoStrategy {
-    sequential_hint: bool,
-}
-
-#[cfg(test)]
-const IO_BASELINE: VerifierIoStrategy = VerifierIoStrategy { sequential_hint: false };
-#[cfg(test)]
-const IO_SEQUENTIAL_HINT: VerifierIoStrategy = VerifierIoStrategy { sequential_hint: true };
 
 /// Backend-independent exact byte verifier.
 ///
@@ -52,25 +42,25 @@ pub(crate) trait ExactVerifier {
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool>;
 
+    /// Verifies all groups and removes every group that did not complete exact
+    /// byte verification successfully. Callers therefore cannot accidentally
+    /// surface an unverified hash candidate as a real duplicate group.
     #[cfg(feature = "fast_duplicates")]
     fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        let mut verified = 0;
         for group in &mut result.groups {
-            if self.verify_group(group)? {
-                verified += 1;
-            }
+            self.verify_group(group)?;
         }
-        Ok(verified)
+        Ok(retain_verified_groups(result))
     }
 }
 
 /// Production exact verifier.
 ///
-/// It keeps normal-sized duplicate groups open for the whole comparison, reads
-/// the reference once, uses 1 MiB buffers and Rust slice equality, and on
-/// Windows requests sequential access. It checks both path-level and handle-level
-/// fingerprints before/after the byte comparison. Groups above the handle cap
-/// fall back to the proven batched implementation.
+/// Normal-sized groups keep all handles open for the whole comparison, read the
+/// reference once, use 1 MiB buffers and Rust slice equality, and on Windows
+/// request sequential access. Both path-level and handle-level fingerprints are
+/// checked before/after the byte comparison. Groups above the handle cap fall
+/// back to a bounded-handle batched implementation with the same safety checks.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct StdBufferedVerifier;
 
@@ -126,21 +116,26 @@ fn verification_pool() -> io::Result<&'static rayon::ThreadPool> {
     // Another caller can race us only during initialization. If it wins, use
     // the already-installed equivalent pool and drop this one.
     let _ = VERIFY_POOL_6.set(pool);
-    Ok(VERIFY_POOL_6.get().expect("verification pool must be initialized"))
+    Ok(VERIFY_POOL_6
+        .get()
+        .expect("verification pool must be initialized"))
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn retain_verified_groups(result: &mut DuplicateScanResult) -> usize {
+    result.groups.retain(|group| group.verified);
+    result.groups.len()
 }
 
 #[cfg(feature = "fast_duplicates")]
 fn verify_result_sequential(result: &mut DuplicateScanResult) -> io::Result<usize> {
-    let mut verified = 0;
     let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
 
     for group in &mut result.groups {
-        if verify_group_pinned_handles(group, &mut workspace, true)? {
-            verified += 1;
-        }
+        verify_group_pinned_handles(group, &mut workspace, true)?;
     }
 
-    Ok(verified)
+    Ok(retain_verified_groups(result))
 }
 
 /// Production group-parallel verifier.
@@ -166,14 +161,11 @@ fn verify_result_parallel_groups(result: &mut DuplicateScanResult) -> io::Result
             .collect()
     });
 
-    let mut verified = 0;
     for result in results {
-        if result? {
-            verified += 1;
-        }
+        result?;
     }
 
-    Ok(verified)
+    Ok(retain_verified_groups(result))
 }
 
 #[inline]
@@ -209,7 +201,6 @@ impl VerificationWorkspace {
         self.buffer_size
     }
 
-
     #[cfg(test)]
     fn record_reference_read(&mut self, bytes: usize) {
         self.reference_bytes_read += bytes as u64;
@@ -227,7 +218,9 @@ impl VerificationWorkspace {
     fn record_candidate_read(&mut self, _bytes: usize) {}
 }
 
-fn capture_group_fingerprints(group: &DuplicateGroup) -> io::Result<Vec<(u64, Option<std::time::SystemTime>)>> {
+type FileFingerprint = (u64, Option<std::time::SystemTime>);
+
+fn capture_group_fingerprints(group: &DuplicateGroup) -> io::Result<Vec<FileFingerprint>> {
     group
         .files
         .iter()
@@ -235,15 +228,17 @@ fn capture_group_fingerprints(group: &DuplicateGroup) -> io::Result<Vec<(u64, Op
         .collect()
 }
 
-fn all_sizes_match(fingerprints: &[(u64, Option<std::time::SystemTime>)]) -> bool {
+fn all_sizes_match(fingerprints: &[FileFingerprint]) -> bool {
     let Some(reference_size) = fingerprints.first().map(|fingerprint| fingerprint.0) else {
         return false;
     };
 
-    fingerprints.iter().all(|fingerprint| fingerprint.0 == reference_size)
+    fingerprints
+        .iter()
+        .all(|fingerprint| fingerprint.0 == reference_size)
 }
 
-fn group_fingerprints_unchanged(group: &mut DuplicateGroup, before: &[(u64, Option<std::time::SystemTime>)]) -> io::Result<bool> {
+fn group_fingerprints_unchanged(group: &mut DuplicateGroup, before: &[FileFingerprint]) -> io::Result<bool> {
     let mut final_metadata = Vec::with_capacity(group.files.len());
 
     for (file, before_fingerprint) in group.files.iter().zip(before) {
@@ -277,12 +272,7 @@ fn open_for_verification(path: &Path, sequential_hint: bool) -> io::Result<File>
     options.open(path)
 }
 
-#[cfg(test)]
-fn verify_group_buffered(group: &mut DuplicateGroup, workspace: &mut VerificationWorkspace) -> io::Result<bool> {
-    verify_group_with_io_strategy(group, workspace, IO_BASELINE)
-}
-
-fn file_fingerprint(file: &File) -> io::Result<(u64, Option<std::time::SystemTime>)> {
+fn file_fingerprint(file: &File) -> io::Result<FileFingerprint> {
     let metadata = file.metadata()?;
     Ok((metadata.len(), metadata.modified().ok()))
 }
@@ -293,7 +283,7 @@ fn file_fingerprint(file: &File) -> io::Result<(u64, Option<std::time::SystemTim
 /// handles pinned for the whole comparison and reads the reference exactly once.
 /// Path fingerprints are retained before/after verification, while handle
 /// fingerprints prove that the opened files themselves stayed stable. Very large
-/// groups fall back to the proven batched verifier so we do not exhaust handles.
+/// groups fall back to the bounded-handle verifier so we do not exhaust handles.
 fn verify_group_pinned_handles(
     group: &mut DuplicateGroup,
     workspace: &mut VerificationWorkspace,
@@ -306,15 +296,10 @@ fn verify_group_pinned_handles(
     }
 
     if group.files.len() > MAX_PINNED_FILES_PER_GROUP {
-        return verify_group_with_io_strategy(
-            group,
-            workspace,
-            VerifierIoStrategy { sequential_hint },
-        );
+        return verify_group_batched(group, workspace, sequential_hint);
     }
 
-    // Preserve the original path-level safety checks even though the actual
-    // byte I/O uses pinned handles.
+    // Preserve path-level safety even though the byte I/O uses pinned handles.
     let path_before = capture_group_fingerprints(group)?;
     if !all_sizes_match(&path_before) {
         return Ok(false);
@@ -328,13 +313,18 @@ fn verify_group_pinned_handles(
 
     // Bind the just-opened handles to the path state captured immediately
     // before opening. A mismatch means the path changed during the handoff.
-    let handle_before = files.iter().map(file_fingerprint).collect::<io::Result<Vec<_>>>()?;
+    let handle_before = files
+        .iter()
+        .map(file_fingerprint)
+        .collect::<io::Result<Vec<_>>>()?;
     if handle_before != path_before || !all_sizes_match(&handle_before) {
         return Ok(false);
     }
 
     let reference_size = handle_before[0].0;
-    let (reference_file, candidate_files) = files.split_first_mut().expect("group length checked above");
+    let (reference_file, candidate_files) = files
+        .split_first_mut()
+        .expect("group length checked above");
     let mut remaining = reference_size;
 
     while remaining > 0 {
@@ -347,7 +337,10 @@ fn verify_group_pinned_handles(
             candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
             workspace.record_candidate_read(amount);
 
-            if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+            if !buffers_equal(
+                &workspace.reference_buffer[..amount],
+                &workspace.candidate_buffer[..amount],
+            ) {
                 return Ok(false);
             }
         }
@@ -356,14 +349,16 @@ fn verify_group_pinned_handles(
     }
 
     // Prove that the opened files stayed stable while their bytes were read.
-    let handle_after = files.iter().map(file_fingerprint).collect::<io::Result<Vec<_>>>()?;
+    let handle_after = files
+        .iter()
+        .map(file_fingerprint)
+        .collect::<io::Result<Vec<_>>>()?;
     if handle_after != handle_before {
         return Ok(false);
     }
 
-    // Re-check the paths themselves and finalize the deferred metadata. This
-    // restores the path-level race detection semantics from the pre-pinned
-    // verifier instead of trusting only the open handles.
+    // Re-check the paths themselves and finalize deferred metadata. This keeps
+    // path replacement/rename detection in addition to handle stability.
     if !group_fingerprints_unchanged(group, &path_before)? {
         return Ok(false);
     }
@@ -372,10 +367,15 @@ fn verify_group_pinned_handles(
     Ok(true)
 }
 
-fn verify_group_with_io_strategy(
+/// Bounded-handle fallback for groups above `MAX_PINNED_FILES_PER_GROUP`.
+///
+/// The reference stays open, candidates are processed in batches, and both path
+/// and handle fingerprints are checked. This bounds handle pressure while
+/// preserving the exactness guarantees of the normal pinned path.
+fn verify_group_batched(
     group: &mut DuplicateGroup,
     workspace: &mut VerificationWorkspace,
-    strategy: VerifierIoStrategy,
+    sequential_hint: bool,
 ) -> io::Result<bool> {
     group.verified = false;
 
@@ -383,21 +383,40 @@ fn verify_group_with_io_strategy(
         return Ok(false);
     }
 
-    let before = capture_group_fingerprints(group)?;
-    if !all_sizes_match(&before) {
+    let path_before = capture_group_fingerprints(group)?;
+    if !all_sizes_match(&path_before) {
         return Ok(false);
     }
 
-    let reference_size = before[0].0;
-    let mut reference_file = open_for_verification(&group.files[0].path, strategy.sequential_hint)?;
+    let reference_size = path_before[0].0;
+    let mut reference_file = open_for_verification(&group.files[0].path, sequential_hint)?;
+    let reference_handle_before = file_fingerprint(&reference_file)?;
+    if reference_handle_before != path_before[0] {
+        return Ok(false);
+    }
 
-    for candidate_batch in group.files[1..].chunks(MAX_CANDIDATES_PER_BATCH) {
+    for (batch_index, candidate_batch) in group.files[1..]
+        .chunks(MAX_CANDIDATES_PER_BATCH)
+        .enumerate()
+    {
         reference_file.seek(SeekFrom::Start(0))?;
+
+        let candidate_start = 1 + batch_index * MAX_CANDIDATES_PER_BATCH;
+        let candidate_end = candidate_start + candidate_batch.len();
+        let expected_fingerprints = &path_before[candidate_start..candidate_end];
 
         let mut candidate_files = candidate_batch
             .iter()
-            .map(|candidate| open_for_verification(&candidate.path, strategy.sequential_hint))
+            .map(|candidate| open_for_verification(&candidate.path, sequential_hint))
             .collect::<io::Result<Vec<_>>>()?;
+
+        let candidate_handle_before = candidate_files
+            .iter()
+            .map(file_fingerprint)
+            .collect::<io::Result<Vec<_>>>()?;
+        if candidate_handle_before != expected_fingerprints {
+            return Ok(false);
+        }
 
         let mut remaining = reference_size;
         while remaining > 0 {
@@ -410,16 +429,31 @@ fn verify_group_with_io_strategy(
                 candidate_file.read_exact(&mut workspace.candidate_buffer[..amount])?;
                 workspace.record_candidate_read(amount);
 
-                if !buffers_equal(&workspace.reference_buffer[..amount], &workspace.candidate_buffer[..amount]) {
+                if !buffers_equal(
+                    &workspace.reference_buffer[..amount],
+                    &workspace.candidate_buffer[..amount],
+                ) {
                     return Ok(false);
                 }
             }
 
             remaining -= amount as u64;
         }
+
+        let candidate_handle_after = candidate_files
+            .iter()
+            .map(file_fingerprint)
+            .collect::<io::Result<Vec<_>>>()?;
+        if candidate_handle_after != candidate_handle_before {
+            return Ok(false);
+        }
     }
 
-    if !group_fingerprints_unchanged(group, &before)? {
+    if file_fingerprint(&reference_file)? != reference_handle_before {
+        return Ok(false);
+    }
+
+    if !group_fingerprints_unchanged(group, &path_before)? {
         return Ok(false);
     }
 
@@ -432,7 +466,8 @@ pub(crate) fn verify_group(group: &mut DuplicateGroup) -> io::Result<bool> {
     StdBufferedVerifier.verify_group(group)
 }
 
-/// Compatibility entry point used by the existing Fast Engine tests.
+/// Compatibility entry point used by the Fast Engine tests and, later, the GUI
+/// integration. On success only exact-verified groups remain in `result.groups`.
 #[cfg(feature = "fast_duplicates")]
 pub(crate) fn verify_result(result: &mut DuplicateScanResult) -> io::Result<usize> {
     StdBufferedVerifier.verify_result(result)
@@ -456,7 +491,9 @@ fn median_duration(values: &mut [Duration]) -> Duration {
     if values.len() % 2 == 1 {
         values[middle]
     } else {
-        Duration::from_secs_f64((values[middle - 1].as_secs_f64() + values[middle].as_secs_f64()) / 2.0)
+        Duration::from_secs_f64(
+            (values[middle - 1].as_secs_f64() + values[middle].as_secs_f64()) / 2.0,
+        )
     }
 }
 
@@ -470,7 +507,6 @@ fn median_f64(values: &mut [f64]) -> f64 {
         (values[middle - 1] + values[middle]) / 2.0
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -489,137 +525,6 @@ mod tests {
                 .map(|path| DuplicateFile::from_path(path).expect("metadata"))
                 .collect(),
         )
-    }
-
-    fn create_equal_and_different_groups() -> (tempfile::TempDir, DuplicateGroup, DuplicateGroup) {
-        let dir = tempdir().expect("tempdir");
-        let identical = vec![0x47; 512 * 1024 + 19];
-        let mut different = identical.clone();
-        different[300_001] ^= 0x7F;
-
-        let a = dir.path().join("a.bin");
-        let b = dir.path().join("b.bin");
-        let c = dir.path().join("c.bin");
-        fs::write(&a, &identical).expect("write a");
-        fs::write(&b, &identical).expect("write b");
-        fs::write(&c, &different).expect("write c");
-
-        (
-            dir,
-            group_from_paths(vec![a.clone(), b]),
-            group_from_paths(vec![a, c]),
-        )
-    }
-
-    #[test]
-    fn optimized_verifier_reads_reference_once_for_normal_group() {
-        let dir = tempdir().expect("tempdir");
-        let size = VERIFY_BUFFER_SIZE + 257;
-        let data = vec![0xA5; size];
-
-        let mut paths = Vec::new();
-        for index in 0..6 {
-            let path = dir.path().join(format!("same-{index}.bin"));
-            fs::write(&path, &data).expect("write test file");
-            paths.push(path);
-        }
-
-        let mut group = group_from_paths(paths);
-        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-
-        assert!(verify_group_buffered(&mut group, &mut workspace).expect("verify"));
-        assert!(group.verified);
-        assert_eq!(workspace.reference_bytes_read, size as u64);
-        assert_eq!(workspace.candidate_bytes_read, (size as u64) * 5);
-    }
-
-    #[test]
-    fn optimized_verifier_batches_very_large_groups() {
-        let dir = tempdir().expect("tempdir");
-        let size = 64 * 1024 + 13;
-        let data = vec![0x6D; size];
-
-        let mut paths = Vec::new();
-        for index in 0..18 {
-            let path = dir.path().join(format!("large-group-{index}.bin"));
-            fs::write(&path, &data).expect("write test file");
-            paths.push(path);
-        }
-
-        let mut group = group_from_paths(paths);
-        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-
-        assert!(verify_group_buffered(&mut group, &mut workspace).expect("verify"));
-        assert!(group.verified);
-        assert_eq!(workspace.reference_bytes_read, (size as u64) * 2);
-        assert_eq!(workspace.candidate_bytes_read, (size as u64) * 17);
-    }
-
-    #[test]
-    fn optimized_verifier_rejects_difference_in_late_chunk() {
-        let dir = tempdir().expect("tempdir");
-        let size = VERIFY_BUFFER_SIZE + 4096;
-        let reference = vec![0x3C; size];
-        let mut different = reference.clone();
-        different[size - 17] ^= 0xFF;
-
-        let reference_path = dir.path().join("reference.bin");
-        let same_path = dir.path().join("same.bin");
-        let different_path = dir.path().join("different.bin");
-
-        fs::write(&reference_path, &reference).expect("write reference");
-        fs::write(&same_path, &reference).expect("write same");
-        fs::write(&different_path, &different).expect("write different");
-
-        let mut group = group_from_paths(vec![reference_path, same_path, different_path]);
-        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-
-        assert!(!verify_group_buffered(&mut group, &mut workspace).expect("verify"));
-        assert!(!group.verified);
-    }
-
-    #[test]
-    fn configured_buffer_sizes_preserve_exactness() {
-        let (_dir, equal_group, different_group) = create_equal_and_different_groups();
-
-        for buffer_size in [1_usize, 2, 4, 8, 16].map(|mib| mib * 1024 * 1024) {
-            let mut equal = equal_group.clone();
-            let mut equal_workspace = VerificationWorkspace::new(buffer_size);
-            assert!(
-                verify_group_buffered(&mut equal, &mut equal_workspace).expect("equal verification"),
-                "equal files failed with buffer size {buffer_size}"
-            );
-
-            let mut different = different_group.clone();
-            let mut different_workspace = VerificationWorkspace::new(buffer_size);
-            assert!(
-                !verify_group_buffered(&mut different, &mut different_workspace).expect("different verification"),
-                "different files passed with buffer size {buffer_size}"
-            );
-        }
-    }
-
-    #[test]
-    fn io_strategies_preserve_exactness() {
-        let (_dir, equal_group, different_group) = create_equal_and_different_groups();
-
-        for strategy in [IO_BASELINE, IO_SEQUENTIAL_HINT] {
-            let mut equal = equal_group.clone();
-            let mut equal_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-            assert!(
-                verify_group_with_io_strategy(&mut equal, &mut equal_workspace, strategy).expect("equal verification"),
-                "equal files failed with {strategy:?}"
-            );
-
-            let mut different = different_group.clone();
-            let mut different_workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-            assert!(
-                !verify_group_with_io_strategy(&mut different, &mut different_workspace, strategy).expect("different verification"),
-                "different files passed with {strategy:?}"
-            );
-        }
-
-
     }
 
     #[test]
@@ -642,13 +547,106 @@ mod tests {
 
         let mut equal = group_from_paths(vec![reference_path.clone(), same_a_path, same_b_path]);
         let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-        assert!(verify_group_pinned_handles(&mut equal, &mut workspace, true).expect("pinned equal verification"));
+        assert!(
+            verify_group_pinned_handles(&mut equal, &mut workspace, true)
+                .expect("pinned equal verification")
+        );
         assert_eq!(workspace.reference_bytes_read, size as u64);
         assert_eq!(workspace.candidate_bytes_read, (size as u64) * 2);
 
         let mut unequal = group_from_paths(vec![reference_path, different_path]);
         let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
-        assert!(!verify_group_pinned_handles(&mut unequal, &mut workspace, true).expect("pinned unequal verification"));
+        assert!(
+            !verify_group_pinned_handles(&mut unequal, &mut workspace, true)
+                .expect("pinned unequal verification")
+        );
+        assert!(!unequal.verified);
+    }
+
+    #[test]
+    fn pinned_handles_reject_difference_in_late_chunk() {
+        let dir = tempdir().expect("tempdir");
+        let size = VERIFY_BUFFER_SIZE * 2 + 4096;
+        let reference = vec![0x3C; size];
+        let mut different = reference.clone();
+        different[size - 17] ^= 0xFF;
+
+        let reference_path = dir.path().join("reference.bin");
+        let different_path = dir.path().join("different.bin");
+        fs::write(&reference_path, &reference).expect("write reference");
+        fs::write(&different_path, &different).expect("write different");
+
+        let mut group = group_from_paths(vec![reference_path, different_path]);
+        assert!(!StdBufferedVerifier.verify_group(&mut group).expect("verify"));
+        assert!(!group.verified);
+    }
+
+    #[test]
+    fn empty_files_are_exact_duplicates() {
+        let dir = tempdir().expect("tempdir");
+        let left = dir.path().join("empty-a.bin");
+        let right = dir.path().join("empty-b.bin");
+        fs::write(&left, []).expect("write left");
+        fs::write(&right, []).expect("write right");
+
+        let mut group = group_from_paths(vec![left, right]);
+        assert!(StdBufferedVerifier.verify_group(&mut group).expect("verify empty files"));
+        assert!(group.verified);
+    }
+
+    #[test]
+    fn singleton_group_is_never_verified() {
+        let dir = tempdir().expect("tempdir");
+        let only = dir.path().join("only.bin");
+        fs::write(&only, b"one file").expect("write file");
+
+        let mut group = group_from_paths(vec![only]);
+        assert!(!StdBufferedVerifier.verify_group(&mut group).expect("verify singleton"));
+        assert!(!group.verified);
+    }
+
+    #[test]
+    fn pinned_handle_cap_falls_back_safely() {
+        let dir = tempdir().expect("tempdir");
+        let data = vec![0x6D; 4096];
+        let file_count = MAX_PINNED_FILES_PER_GROUP + 1;
+
+        let mut paths = Vec::with_capacity(file_count);
+        for index in 0..file_count {
+            let path = dir.path().join(format!("large-group-{index:03}.bin"));
+            fs::write(&path, &data).expect("write test file");
+            paths.push(path);
+        }
+
+        let mut equal_group = group_from_paths(paths.clone());
+        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+        assert!(
+            verify_group_pinned_handles(&mut equal_group, &mut workspace, true)
+                .expect("fallback equal verification")
+        );
+        assert!(equal_group.verified);
+
+        let expected_reference_passes = (file_count - 1).div_ceil(MAX_CANDIDATES_PER_BATCH);
+        assert_eq!(
+            workspace.reference_bytes_read,
+            (data.len() as u64) * expected_reference_passes as u64
+        );
+        assert_eq!(
+            workspace.candidate_bytes_read,
+            (data.len() as u64) * (file_count as u64 - 1)
+        );
+
+        let mut changed = data.clone();
+        *changed.last_mut().expect("non-empty") ^= 0xFF;
+        fs::write(paths.last().expect("last path"), &changed).expect("overwrite last candidate");
+
+        let mut different_group = group_from_paths(paths);
+        let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+        assert!(
+            !verify_group_pinned_handles(&mut different_group, &mut workspace, true)
+                .expect("fallback unequal verification")
+        );
+        assert!(!different_group.verified);
     }
 
     #[test]
@@ -681,10 +679,55 @@ mod tests {
 
     #[cfg(feature = "fast_duplicates")]
     #[test]
+    fn verify_result_retains_only_exact_verified_groups() {
+        let dir = tempdir().expect("tempdir");
+
+        let equal = vec![0x31; 64 * 1024];
+        let different_a = vec![0x41; 64 * 1024];
+        let different_b = vec![0x42; 64 * 1024];
+
+        let equal_a = dir.path().join("equal-a.bin");
+        let equal_b = dir.path().join("equal-b.bin");
+        let diff_a = dir.path().join("diff-a.bin");
+        let diff_b = dir.path().join("diff-b.bin");
+        fs::write(&equal_a, &equal).expect("write equal a");
+        fs::write(&equal_b, &equal).expect("write equal b");
+        fs::write(&diff_a, &different_a).expect("write diff a");
+        fs::write(&diff_b, &different_b).expect("write diff b");
+
+        let mut result = DuplicateScanResult {
+            engine: "test",
+            groups: vec![
+                group_from_paths(vec![equal_a, equal_b]),
+                group_from_paths(vec![diff_a, diff_b]),
+            ],
+            elapsed: Duration::ZERO,
+        };
+
+        let verified = StdBufferedVerifier
+            .verify_result(&mut result)
+            .expect("verify result");
+        assert_eq!(verified, 1);
+        assert_eq!(result.groups.len(), 1);
+        assert!(result.groups[0].verified);
+        assert!(result.groups[0]
+            .files
+            .iter()
+            .all(|file| file.path.file_name().unwrap().to_string_lossy().starts_with("equal-")));
+    }
+
+    #[cfg(feature = "fast_duplicates")]
+    #[test]
     fn production_parallelism_policy_is_conservative() {
         assert_eq!(select_production_group_threads(0, 8), 1);
-        assert_eq!(select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY - 1, 8), 1);
-        assert_eq!(select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY, 5), 1);
+        assert_eq!(
+            select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY - 1, 8),
+            1
+        );
+        assert_eq!(
+            select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY, 5),
+            1
+        );
         assert_eq!(
             select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY, 6),
             PRODUCTION_GROUP_THREADS
@@ -698,7 +741,9 @@ mod tests {
     #[cfg(feature = "fast_duplicates")]
     #[test]
     fn parallel_group_verification_matches_sequential() {
-        use crate::duplicate_engine::{compare_results, DuplicateEngine, DuplicateScanRequest, FclonesEngine};
+        use crate::duplicate_engine::{
+            DuplicateEngine, DuplicateScanRequest, FclonesEngine, compare_results,
+        };
 
         let dir = tempdir().expect("tempdir");
         for group_index in 0..12_u8 {
@@ -707,8 +752,16 @@ mod tests {
             if let Some(last) = data.last_mut() {
                 *last = group_index;
             }
-            fs::write(dir.path().join(format!("group-{group_index:02}-a.bin")), &data).expect("write a");
-            fs::write(dir.path().join(format!("group-{group_index:02}-b.bin")), &data).expect("write b");
+            fs::write(
+                dir.path().join(format!("group-{group_index:02}-a.bin")),
+                &data,
+            )
+            .expect("write a");
+            fs::write(
+                dir.path().join(format!("group-{group_index:02}-b.bin")),
+                &data,
+            )
+            .expect("write b");
         }
 
         let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
@@ -718,11 +771,13 @@ mod tests {
         let mut sequential = candidates.clone();
         let seq_verified = verify_result_sequential(&mut sequential).expect("sequential verify");
         assert_eq!(seq_verified, 12);
+        assert_eq!(sequential.groups.len(), 12);
         assert!(sequential.groups.iter().all(|group| group.verified));
 
         let mut parallel = candidates.clone();
         let parallel_verified = verify_result_parallel_groups(&mut parallel).expect("parallel verify");
         assert_eq!(parallel_verified, 12);
+        assert_eq!(parallel.groups.len(), 12);
         assert!(parallel.groups.iter().all(|group| group.verified));
         assert!(compare_results(&sequential, &parallel).identical());
 
@@ -733,6 +788,7 @@ mod tests {
             .verify_result(&mut production)
             .expect("production verify");
         assert_eq!(production_verified, 12);
+        assert_eq!(production.groups.len(), 12);
         assert!(production.groups.iter().all(|group| group.verified));
         assert!(compare_results(&sequential, &production).identical());
     }
@@ -741,9 +797,12 @@ mod tests {
     #[test]
     #[ignore = "benchmark manual; definir KROKIET_DUP_BENCH_PATH"]
     fn exact_verifier_real_dataset_benchmark() {
-        use crate::duplicate_engine::{compare_results, DuplicateEngine, DuplicateScanRequest, FclonesEngine};
         use std::path::PathBuf;
         use std::time::Instant;
+
+        use crate::duplicate_engine::{
+            DuplicateEngine, DuplicateScanRequest, FclonesEngine, compare_results,
+        };
 
         let path = std::env::var("KROKIET_DUP_BENCH_PATH")
             .map(PathBuf::from)
@@ -776,12 +835,17 @@ mod tests {
         let request = DuplicateScanRequest::for_paths([path]);
 
         let baseline_candidates = FclonesEngine.scan(&request).expect("fallo fclones warm-up");
-        assert!(!baseline_candidates.groups.is_empty(), "el dataset no contiene grupos duplicados");
+        assert!(
+            !baseline_candidates.groups.is_empty(),
+            "el dataset no contiene grupos duplicados"
+        );
 
-        let selected_threads = select_production_group_threads(baseline_candidates.groups.len(), logical_cpus);
+        let selected_threads =
+            select_production_group_threads(baseline_candidates.groups.len(), logical_cpus);
 
         let mut sequential_warm = baseline_candidates.clone();
-        let seq_count = verify_result_sequential(&mut sequential_warm).expect("fallo warm-up secuencial");
+        let seq_count =
+            verify_result_sequential(&mut sequential_warm).expect("fallo warm-up secuencial");
         assert_eq!(seq_count, sequential_warm.groups.len());
 
         let mut production_warm = baseline_candidates.clone();
@@ -815,14 +879,15 @@ mod tests {
             assert!(compare_results(&baseline_candidates, &round_candidates).identical());
             println!("  scan comun : {:>10.3?}", scan_elapsed);
 
-            // Alternate order each round so neither path systematically benefits
-            // from being the first or second consumer of the page cache.
+            // Alternate order so neither path systematically benefits from being
+            // first or second consumer of the page cache.
             let production_first = round % 2 == 1;
 
             let run_sequential = |candidates: &DuplicateScanResult| {
                 let mut result = candidates.clone();
                 let started = Instant::now();
-                let verified = verify_result_sequential(&mut result).expect("fallo sequential");
+                let verified =
+                    verify_result_sequential(&mut result).expect("fallo sequential");
                 let elapsed = started.elapsed();
                 assert_eq!(verified, result.groups.len());
                 assert!(result.groups.iter().all(|group| group.verified));
@@ -906,6 +971,4 @@ mod tests {
         );
         println!("============================================================");
     }
-
-
 }
