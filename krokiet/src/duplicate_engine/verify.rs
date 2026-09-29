@@ -7,6 +7,11 @@ use std::os::windows::fs::OpenOptionsExt;
 
 #[cfg(all(test, feature = "fast_duplicates"))]
 use std::time::Duration;
+#[cfg(feature = "fast_duplicates")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "fast_duplicates")]
+use rayon::prelude::*;
 
 use super::types::{DuplicateGroup, metadata_fingerprint};
 #[cfg(feature = "fast_duplicates")]
@@ -89,6 +94,73 @@ impl ExactVerifier for StdBufferedVerifier {
 
         Ok(verified)
     }
+}
+
+#[cfg(feature = "fast_duplicates")]
+static VERIFY_POOL_2: OnceLock<rayon::ThreadPool> = OnceLock::new();
+#[cfg(feature = "fast_duplicates")]
+static VERIFY_POOL_4: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+#[cfg(feature = "fast_duplicates")]
+fn verification_pool(threads: usize) -> io::Result<&'static rayon::ThreadPool> {
+    let slot = match threads {
+        2 => &VERIFY_POOL_2,
+        4 => &VERIFY_POOL_4,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported exact-verifier thread count: {threads}"),
+            ));
+        }
+    };
+
+    if let Some(pool) = slot.get() {
+        return Ok(pool);
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(move |index| format!("krokiet-exact-{threads}-{index}"))
+        .build()
+        .map_err(|error| io::Error::other(format!("failed to build exact-verifier thread pool: {error}")))?;
+
+    // Another caller can race us only during initialization. If it wins, use
+    // the already-installed pool and simply drop this equivalent one.
+    let _ = slot.set(pool);
+    Ok(slot.get().expect("verification pool must be initialized"))
+}
+
+/// Experimental Phase 2.3 verifier.
+///
+/// Candidate reads inside one duplicate group stay serial because that already
+/// benchmarked better. This variant parallelizes only independent groups, so
+/// each worker owns its files and 1 MiB workspace and never shares mutable I/O
+/// state with another group.
+#[cfg(feature = "fast_duplicates")]
+fn verify_result_parallel_groups(result: &mut DuplicateScanResult, threads: usize) -> io::Result<usize> {
+    if threads <= 1 || result.groups.len() <= 1 {
+        return StdBufferedVerifier.verify_result(result);
+    }
+
+    let pool = verification_pool(threads)?;
+    let results: Vec<io::Result<bool>> = pool.install(|| {
+        result
+            .groups
+            .par_iter_mut()
+            .map(|group| {
+                let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
+                verify_group_pinned_handles(group, &mut workspace, true)
+            })
+            .collect()
+    });
+
+    let mut verified = 0;
+    for result in results {
+        if result? {
+            verified += 1;
+        }
+    }
+    Ok(verified)
 }
 
 #[inline]
@@ -1055,6 +1127,44 @@ mod tests {
 
     #[cfg(feature = "fast_duplicates")]
     #[test]
+    fn parallel_group_verification_matches_sequential() {
+        use crate::duplicate_engine::{compare_results, DuplicateEngine, DuplicateScanRequest, FclonesEngine};
+
+        let dir = tempdir().expect("tempdir");
+        for group_index in 0..12_u8 {
+            let size = 192 * 1024 + group_index as usize * 257;
+            let mut data = vec![group_index.wrapping_mul(17).wrapping_add(3); size];
+            if let Some(last) = data.last_mut() {
+                *last = group_index;
+            }
+            fs::write(dir.path().join(format!("group-{group_index:02}-a.bin")), &data).expect("write a");
+            fs::write(dir.path().join(format!("group-{group_index:02}-b.bin")), &data).expect("write b");
+        }
+
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let candidates = FclonesEngine.scan(&request).expect("fclones scan");
+        assert_eq!(candidates.groups.len(), 12);
+
+        let mut sequential = candidates.clone();
+        let mut parallel_2 = candidates.clone();
+        let mut parallel_4 = candidates;
+
+        let seq_verified = StdBufferedVerifier.verify_result(&mut sequential).expect("sequential verify");
+        let p2_verified = verify_result_parallel_groups(&mut parallel_2, 2).expect("parallel-2 verify");
+        let p4_verified = verify_result_parallel_groups(&mut parallel_4, 4).expect("parallel-4 verify");
+
+        assert_eq!(seq_verified, 12);
+        assert_eq!(p2_verified, 12);
+        assert_eq!(p4_verified, 12);
+        assert!(sequential.groups.iter().all(|group| group.verified));
+        assert!(parallel_2.groups.iter().all(|group| group.verified));
+        assert!(parallel_4.groups.iter().all(|group| group.verified));
+        assert!(compare_results(&sequential, &parallel_2).identical());
+        assert!(compare_results(&sequential, &parallel_4).identical());
+    }
+
+    #[cfg(feature = "fast_duplicates")]
+    #[test]
     fn prefix_suffix_candidates_are_split_by_exact_content() {
         use crate::duplicate_engine::{compare_results, DuplicateEngine, DuplicateScanRequest, FclonesEngine};
 
@@ -1117,108 +1227,91 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK FCLONES PREFILTER + EXACT REFINE");
+        println!(" KROKIET - BENCHMARK EXACT VERIFY POR GRUPOS");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
-        println!("Baseline      : fclones full hash + pinned exact verify");
-        println!("Candidato     : size/prefix/suffix + exact byte refinement");
-        println!("Buffer        : 1 MiB");
+        println!("Detector      : fclones full hash (sin cambiar)");
+        println!("Verifier      : pinned handles + 1 MiB + byte exacto");
+        println!("Estrategias   : secuencial / 2 grupos / 4 grupos");
         println!("Rondas        : {runs}");
-        println!("Seguridad     : solo grupos byte-identicos terminan verified=true");
+        println!("Seguridad     : misma verificacion exacta por grupo");
         println!();
 
         let request = DuplicateScanRequest::for_paths([path]);
 
-        // Correctness warm-up. The optimized candidate pipeline is allowed to
-        // produce extra groups before refinement, but after exact refinement it
-        // must be identical to fclones full-hash + exact verification.
-        let mut baseline_warm = FclonesEngine.scan(&request).expect("fallo full-hash warm-up");
-        let baseline_warm_groups = baseline_warm.groups.len();
-        let baseline_verified = StdBufferedVerifier
-            .verify_result(&mut baseline_warm)
-            .expect("fallo exact verify baseline warm-up");
-        assert_eq!(baseline_verified, baseline_warm_groups);
+        // Correctness warm-up. All strategies must produce exactly the same
+        // verified groups before any timing is considered.
+        let baseline_candidates = FclonesEngine.scan(&request).expect("fallo fclones warm-up");
+        assert!(!baseline_candidates.groups.is_empty(), "el dataset no contiene grupos duplicados");
 
-        let mut candidate_warm = FclonesEngine
-            .scan_prefix_suffix_candidates(&request)
-            .expect("fallo prefilter warm-up");
-        let prefilter_groups = candidate_warm.groups.len();
-        let prefilter_files = candidate_warm.file_count();
-        let refined_warm = refine_result_exact(&mut candidate_warm).expect("fallo exact refine warm-up");
-        assert_eq!(refined_warm, candidate_warm.groups.len());
+        let mut sequential_warm = baseline_candidates.clone();
+        let mut parallel_2_warm = baseline_candidates.clone();
+        let mut parallel_4_warm = baseline_candidates.clone();
 
-        let comparison = compare_results(&baseline_warm, &candidate_warm);
-        assert!(comparison.identical(), "warm-up produjo resultados distintos: {comparison:#?}");
+        let seq_count = StdBufferedVerifier
+            .verify_result(&mut sequential_warm)
+            .expect("fallo warm-up secuencial");
+        let p2_count = verify_result_parallel_groups(&mut parallel_2_warm, 2).expect("fallo warm-up parallel-2");
+        let p4_count = verify_result_parallel_groups(&mut parallel_4_warm, 4).expect("fallo warm-up parallel-4");
+
+        assert_eq!(seq_count, sequential_warm.groups.len());
+        assert_eq!(p2_count, parallel_2_warm.groups.len());
+        assert_eq!(p4_count, parallel_4_warm.groups.len());
+        assert!(compare_results(&sequential_warm, &parallel_2_warm).identical());
+        assert!(compare_results(&sequential_warm, &parallel_4_warm).identical());
 
         println!("Warm-up       : resultados exactos identicos [OK]");
-        println!("Prefilter     : {prefilter_groups} grupos / {prefilter_files} archivos candidatos");
-        println!("Final exacto  : {} grupos / {} archivos", candidate_warm.groups.len(), candidate_warm.file_count());
+        println!("Grupos        : {}", baseline_candidates.groups.len());
+        println!("Archivos      : {}", baseline_candidates.file_count());
 
-        let names = ["full-hash+verify", "prefilter+refine"];
-        let mut scan_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
-        let mut exact_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
-        let mut total_times = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        let names = ["sequential", "groups-2", "groups-4"];
+        let mut scan_times = [Vec::with_capacity(runs), Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        let mut exact_times = [Vec::with_capacity(runs), Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        let mut total_times = [Vec::with_capacity(runs), Vec::with_capacity(runs), Vec::with_capacity(runs)];
 
         for round in 0..runs {
             println!();
             println!("RONDA {}/{}", round + 1, runs);
 
-            for offset in 0..2 {
-                let index = (round + offset) % 2;
+            for offset in 0..3 {
+                let index = (round + offset) % 3;
                 let total_started = Instant::now();
-
-                let (mut result, pre_groups, pre_files) = if index == 0 {
-                    let result = FclonesEngine.scan(&request).expect("fallo fclones full hash");
-                    let groups = result.groups.len();
-                    let files = result.file_count();
-                    (result, groups, files)
-                } else {
-                    let result = FclonesEngine
-                        .scan_prefix_suffix_candidates(&request)
-                        .expect("fallo fclones prefilter");
-                    let groups = result.groups.len();
-                    let files = result.file_count();
-                    (result, groups, files)
-                };
-
+                let mut result = FclonesEngine.scan(&request).expect("fallo fclones");
                 let scan_elapsed = result.elapsed;
+
                 let exact_started = Instant::now();
-                let exact_groups = if index == 0 {
-                    let expected = result.groups.len();
-                    let verified = StdBufferedVerifier.verify_result(&mut result).expect("fallo exact verify baseline");
-                    assert_eq!(verified, expected);
-                    verified
-                } else {
-                    refine_result_exact(&mut result).expect("fallo exact refine candidate")
+                let verified = match index {
+                    0 => StdBufferedVerifier.verify_result(&mut result).expect("fallo sequential"),
+                    1 => verify_result_parallel_groups(&mut result, 2).expect("fallo groups-2"),
+                    2 => verify_result_parallel_groups(&mut result, 4).expect("fallo groups-4"),
+                    _ => unreachable!(),
                 };
                 let exact_elapsed = exact_started.elapsed();
                 let total_elapsed = total_started.elapsed();
 
-                if index == 1 {
-                    let comparison = compare_results(&baseline_warm, &result);
-                    assert!(comparison.identical(), "prefilter exacto difiere del baseline: {comparison:#?}");
-                }
-
+                assert_eq!(verified, result.groups.len(), "{} no verifico todos los grupos", names[index]);
                 assert!(result.groups.iter().all(|group| group.verified));
+                assert!(compare_results(&sequential_warm, &result).identical(), "{} produjo resultados distintos", names[index]);
+
                 scan_times[index].push(scan_elapsed);
                 exact_times[index].push(exact_elapsed);
                 total_times[index].push(total_elapsed);
 
                 println!(
-                    "  {:<17}: scan {:>10.3?} | exact {:>10.3?} | total {:>10.3?} | pre {pre_groups:>3}g/{pre_files:>3}f -> {exact_groups:>3}g/{:>3}f [OK]",
+                    "  {:<10}: scan {:>10.3?} | exact {:>10.3?} | total {:>10.3?} | {verified}/{} [OK]",
                     names[index],
                     scan_elapsed,
                     exact_elapsed,
                     total_elapsed,
-                    result.file_count(),
+                    result.groups.len(),
                 );
             }
         }
 
-        let mut scan_medians = [Duration::ZERO; 2];
-        let mut exact_medians = [Duration::ZERO; 2];
-        let mut total_medians = [Duration::ZERO; 2];
-        for index in 0..2 {
+        let mut scan_medians = [Duration::ZERO; 3];
+        let mut exact_medians = [Duration::ZERO; 3];
+        let mut total_medians = [Duration::ZERO; 3];
+        for index in 0..3 {
             scan_medians[index] = median_duration(&mut scan_times[index]);
             exact_medians[index] = median_duration(&mut exact_times[index]);
             total_medians[index] = median_duration(&mut total_times[index]);
@@ -1228,17 +1321,37 @@ mod tests {
         println!("------------------------------------------------------------");
         println!(" MEDIANA DE {runs} RONDA(S)");
         println!("------------------------------------------------------------");
-        for index in 0..2 {
+        for index in 0..3 {
             println!(
-                " {:<17}: scan {:>10.3?} | exact {:>10.3?} | total {:>10.3?}",
+                " {:<10}: scan {:>10.3?} | exact {:>10.3?} | total {:>10.3?}",
                 names[index], scan_medians[index], exact_medians[index], total_medians[index]
             );
         }
+
+        let (best_exact_index, best_exact) = exact_medians
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, duration)| duration.as_nanos())
+            .expect("benchmark sin exact timings");
+        let (best_total_index, best_total) = total_medians
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, duration)| duration.as_nanos())
+            .expect("benchmark sin total timings");
+
         println!("------------------------------------------------------------");
-        if total_medians[1].as_secs_f64() > 0.0 {
+        println!(" Mejor exact   : {} ({:.3?})", names[best_exact_index], best_exact);
+        println!(" Mejor pipeline: {} ({:.3?})", names[best_total_index], best_total);
+        if best_exact.as_secs_f64() > 0.0 {
             println!(
-                " Prefilter vs full: {:.3}x (pipeline seguro)",
-                total_medians[0].as_secs_f64() / total_medians[1].as_secs_f64()
+                " Exact vs seq   : {:.3}x",
+                exact_medians[0].as_secs_f64() / best_exact.as_secs_f64()
+            );
+        }
+        if best_total.as_secs_f64() > 0.0 {
+            println!(
+                " Total vs seq   : {:.3}x",
+                total_medians[0].as_secs_f64() / best_total.as_secs_f64()
             );
         }
         println!("============================================================");
