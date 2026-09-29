@@ -106,6 +106,10 @@ static VERIFY_POOL_4: OnceLock<rayon::ThreadPool> = OnceLock::new();
 static VERIFY_POOL_6: OnceLock<rayon::ThreadPool> = OnceLock::new();
 #[cfg(feature = "fast_duplicates")]
 static VERIFY_POOL_8: OnceLock<rayon::ThreadPool> = OnceLock::new();
+#[cfg(feature = "fast_duplicates")]
+static VERIFY_POOL_12: OnceLock<rayon::ThreadPool> = OnceLock::new();
+#[cfg(feature = "fast_duplicates")]
+static VERIFY_POOL_16: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 #[cfg(feature = "fast_duplicates")]
 fn verification_pool(threads: usize) -> io::Result<&'static rayon::ThreadPool> {
@@ -115,6 +119,8 @@ fn verification_pool(threads: usize) -> io::Result<&'static rayon::ThreadPool> {
         4 => &VERIFY_POOL_4,
         6 => &VERIFY_POOL_6,
         8 => &VERIFY_POOL_8,
+        12 => &VERIFY_POOL_12,
+        16 => &VERIFY_POOL_16,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1159,7 +1165,7 @@ mod tests {
         assert_eq!(seq_verified, 12);
         assert!(sequential.groups.iter().all(|group| group.verified));
 
-        for threads in [2, 3, 4, 6, 8] {
+        for threads in [2, 3, 4, 6, 8, 12, 16] {
             let mut parallel = candidates.clone();
             let verified = verify_result_parallel_groups(&mut parallel, threads)
                 .unwrap_or_else(|error| panic!("parallel-{threads} verify failed: {error}"));
@@ -1233,12 +1239,16 @@ mod tests {
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK EXACT VERIFY: ESCALADO POR GRUPOS");
+        println!(" KROKIET - BENCHMARK EXACT VERIFY: LIMITE DE ESCALADO");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
         println!("Detector      : fclones full hash (una vez por ronda)");
         println!("Verifier      : pinned handles + 1 MiB + byte exacto");
-        println!("Estrategias   : secuencial / 3 / 4 / 6 / 8 grupos");
+        println!("Estrategias   : secuencial / 6 / 8 / 12 / 16 grupos");
+        println!(
+            "CPU logicos    : {}",
+            std::thread::available_parallelism().map(|value| value.get()).unwrap_or(1)
+        );
         println!("Rondas        : {runs}");
         println!("Medicion      : mismo resultado fclones para todas las estrategias de una ronda");
         println!("Pipeline      : scan comun de la ronda + tiempo exact de cada estrategia");
@@ -1257,7 +1267,7 @@ mod tests {
             .expect("fallo warm-up secuencial");
         assert_eq!(seq_count, sequential_warm.groups.len());
 
-        for threads in [3, 4, 6, 8] {
+        for threads in [6, 8, 12, 16] {
             let mut parallel_warm = baseline_candidates.clone();
             let count = verify_result_parallel_groups(&mut parallel_warm, threads)
                 .unwrap_or_else(|error| panic!("fallo warm-up groups-{threads}: {error}"));
@@ -1271,10 +1281,10 @@ mod tests {
 
         let strategies: [(&str, usize); 5] = [
             ("sequential", 1),
-            ("groups-3", 3),
-            ("groups-4", 4),
             ("groups-6", 6),
             ("groups-8", 8),
+            ("groups-12", 12),
+            ("groups-16", 16),
         ];
         let mut scan_times = Vec::with_capacity(runs);
         let mut exact_times: Vec<Vec<Duration>> = (0..strategies.len()).map(|_| Vec::with_capacity(runs)).collect();
@@ -1295,7 +1305,8 @@ mod tests {
             println!("  scan comun : {:>10.3?}", scan_elapsed);
 
             // Rotate which verifier runs first so warm-cache effects are spread
-            // across all strategies over the benchmark.
+            // across all strategies over the benchmark. This phase searches for
+            // the saturation point above the previously winning 8-group setting.
             for offset in 0..strategies.len() {
                 let index = (round + offset) % strategies.len();
                 let (name, threads) = strategies[index];
