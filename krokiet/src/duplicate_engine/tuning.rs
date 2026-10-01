@@ -16,10 +16,11 @@ use serde_json::{Value, json};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Version 5 adds an adaptive rescue pass. If the normal 250 ms calibration is
-// invalid, every candidate is measured again from scratch with a longer window
-// and stronger paired confirmation. Old profiles are deliberately ignored.
-const TUNING_FORMAT_VERSION: u64 = 5;
+// Version 6 keeps the adaptive rescue pass and changes Windows storage identity
+// from a drive letter to the underlying volume when possible. It also adds a
+// read-only/permission-safe planning API so lack of write access never blocks a
+// duplicate scan. Old profiles are deliberately ignored.
+const TUNING_FORMAT_VERSION: u64 = 6;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
 const DEFAULT_RECHECK_ROUNDS: usize = 4;
@@ -34,6 +35,11 @@ const MIN_GROUPS: usize = 8;
 const HIGH_STABILITY_RELATIVE_MAD: f64 = 0.04;
 const LOW_STABILITY_RELATIVE_MAD: f64 = 0.08;
 const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
+
+/// Conservative verifier concurrency used when a storage has no usable profile
+/// and no writable place where Krokiet can calibrate it. Correctness is unchanged;
+/// only performance can be lower until a real profile becomes available.
+pub(crate) const SAFE_FALLBACK_WORKERS: usize = 1;
 
 /// Controls the one-off calibration workload.
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +143,45 @@ impl CalibrationStability {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum VerifierTuningPlan {
+    /// A previously calibrated profile can be reused immediately.
+    UseProfile {
+        storage_key: String,
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    /// No profile exists, but Krokiet found a writable directory on the same
+    /// storage and can calibrate there.
+    Calibrate {
+        storage_key: String,
+        directory: PathBuf,
+    },
+    /// No profile exists and calibration cannot safely create temporary files.
+    /// Scanning should continue with a conservative worker count.
+    Fallback {
+        storage_key: String,
+        workers: usize,
+    },
+}
+
+impl VerifierTuningPlan {
+    pub(crate) fn storage_key(&self) -> &str {
+        match self {
+            Self::UseProfile { storage_key, .. }
+            | Self::Calibrate { storage_key, .. }
+            | Self::Fallback { storage_key, .. } => storage_key,
+        }
+    }
+
+    pub(crate) fn workers(&self) -> Option<usize> {
+        match self {
+            Self::UseProfile { workers, .. } | Self::Fallback { workers, .. } => Some(*workers),
+            Self::Calibrate { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct VerifierTuningProfile {
     /// Stable storage identifier for the calibrated directory.
     pub storage_key: String,
@@ -207,6 +252,17 @@ impl VerifierTuningStore {
         &self.profiles
     }
 
+    pub(crate) fn profile_for_storage_key(&self, storage_key: &str) -> Option<&VerifierTuningProfile> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.storage_key == storage_key && profile.stability != CalibrationStability::Invalid)
+    }
+
+    pub(crate) fn profile_for_path(&self, path: &Path) -> io::Result<Option<&VerifierTuningProfile>> {
+        let storage_key = storage_key_for_path(path)?;
+        Ok(self.profile_for_storage_key(&storage_key))
+    }
+
     pub(crate) fn upsert(&mut self, profile: VerifierTuningProfile) {
         if let Some(existing) = self
             .profiles
@@ -234,17 +290,9 @@ impl VerifierTuningStore {
         let mut selected: Option<usize> = None;
         for path in paths {
             let key = storage_key_for_path(path)?;
-            let Some(profile) = self
-                .profiles
-                .iter()
-                .find(|profile| profile.storage_key == key)
-            else {
+            let Some(profile) = self.profile_for_storage_key(&key) else {
                 return Ok(None);
             };
-
-            if profile.stability == CalibrationStability::Invalid {
-                return Ok(None);
-            }
 
             selected = Some(match selected {
                 Some(current) => current.min(profile.workers),
@@ -419,6 +467,106 @@ impl VerifierTuningStore {
         }
         fs::rename(temporary, path)
     }
+}
+
+/// Decides what Krokiet should do for one path without ever requiring write
+/// access just to continue a scan. Existing profiles win first; otherwise a
+/// writable location on the same storage is selected for calibration. If none
+/// exists, Krokiet falls back to one verifier worker and skips calibration.
+pub(crate) fn tuning_plan_for_path(
+    store: &VerifierTuningStore,
+    path: &Path,
+) -> io::Result<VerifierTuningPlan> {
+    let storage_key = storage_key_for_path(path)?;
+
+    if let Some(profile) = store.profile_for_storage_key(&storage_key) {
+        return Ok(VerifierTuningPlan::UseProfile {
+            storage_key,
+            workers: profile.workers,
+            stability: profile.stability,
+        });
+    }
+
+    if let Some(directory) = find_writable_calibration_directory(path)? {
+        return Ok(VerifierTuningPlan::Calibrate {
+            storage_key,
+            directory,
+        });
+    }
+
+    Ok(VerifierTuningPlan::Fallback {
+        storage_key,
+        workers: SAFE_FALLBACK_WORKERS,
+    })
+}
+
+/// Finds a place on the same storage where temporary calibration files can be
+/// created. The requested directory is preferred. If it is protected, ancestors
+/// on the same storage are tried. Nothing outside that storage is used.
+pub(crate) fn find_writable_calibration_directory(path: &Path) -> io::Result<Option<PathBuf>> {
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::metadata(&canonical)?;
+    let start = if metadata.is_dir() {
+        canonical
+    } else {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory"))?
+    };
+
+    let target_storage = storage_key_for_path(&start)?;
+
+    for candidate in start.ancestors() {
+        if !candidate.is_dir() {
+            continue;
+        }
+
+        let Ok(candidate_storage) = storage_key_for_path(candidate) else {
+            continue;
+        };
+        if candidate_storage != target_storage {
+            continue;
+        }
+
+        if calibration_write_probe(candidate) {
+            return Ok(Some(candidate.to_path_buf()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn calibration_write_probe(parent: &Path) -> bool {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..4_u32 {
+        let root = parent.join(format!(
+            ".krokiet-verifier-write-probe-{pid}-{nanos}-{attempt}"
+        ));
+
+        match fs::create_dir(&root) {
+            Ok(()) => {
+                let probe_file = root.join("probe.bin");
+                let result = (|| -> io::Result<()> {
+                    let mut file = File::create(&probe_file)?;
+                    file.write_all(&[0x4B])?;
+                    file.flush()?;
+                    Ok(())
+                })();
+                let _ = fs::remove_dir_all(&root);
+                return result.is_ok();
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        }
+    }
+
+    false
 }
 
 /// Performs a one-off calibration and persists it only when the measurement is
@@ -1233,14 +1381,22 @@ pub(crate) fn storage_key_for_path(path: &Path) -> io::Result<String> {
     };
 
     let key = match prefix_component.kind() {
-        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
-            format!("windows-disk:{}", (letter as char).to_ascii_uppercase())
-        }
+        // Network shares are already identified independently from a mapped drive
+        // letter, so keep server/share as the stable key.
         Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
             "windows-unc:{}\\{}",
             server.to_string_lossy().to_ascii_lowercase(),
             share.to_string_lossy().to_ascii_lowercase(),
         ),
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            // Prefer the Windows volume GUID. This survives a USB changing from,
+            // for example, Q: to F: on the same machine. If Windows cannot expose
+            // a volume GUID, retain the old drive-letter fallback rather than
+            // making tuning fail.
+            windows_volume_key(&canonical).unwrap_or_else(|_| {
+                format!("windows-disk:{}", (letter as char).to_ascii_uppercase())
+            })
+        }
         Prefix::DeviceNS(device) => {
             format!(
                 "windows-device:{}",
@@ -1256,6 +1412,86 @@ pub(crate) fn storage_key_for_path(path: &Path) -> io::Result<String> {
     };
 
     Ok(key)
+}
+
+#[cfg(windows)]
+fn windows_volume_key(path: &Path) -> io::Result<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumePathNameW(
+            lpsz_file_name: *const u16,
+            lpsz_volume_path_name: *mut u16,
+            cch_buffer_length: u32,
+        ) -> i32;
+        fn GetVolumeNameForVolumeMountPointW(
+            lpsz_volume_mount_point: *const u16,
+            lpsz_volume_name: *mut u16,
+            cch_buffer_length: u32,
+        ) -> i32;
+    }
+
+    fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn wide_to_string(buffer: &[u16]) -> String {
+        let end = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+        OsString::from_wide(&buffer[..end])
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    const PATH_CAPACITY: usize = 32_768;
+    const VOLUME_CAPACITY: usize = 1_024;
+
+    let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    // `canonicalize` commonly returns `\\?\C:\...`. The volume APIs are
+    // most compatible with the regular `C:\...` spelling for drive paths.
+    if input.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+        input.drain(..4);
+    }
+    input.push(0);
+
+    let mut mount_point = vec![0_u16; PATH_CAPACITY];
+    let mount_ok = unsafe {
+        GetVolumePathNameW(
+            input.as_ptr(),
+            mount_point.as_mut_ptr(),
+            PATH_CAPACITY as u32,
+        )
+    };
+    if mount_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mount_point_string = wide_to_string(&mount_point);
+    let mount_point_wide = wide_null(std::ffi::OsStr::new(&mount_point_string));
+    let mut volume_name = vec![0_u16; VOLUME_CAPACITY];
+    let volume_ok = unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_point_wide.as_ptr(),
+            volume_name.as_mut_ptr(),
+            VOLUME_CAPACITY as u32,
+        )
+    };
+    if volume_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let raw = wide_to_string(&volume_name);
+    let without_prefix = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let normalized = without_prefix
+        .trim_end_matches(|character| character == '\\' || character == '/')
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Err(io::Error::other("Windows returned an empty volume identifier"));
+    }
+
+    Ok(format!("windows-volume:{normalized}"))
 }
 
 #[cfg(unix)]
@@ -1443,6 +1679,53 @@ mod tests {
                 .expect("lookup"),
             None
         );
+    }
+
+    #[test]
+    fn writable_calibration_directory_prefers_requested_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let selected = find_writable_calibration_directory(dir.path())
+            .expect("writable lookup")
+            .expect("temporary directory should be writable");
+        assert_eq!(
+            fs::canonicalize(&selected).expect("selected canonical"),
+            fs::canonicalize(dir.path()).expect("temp canonical")
+        );
+    }
+
+    #[test]
+    fn tuning_plan_reuses_an_existing_profile_without_probing_for_calibration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(VerifierTuningProfile {
+            storage_key: storage_key.clone(),
+            calibrated_path: dir.path().to_path_buf(),
+            workers: 6,
+            logical_cpus: 8,
+            median_mib_per_second: 4000.0,
+            selected_samples: 9,
+            selected_verification_runs: 45,
+            relative_mad: 0.03,
+            decision_relative_mad: 0.04,
+            global_relative_mad: 0.05,
+            selected_slowdown_vs_fastest: 0.01,
+            stability: CalibrationStability::Medium,
+            calibrated_at_unix_seconds: 42,
+        });
+
+        match tuning_plan_for_path(&store, dir.path()).expect("plan") {
+            VerifierTuningPlan::UseProfile {
+                storage_key: key,
+                workers,
+                stability,
+            } => {
+                assert_eq!(key, storage_key);
+                assert_eq!(workers, 6);
+                assert_eq!(stability, CalibrationStability::Medium);
+            }
+            other => panic!("expected stored profile, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "fast_duplicates")]

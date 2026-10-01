@@ -24,7 +24,10 @@ mod verify;
 mod tuning;
 
 #[cfg(not(test))]
-use tuning::{CalibrationOptions, CalibrationStability, calibrate_directory};
+use tuning::{
+    CalibrationOptions, CalibrationStability, SAFE_FALLBACK_WORKERS, calibrate_directory,
+    find_writable_calibration_directory, storage_key_for_path,
+};
 
 #[cfg(not(test))]
 fn main() -> ExitCode {
@@ -53,19 +56,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 2.9.2.2");
+    println!(" KROKIET - VERIFIER TUNING 2.9.2.3");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo            : calibracion local independiente");
     println!();
 
-    let report = calibrate_directory(&path, CalibrationOptions::default())?;
+    let canonical_requested = std::fs::canonicalize(&path)?;
+    let storage_key = storage_key_for_path(&canonical_requested)?;
+    let Some(calibration_directory) = find_writable_calibration_directory(&canonical_requested)? else {
+        println!("Ruta canonica   : {}", canonical_requested.display());
+        println!("Storage key     : {storage_key}");
+        println!("Escritura       : no disponible para calibracion");
+        println!("Calibracion     : OMITIDA");
+        println!(
+            "Workers         : {} (fallback seguro)",
+            SAFE_FALLBACK_WORKERS
+        );
+        println!();
+        println!("La busqueda de duplicados puede continuar normalmente.");
+        println!("============================================================");
+        return Ok(());
+    };
 
-    println!(
-        "Ruta canonica   : {}",
-        report.profile.calibrated_path.display()
-    );
-    println!("Storage key     : {}", report.profile.storage_key);
+    if calibration_directory != canonical_requested {
+        println!("Ruta canonica   : {}", canonical_requested.display());
+        println!("Storage key     : {storage_key}");
+        println!(
+            "Carpeta prueba  : {}",
+            calibration_directory.display()
+        );
+        println!();
+    }
+
+    let report = calibrate_directory(&calibration_directory, CalibrationOptions::default())?;
+
+    if calibration_directory == canonical_requested {
+        println!(
+            "Ruta canonica   : {}",
+            canonical_requested.display()
+        );
+        println!("Storage key     : {}", report.profile.storage_key);
+    }
     println!("CPU logicos     : {}", report.profile.logical_cpus);
     println!("Grupos          : {}", report.groups);
     println!(
