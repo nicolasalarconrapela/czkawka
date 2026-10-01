@@ -16,35 +16,43 @@ use serde_json::{Value, json};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Version 2 changes the benchmark methodology: five base rounds, finalist
-// rechecks and stability metadata. Old profiles are intentionally invalidated.
-const TUNING_FORMAT_VERSION: u64 = 2;
+// Version 3 changes the calibration methodology substantially: every timed
+// sample now spans a minimum verifier-time window and close finalists receive a
+// paired confirmation. Old profiles are deliberately ignored.
+const TUNING_FORMAT_VERSION: u64 = 3;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
 const DEFAULT_RECHECK_ROUNDS: usize = 4;
+const DEFAULT_PAIR_ROUNDS: usize = 5;
 const DEFAULT_MAX_WORKERS: usize = 16;
 const DEFAULT_TIE_MARGIN: f64 = 0.05;
 const DEFAULT_RECHECK_MARGIN: f64 = 0.10;
+const DEFAULT_TARGET_SAMPLE_TIME: Duration = Duration::from_millis(250);
 const MIN_GROUPS: usize = 8;
 const HIGH_STABILITY_RELATIVE_MAD: f64 = 0.04;
 const LOW_STABILITY_RELATIVE_MAD: f64 = 0.08;
+const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
 
 /// Controls the one-off calibration workload.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CalibrationOptions {
     /// Size of each temporary file. Every group contains two identical files.
     pub file_size: u64,
-    /// Number of timed repetitions for every candidate worker count.
+    /// Number of robust timed windows for every candidate worker count.
     pub rounds: usize,
-    /// Extra repetitions for candidates close enough to the initial winner.
+    /// Extra timed windows for candidates close to the initial winner.
     pub recheck_rounds: usize,
+    /// Number of paired confirmation rounds between finalists.
+    pub pair_rounds: usize,
+    /// Minimum amount of actual verifier time represented by one timed sample.
+    pub target_sample_time: Duration,
     /// Safety ceiling for the number of verifier workers tested.
     pub max_workers: usize,
     /// If several candidates are within this fraction of the fastest median,
     /// prefer the one using fewer workers.
     pub tie_margin: f64,
     /// Candidates within this fraction of the fastest initial median are
-    /// re-measured before the final selection.
+    /// re-measured and considered for paired confirmation.
     pub recheck_margin: f64,
 }
 
@@ -54,6 +62,8 @@ impl Default for CalibrationOptions {
             file_size: DEFAULT_FILE_SIZE,
             rounds: DEFAULT_ROUNDS,
             recheck_rounds: DEFAULT_RECHECK_ROUNDS,
+            pair_rounds: DEFAULT_PAIR_ROUNDS,
+            target_sample_time: DEFAULT_TARGET_SAMPLE_TIME,
             max_workers: DEFAULT_MAX_WORKERS,
             tie_margin: DEFAULT_TIE_MARGIN,
             recheck_margin: DEFAULT_RECHECK_MARGIN,
@@ -65,10 +75,25 @@ impl Default for CalibrationOptions {
 pub(crate) struct TuningMeasurement {
     pub workers: usize,
     pub samples: usize,
+    /// Total exact-verifier invocations represented by the robust samples.
+    pub verification_runs: usize,
+    /// Median normalized time for one exact-verifier pass.
     pub median: Duration,
     pub median_mib_per_second: f64,
     /// Median absolute deviation divided by the median. Lower is more stable.
     pub relative_mad: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PairwiseMeasurement {
+    pub incumbent_workers: usize,
+    pub challenger_workers: usize,
+    pub pairs: usize,
+    /// challenger_time / incumbent_time. Values below 1.0 favor the challenger.
+    pub median_ratio: f64,
+    /// Number of pairs where the challenger was at least `tie_margin` faster.
+    pub decisive_challenger_wins: usize,
+    pub promoted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +101,7 @@ pub(crate) enum CalibrationStability {
     High,
     Medium,
     Low,
+    Invalid,
 }
 
 impl CalibrationStability {
@@ -84,6 +110,7 @@ impl CalibrationStability {
             Self::High => "high",
             Self::Medium => "medium",
             Self::Low => "low",
+            Self::Invalid => "invalid",
         }
     }
 
@@ -92,6 +119,7 @@ impl CalibrationStability {
             Self::High => "alta",
             Self::Medium => "media",
             Self::Low => "baja",
+            Self::Invalid => "invalida",
         }
     }
 
@@ -100,6 +128,7 @@ impl CalibrationStability {
             "high" => Some(Self::High),
             "medium" => Some(Self::Medium),
             "low" => Some(Self::Low),
+            "invalid" => Some(Self::Invalid),
             _ => None,
         }
     }
@@ -117,12 +146,18 @@ pub(crate) struct VerifierTuningProfile {
     pub logical_cpus: usize,
     /// Throughput of the selected configuration on the synthetic exact-verify workload.
     pub median_mib_per_second: f64,
-    /// Number of timed samples that contributed to the selected result.
+    /// Number of robust samples that contributed to the selected result.
     pub selected_samples: usize,
+    /// Total exact-verifier invocations represented by those samples.
+    pub selected_verification_runs: usize,
     /// Robust relative dispersion of the selected candidate.
     pub relative_mad: f64,
+    /// Median robust dispersion across all tested candidates. This catches
+    /// system-wide instability even when the final candidate itself looks quiet.
+    pub global_relative_mad: f64,
     /// How much slower the selected candidate is than the absolute fastest
-    /// candidate. This can be non-zero because the tie policy prefers fewer workers.
+    /// aggregate candidate. This can be non-zero because the tie policy prefers
+    /// lower concurrency.
     pub selected_slowdown_vs_fastest: f64,
     pub stability: CalibrationStability,
     pub calibrated_at_unix_seconds: u64,
@@ -132,12 +167,17 @@ pub(crate) struct VerifierTuningProfile {
 pub(crate) struct CalibrationReport {
     pub profile: VerifierTuningProfile,
     pub measurements: Vec<TuningMeasurement>,
+    pub pairwise: Vec<PairwiseMeasurement>,
     pub groups: usize,
     pub bytes_per_run: u64,
     pub initial_rounds: usize,
     pub recheck_rounds: usize,
+    pub pair_rounds: usize,
+    pub target_sample_time: Duration,
     pub initial_selected_workers: usize,
+    pub aggregate_selected_workers: usize,
     pub rechecked_workers: Vec<usize>,
+    pub paired_workers: Vec<usize>,
 }
 
 /// Small persistent store. Krokiet can keep this alongside its normal settings.
@@ -169,9 +209,9 @@ impl VerifierTuningStore {
 
     /// Returns the worker budget for all requested paths.
     ///
-    /// If every path has a profile, the most conservative worker count is used
-    /// across storages. If at least one storage is unknown, `None` is returned so
-    /// the caller can keep the verifier sequential or ask for calibration.
+    /// If every path has a valid profile, the most conservative worker count is
+    /// used across storages. If at least one storage is unknown or invalid,
+    /// `None` is returned so the caller can stay sequential or request tuning.
     pub(crate) fn workers_for_paths(&self, paths: &[PathBuf]) -> io::Result<Option<usize>> {
         if paths.is_empty() {
             return Ok(None);
@@ -187,6 +227,10 @@ impl VerifierTuningStore {
             else {
                 return Ok(None);
             };
+
+            if profile.stability == CalibrationStability::Invalid {
+                return Ok(None);
+            }
 
             selected = Some(match selected {
                 Some(current) => current.min(profile.workers),
@@ -208,8 +252,6 @@ impl VerifierTuningStore {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
         if value.get("version").and_then(Value::as_u64) != Some(TUNING_FORMAT_VERSION) {
-            // Unknown/old versions are ignored rather than risking a stale tuning
-            // decision after the benchmark methodology changes.
             return Ok(Self::default());
         }
 
@@ -231,7 +273,14 @@ impl VerifierTuningStore {
             let Some(logical_cpus) = item.get("logical_cpus").and_then(Value::as_u64) else {
                 continue;
             };
-            let Some(selected_samples) = item.get("selected_samples").and_then(Value::as_u64) else {
+            let Some(selected_samples) = item.get("selected_samples").and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(selected_verification_runs) = item
+                .get("selected_verification_runs")
+                .and_then(Value::as_u64)
+            else {
                 continue;
             };
             let Some(stability) = item
@@ -248,6 +297,10 @@ impl VerifierTuningStore {
                 .unwrap_or(0.0);
             let relative_mad = item
                 .get("relative_mad")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let global_relative_mad = item
+                .get("global_relative_mad")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
             let selected_slowdown_vs_fastest = item
@@ -268,7 +321,14 @@ impl VerifierTuningStore {
             let Ok(selected_samples) = usize::try_from(selected_samples) else {
                 continue;
             };
-            if workers == 0 || logical_cpus == 0 || selected_samples == 0 {
+            let Ok(selected_verification_runs) = usize::try_from(selected_verification_runs) else {
+                continue;
+            };
+            if workers == 0
+                || logical_cpus == 0
+                || selected_samples == 0
+                || selected_verification_runs == 0
+            {
                 continue;
             }
 
@@ -279,7 +339,9 @@ impl VerifierTuningStore {
                 logical_cpus,
                 median_mib_per_second,
                 selected_samples,
+                selected_verification_runs,
                 relative_mad,
+                global_relative_mad,
                 selected_slowdown_vs_fastest,
                 stability,
                 calibrated_at_unix_seconds,
@@ -307,7 +369,9 @@ impl VerifierTuningStore {
                     "logical_cpus": profile.logical_cpus,
                     "median_mib_per_second": profile.median_mib_per_second,
                     "selected_samples": profile.selected_samples,
+                    "selected_verification_runs": profile.selected_verification_runs,
                     "relative_mad": profile.relative_mad,
+                    "global_relative_mad": profile.global_relative_mad,
                     "selected_slowdown_vs_fastest": profile.selected_slowdown_vs_fastest,
                     "stability": profile.stability.as_str(),
                     "calibrated_at_unix_seconds": profile.calibrated_at_unix_seconds,
@@ -337,20 +401,21 @@ impl VerifierTuningStore {
     }
 }
 
-/// Performs a one-off calibration on `directory`.
-///
-/// The function creates a temporary exact-verification dataset on that storage,
-/// benchmarks candidate worker counts, rechecks the candidates close to the
-/// initial winner, chooses the least-concurrent option within `tie_margin` of
-/// the fastest final median, and removes the temporary files.
-///
-/// It never runs fclones and is completely independent from duplicate scanning.
+/// Performs a one-off calibration and persists it only when the measurement is
+/// considered usable. An invalid/noisy calibration is returned as an error so a
+/// previous good profile cannot be overwritten by a bad run.
 pub(crate) fn calibrate_and_store(
     directory: &Path,
     store_path: &Path,
     options: CalibrationOptions,
 ) -> io::Result<CalibrationReport> {
     let report = calibrate_directory(directory, options)?;
+    if report.profile.stability == CalibrationStability::Invalid {
+        return Err(io::Error::other(
+            "verifier calibration is too unstable; profile was not stored",
+        ));
+    }
+
     let mut store = VerifierTuningStore::load(store_path)?;
     store.upsert(report.profile.clone());
     store.save(store_path)?;
@@ -388,8 +453,8 @@ pub(crate) fn calibrate_directory(
         executors.insert(workers, ExactVerifierExecutor::new(workers)?);
     }
 
-    // Warm the same path/metadata/page-cache path the real post-fclones verifier
-    // normally sees. The warm-up is not timed.
+    // Warm the same file/metadata/page-cache path that the real post-fclones
+    // verifier commonly sees. Warm-up is not timed.
     let mut warm = dataset.result.clone();
     executors
         .get(&1)
@@ -397,29 +462,29 @@ pub(crate) fn calibrate_directory(
         .verify_result(&mut warm)?;
 
     let sample_capacity = options.rounds.saturating_add(options.recheck_rounds);
-    let mut samples: HashMap<usize, Vec<Duration>> = candidates
+    let mut buckets: HashMap<usize, SampleBucket> = candidates
         .iter()
         .copied()
-        .map(|workers| (workers, Vec::with_capacity(sample_capacity)))
+        .map(|workers| (workers, SampleBucket::with_capacity(sample_capacity)))
         .collect();
 
     run_calibration_rounds(
         &candidates,
         options.rounds,
         0,
+        options.target_sample_time,
         &executors,
         &dataset,
-        &mut samples,
+        &mut buckets,
     )?;
 
-    let initial_measurements = build_measurements(&candidates, &samples, dataset.bytes_per_run);
-    let initial_selected = select_measurement(&initial_measurements, options.tie_margin);
-    let initial_selected_workers = initial_selected.workers;
+    let initial_measurements = build_measurements(&candidates, &buckets, dataset.bytes_per_run);
+    let initial_selected_workers = select_measurement(&initial_measurements, options.tie_margin).workers;
 
     let rechecked_workers = if options.recheck_rounds == 0 {
         Vec::new()
     } else {
-        recheck_candidates(&initial_measurements, options.recheck_margin)
+        close_candidates(&initial_measurements, options.recheck_margin)
     };
 
     if !rechecked_workers.is_empty() {
@@ -427,20 +492,45 @@ pub(crate) fn calibrate_directory(
             &rechecked_workers,
             options.recheck_rounds,
             options.rounds,
+            options.target_sample_time,
             &executors,
             &dataset,
-            &mut samples,
+            &mut buckets,
         )?;
     }
 
-    let measurements = build_measurements(&candidates, &samples, dataset.bytes_per_run);
-    let selected = select_measurement(&measurements, options.tie_margin);
+    let measurements = build_measurements(&candidates, &buckets, dataset.bytes_per_run);
+    let aggregate_selected_workers = select_measurement(&measurements, options.tie_margin).workers;
+    let paired_workers = close_candidates(&measurements, options.recheck_margin);
+
+    let (workers, pairwise) = if options.pair_rounds == 0 || paired_workers.len() <= 1 {
+        (aggregate_selected_workers, Vec::new())
+    } else {
+        paired_confirmation(
+            &paired_workers,
+            options.pair_rounds,
+            options.target_sample_time,
+            options.tie_margin,
+            &executors,
+            &dataset,
+        )?
+    };
+
+    let selected = measurements
+        .iter()
+        .find(|measurement| measurement.workers == workers)
+        .expect("paired selection must refer to a measured worker count");
     let fastest = fastest_measurement(&measurements);
     let selected_slowdown_vs_fastest = slowdown_ratio(selected.median, fastest.median);
+    let global_relative_mad = global_relative_mad(&measurements);
     let stability = classify_stability(
         initial_selected_workers,
-        selected.workers,
+        aggregate_selected_workers,
+        workers,
         selected.relative_mad,
+        global_relative_mad,
+        &pairwise,
+        options.tie_margin,
     );
 
     let storage_key = storage_key_for_path(&calibrated_path)?;
@@ -453,32 +543,55 @@ pub(crate) fn calibrate_directory(
         profile: VerifierTuningProfile {
             storage_key,
             calibrated_path,
-            workers: selected.workers,
+            workers,
             logical_cpus,
             median_mib_per_second: selected.median_mib_per_second,
             selected_samples: selected.samples,
+            selected_verification_runs: selected.verification_runs,
             relative_mad: selected.relative_mad,
+            global_relative_mad,
             selected_slowdown_vs_fastest,
             stability,
             calibrated_at_unix_seconds,
         },
         measurements,
+        pairwise,
         groups: dataset.group_count,
         bytes_per_run: dataset.bytes_per_run,
         initial_rounds: options.rounds,
         recheck_rounds: options.recheck_rounds,
+        pair_rounds: options.pair_rounds,
+        target_sample_time: options.target_sample_time,
         initial_selected_workers,
+        aggregate_selected_workers,
         rechecked_workers,
+        paired_workers,
     })
+}
+
+#[derive(Clone, Debug, Default)]
+struct SampleBucket {
+    normalized_times: Vec<Duration>,
+    verification_runs: usize,
+}
+
+impl SampleBucket {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            normalized_times: Vec::with_capacity(capacity),
+            verification_runs: 0,
+        }
+    }
 }
 
 fn run_calibration_rounds(
     candidates: &[usize],
     rounds: usize,
     round_offset: usize,
+    target_sample_time: Duration,
     executors: &HashMap<usize, ExactVerifierExecutor>,
     dataset: &CalibrationDataset,
-    samples: &mut HashMap<usize, Vec<Duration>>,
+    buckets: &mut HashMap<usize, SampleBucket>,
 ) -> io::Result<()> {
     if candidates.is_empty() || rounds == 0 {
         return Ok(());
@@ -494,51 +607,79 @@ fn run_calibration_rounds(
         }
 
         for workers in order {
-            let mut result = dataset.result.clone();
-            let started = Instant::now();
-            let verified = executors
-                .get(&workers)
-                .expect("executor exists for every candidate")
-                .verify_result(&mut result)?;
-            let elapsed = started.elapsed();
+            let (normalized, verification_runs) = measure_candidate_window(
+                executors
+                    .get(&workers)
+                    .expect("executor exists for every candidate"),
+                dataset,
+                target_sample_time,
+            )?;
 
-            if verified != dataset.group_count || result.groups.len() != dataset.group_count {
-                return Err(io::Error::other(format!(
-                    "calibration verifier returned {verified}/{} groups with {workers} worker(s)",
-                    dataset.group_count
-                )));
-            }
-
-            samples
+            let bucket = buckets
                 .get_mut(&workers)
-                .expect("sample bucket exists")
-                .push(elapsed);
+                .expect("sample bucket exists for every candidate");
+            bucket.normalized_times.push(normalized);
+            bucket.verification_runs = bucket.verification_runs.saturating_add(verification_runs);
         }
     }
 
     Ok(())
 }
 
+fn measure_candidate_window(
+    executor: &ExactVerifierExecutor,
+    dataset: &CalibrationDataset,
+    target_sample_time: Duration,
+) -> io::Result<(Duration, usize)> {
+    let mut measured = Duration::ZERO;
+    let mut verification_runs = 0_usize;
+
+    while verification_runs == 0 || measured < target_sample_time {
+        // Result cloning is intentionally outside the timed verifier interval.
+        let mut result = dataset.result.clone();
+        let started = Instant::now();
+        let verified = executor.verify_result(&mut result)?;
+        let elapsed = started.elapsed();
+
+        if verified != dataset.group_count || result.groups.len() != dataset.group_count {
+            return Err(io::Error::other(format!(
+                "calibration verifier returned {verified}/{} groups with {} worker(s)",
+                dataset.group_count,
+                executor.workers()
+            )));
+        }
+
+        measured = measured.saturating_add(elapsed);
+        verification_runs = verification_runs.saturating_add(1);
+    }
+
+    let normalized = Duration::from_secs_f64(
+        measured.as_secs_f64() / verification_runs.max(1) as f64,
+    );
+    Ok((normalized, verification_runs))
+}
+
 fn build_measurements(
     candidates: &[usize],
-    samples: &HashMap<usize, Vec<Duration>>,
+    buckets: &HashMap<usize, SampleBucket>,
     bytes_per_run: u64,
 ) -> Vec<TuningMeasurement> {
     let mut measurements = Vec::with_capacity(candidates.len());
 
     for &workers in candidates {
-        let values = samples
+        let bucket = buckets
             .get(&workers)
             .expect("sample bucket exists for every candidate");
-        let median = median_duration(values);
+        let median = median_duration(&bucket.normalized_times);
         let seconds = median.as_secs_f64().max(f64::MIN_POSITIVE);
         let median_mib_per_second = bytes_per_run as f64 / (1024.0 * 1024.0) / seconds;
         measurements.push(TuningMeasurement {
             workers,
-            samples: values.len(),
+            samples: bucket.normalized_times.len(),
+            verification_runs: bucket.verification_runs,
             median,
             median_mib_per_second,
-            relative_mad: relative_mad(values, median),
+            relative_mad: relative_mad(&bucket.normalized_times, median),
         });
     }
 
@@ -546,10 +687,7 @@ fn build_measurements(
     measurements
 }
 
-fn select_measurement(
-    measurements: &[TuningMeasurement],
-    tie_margin: f64,
-) -> &TuningMeasurement {
+fn select_measurement(measurements: &[TuningMeasurement], tie_margin: f64) -> &TuningMeasurement {
     let fastest_seconds = fastest_measurement(measurements).median.as_secs_f64();
     let acceptable_seconds = fastest_seconds * (1.0 + tie_margin);
 
@@ -567,13 +705,13 @@ fn fastest_measurement(measurements: &[TuningMeasurement]) -> &TuningMeasurement
         .expect("at least one tuning measurement")
 }
 
-fn recheck_candidates(measurements: &[TuningMeasurement], recheck_margin: f64) -> Vec<usize> {
-    if measurements.len() <= 1 {
+fn close_candidates(measurements: &[TuningMeasurement], margin: f64) -> Vec<usize> {
+    if measurements.is_empty() {
         return Vec::new();
     }
 
     let fastest_seconds = fastest_measurement(measurements).median.as_secs_f64();
-    let threshold = fastest_seconds * (1.0 + recheck_margin);
+    let threshold = fastest_seconds * (1.0 + margin);
 
     measurements
         .iter()
@@ -582,20 +720,145 @@ fn recheck_candidates(measurements: &[TuningMeasurement], recheck_margin: f64) -
         .collect()
 }
 
+fn paired_confirmation(
+    candidates: &[usize],
+    pair_rounds: usize,
+    target_sample_time: Duration,
+    tie_margin: f64,
+    executors: &HashMap<usize, ExactVerifierExecutor>,
+    dataset: &CalibrationDataset,
+) -> io::Result<(usize, Vec<PairwiseMeasurement>)> {
+    let mut ordered = candidates.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+
+    let Some(&first) = ordered.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paired confirmation requires at least one candidate",
+        ));
+    };
+
+    let mut incumbent = first;
+    let mut comparisons = Vec::with_capacity(ordered.len().saturating_sub(1));
+
+    for challenger in ordered.into_iter().skip(1) {
+        let mut ratios = Vec::with_capacity(pair_rounds);
+
+        for pair_index in 0..pair_rounds {
+            let (incumbent_time, challenger_time) = if pair_index % 2 == 0 {
+                let incumbent_time = measure_candidate_window(
+                    executors
+                        .get(&incumbent)
+                        .expect("executor exists for paired incumbent"),
+                    dataset,
+                    target_sample_time,
+                )?
+                .0;
+                let challenger_time = measure_candidate_window(
+                    executors
+                        .get(&challenger)
+                        .expect("executor exists for paired challenger"),
+                    dataset,
+                    target_sample_time,
+                )?
+                .0;
+                (incumbent_time, challenger_time)
+            } else {
+                let challenger_time = measure_candidate_window(
+                    executors
+                        .get(&challenger)
+                        .expect("executor exists for paired challenger"),
+                    dataset,
+                    target_sample_time,
+                )?
+                .0;
+                let incumbent_time = measure_candidate_window(
+                    executors
+                        .get(&incumbent)
+                        .expect("executor exists for paired incumbent"),
+                    dataset,
+                    target_sample_time,
+                )?
+                .0;
+                (incumbent_time, challenger_time)
+            };
+
+            let incumbent_seconds = incumbent_time.as_secs_f64().max(f64::MIN_POSITIVE);
+            ratios.push(challenger_time.as_secs_f64() / incumbent_seconds);
+        }
+
+        let median_ratio = median_f64_owned(&ratios);
+        let decisive_threshold = 1.0 - tie_margin;
+        let decisive_challenger_wins = ratios
+            .iter()
+            .filter(|ratio| **ratio < decisive_threshold)
+            .count();
+        let required_wins = pair_rounds / 2 + 1;
+        let promoted = median_ratio < decisive_threshold
+            && decisive_challenger_wins >= required_wins;
+
+        comparisons.push(PairwiseMeasurement {
+            incumbent_workers: incumbent,
+            challenger_workers: challenger,
+            pairs: pair_rounds,
+            median_ratio,
+            decisive_challenger_wins,
+            promoted,
+        });
+
+        if promoted {
+            incumbent = challenger;
+        }
+    }
+
+    Ok((incumbent, comparisons))
+}
+
 fn classify_stability(
     initial_selected_workers: usize,
+    aggregate_selected_workers: usize,
     final_selected_workers: usize,
     selected_relative_mad: f64,
+    global_relative_mad: f64,
+    pairwise: &[PairwiseMeasurement],
+    tie_margin: f64,
 ) -> CalibrationStability {
-    if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD {
+    if selected_relative_mad > INVALID_STABILITY_RELATIVE_MAD
+        || global_relative_mad > INVALID_STABILITY_RELATIVE_MAD
+    {
+        return CalibrationStability::Invalid;
+    }
+
+    // A comparison sitting very close to the promotion boundary means the exact
+    // worker count is sensitive to small system noise, even if its MAD is low.
+    let pair_boundary_uncertain = pairwise.iter().any(|comparison| {
+        let boundary = 1.0 - tie_margin;
+        (comparison.median_ratio - boundary).abs() <= 0.015
+    });
+
+    if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
+        || global_relative_mad > LOW_STABILITY_RELATIVE_MAD
+    {
         CalibrationStability::Low
-    } else if initial_selected_workers != final_selected_workers
+    } else if initial_selected_workers != aggregate_selected_workers
+        || aggregate_selected_workers != final_selected_workers
         || selected_relative_mad > HIGH_STABILITY_RELATIVE_MAD
+        || global_relative_mad > HIGH_STABILITY_RELATIVE_MAD
+        || pair_boundary_uncertain
     {
         CalibrationStability::Medium
     } else {
         CalibrationStability::High
     }
+}
+
+fn global_relative_mad(measurements: &[TuningMeasurement]) -> f64 {
+    let mut values = measurements
+        .iter()
+        .map(|measurement| measurement.relative_mad)
+        .collect::<Vec<_>>();
+    median_f64(&mut values)
 }
 
 fn slowdown_ratio(selected: Duration, fastest: Duration) -> f64 {
@@ -614,6 +877,12 @@ fn validate_options(options: CalibrationOptions) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "calibration rounds must be greater than zero",
+        ));
+    }
+    if options.target_sample_time.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "calibration target_sample_time must be greater than zero",
         ));
     }
     if options.max_workers == 0 {
@@ -654,9 +923,6 @@ fn candidate_worker_counts(logical_cpus: usize, max_workers: usize) -> Vec<usize
         power = next;
     }
 
-    // Keep the points that have proven useful for the exact verifier while still
-    // adapting to the available logical CPU count. In particular, a 16-thread
-    // machine now measures 6 workers instead of jumping directly from 4 to 8.
     if (3..=4).contains(&limit) {
         candidates.insert(3);
     }
@@ -697,6 +963,11 @@ fn median_f64(values: &mut [f64]) -> f64 {
     } else {
         (values[middle - 1] + values[middle]) / 2.0
     }
+}
+
+fn median_f64_owned(values: &[f64]) -> f64 {
+    let mut values = values.to_vec();
+    median_f64(&mut values)
 }
 
 fn relative_mad(values: &[Duration], median: Duration) -> f64 {
@@ -890,6 +1161,7 @@ mod tests {
         TuningMeasurement {
             workers,
             samples: 5,
+            verification_runs: 25,
             median,
             median_mib_per_second: 1000.0 / median.as_secs_f64(),
             relative_mad,
@@ -929,22 +1201,26 @@ mod tests {
             measurement(12, 104, 0.01),
             measurement(16, 120, 0.01),
         ];
-        assert_eq!(recheck_candidates(&measurements, 0.10), vec![4, 8, 12]);
+        assert_eq!(close_candidates(&measurements, 0.10), vec![4, 8, 12]);
     }
 
     #[test]
-    fn stability_drops_when_final_selection_changes() {
+    fn global_mad_detects_system_wide_noise() {
+        let measurements = vec![
+            measurement(1, 100, 0.02),
+            measurement(2, 80, 0.19),
+            measurement(4, 70, 0.21),
+            measurement(8, 68, 0.03),
+            measurement(16, 67, 0.18),
+        ];
+        assert!(global_relative_mad(&measurements) > 0.12);
+    }
+
+    #[test]
+    fn invalid_stability_rejects_globally_noisy_calibration() {
         assert_eq!(
-            classify_stability(4, 8, 0.01),
-            CalibrationStability::Medium
-        );
-        assert_eq!(
-            classify_stability(4, 4, 0.09),
-            CalibrationStability::Low
-        );
-        assert_eq!(
-            classify_stability(4, 4, 0.02),
-            CalibrationStability::High
+            classify_stability(4, 4, 8, 0.03, 0.19, &[], 0.05),
+            CalibrationStability::Invalid
         );
     }
 
@@ -962,7 +1238,9 @@ mod tests {
             logical_cpus: 4,
             median_mib_per_second: 1234.5,
             selected_samples: 9,
+            selected_verification_runs: 45,
             relative_mad: 0.02,
+            global_relative_mad: 0.03,
             selected_slowdown_vs_fastest: 0.01,
             stability: CalibrationStability::High,
             calibrated_at_unix_seconds: 42,
@@ -973,6 +1251,7 @@ mod tests {
         assert_eq!(loaded.profiles().len(), 1);
         assert_eq!(loaded.profiles()[0].workers, 3);
         assert_eq!(loaded.profiles()[0].selected_samples, 9);
+        assert_eq!(loaded.profiles()[0].selected_verification_runs, 45);
         assert_eq!(loaded.profiles()[0].stability, CalibrationStability::High);
         assert_eq!(
             loaded
@@ -983,9 +1262,24 @@ mod tests {
     }
 
     #[test]
-    fn unknown_storage_returns_no_worker_budget() {
+    fn invalid_profile_is_not_used_for_scanning() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = VerifierTuningStore::default();
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(VerifierTuningProfile {
+            storage_key,
+            calibrated_path: dir.path().to_path_buf(),
+            workers: 8,
+            logical_cpus: 16,
+            median_mib_per_second: 6000.0,
+            selected_samples: 9,
+            selected_verification_runs: 45,
+            relative_mad: 0.03,
+            global_relative_mad: 0.20,
+            selected_slowdown_vs_fastest: 0.0,
+            stability: CalibrationStability::Invalid,
+            calibrated_at_unix_seconds: 42,
+        });
         assert_eq!(
             store
                 .workers_for_paths(&[dir.path().to_path_buf()])
@@ -1006,9 +1300,14 @@ mod tests {
         let report = calibrate_directory(&path, CalibrationOptions::default())
             .expect("storage calibration failed");
 
+        print_report(&report);
+    }
+
+    #[cfg(feature = "fast_duplicates")]
+    fn print_report(report: &CalibrationReport) {
         println!();
         println!("============================================================");
-        println!(" KROKIET - CALIBRACION PREVIA DEL EXACT VERIFIER");
+        println!(" KROKIET - CALIBRACION ROBUSTA DEL EXACT VERIFIER");
         println!("============================================================");
         println!("Ruta          : {}", report.profile.calibrated_path.display());
         println!("Storage key   : {}", report.profile.storage_key);
@@ -1019,6 +1318,10 @@ mod tests {
             report.bytes_per_run as f64 / 1024.0 / 1024.0
         );
         println!("Rondas base   : {}", report.initial_rounds);
+        println!(
+            "Ventana/sample: {:.0} ms",
+            report.target_sample_time.as_secs_f64() * 1000.0
+        );
         if report.rechecked_workers.is_empty() {
             println!("Recheck       : no necesario");
         } else {
@@ -1027,28 +1330,44 @@ mod tests {
                 report.recheck_rounds, report.rechecked_workers
             );
         }
+        println!(
+            "Final pareada : {} ronda(s) para {:?}",
+            report.pair_rounds, report.paired_workers
+        );
         println!();
         for measurement in &report.measurements {
             println!(
-                "workers-{:>2}: {:>10.3?} | {:>9.1} MiB/s | n={:<2} | MAD {:>5.1}%",
+                "workers-{:>2}: {:>10.3?} | {:>9.1} MiB/s | n={:<2} | runs={:<3} | MAD {:>5.1}%",
                 measurement.workers,
                 measurement.median,
                 measurement.median_mib_per_second,
                 measurement.samples,
+                measurement.verification_runs,
                 measurement.relative_mad * 100.0,
             );
         }
-        println!("------------------------------------------------------------");
-        println!(
-            "Seleccion     : {} worker(s)",
-            report.profile.workers
-        );
-        if report.initial_selected_workers != report.profile.workers {
-            println!(
-                "Seleccion ini : {} worker(s)",
-                report.initial_selected_workers
-            );
+        if !report.pairwise.is_empty() {
+            println!("------------------------------------------------------------");
+            println!(" CONFIRMACION PAREADA");
+            for comparison in &report.pairwise {
+                println!(
+                    " {:>2} vs {:>2}: ratio {:>6.3} | victorias decisivas {}/{} | {}",
+                    comparison.incumbent_workers,
+                    comparison.challenger_workers,
+                    comparison.median_ratio,
+                    comparison.decisive_challenger_wins,
+                    comparison.pairs,
+                    if comparison.promoted { "PROMUEVE" } else { "MANTIENE" },
+                );
+            }
         }
+        println!("------------------------------------------------------------");
+        println!("Seleccion ini : {} worker(s)", report.initial_selected_workers);
+        println!(
+            "Seleccion agg : {} worker(s)",
+            report.aggregate_selected_workers
+        );
+        println!("Seleccion     : {} worker(s)", report.profile.workers);
         println!(
             "Rendimiento   : {:.1} MiB/s",
             report.profile.median_mib_per_second
@@ -1058,10 +1377,17 @@ mod tests {
             report.profile.selected_slowdown_vs_fastest * 100.0
         );
         println!(
-            "Estabilidad   : {} (MAD {:.2}%)",
-            report.profile.stability.label_es(),
+            "MAD seleccionado: {:.2}%",
             report.profile.relative_mad * 100.0
         );
+        println!(
+            "MAD global    : {:.2}%",
+            report.profile.global_relative_mad * 100.0
+        );
+        println!("Estabilidad   : {}", report.profile.stability.label_es());
+        if report.profile.stability == CalibrationStability::Invalid {
+            println!("Perfil        : NO GUARDAR; repetir con el sistema menos cargado");
+        }
         println!("============================================================");
     }
 }

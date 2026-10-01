@@ -24,7 +24,7 @@ mod verify;
 mod tuning;
 
 #[cfg(not(test))]
-use tuning::{CalibrationOptions, calibrate_directory};
+use tuning::{CalibrationOptions, CalibrationStability, calibrate_directory};
 
 #[cfg(not(test))]
 fn main() -> ExitCode {
@@ -53,7 +53,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 2.9.1");
+    println!(" KROKIET - VERIFIER TUNING 2.9.2");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo            : calibracion local independiente");
@@ -73,6 +73,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.bytes_per_run as f64 / 1024.0 / 1024.0
     );
     println!("Rondas base     : {}", report.initial_rounds);
+    println!(
+        "Ventana/sample  : {:.0} ms",
+        report.target_sample_time.as_secs_f64() * 1000.0
+    );
     if report.rechecked_workers.is_empty() {
         println!("Recheck         : no necesario");
     } else {
@@ -81,27 +85,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.recheck_rounds, report.rechecked_workers
         );
     }
+    println!(
+        "Final pareada   : {} ronda(s) para {:?}",
+        report.pair_rounds, report.paired_workers
+    );
     println!();
 
     for measurement in &report.measurements {
         println!(
-            "workers-{:>2}: {:>10.3?} | {:>9.1} MiB/s | n={:<2} | MAD {:>5.1}%",
+            "workers-{:>2}: {:>10.3?} | {:>9.1} MiB/s | n={:<2} | runs={:<3} | MAD {:>5.1}%",
             measurement.workers,
             measurement.median,
             measurement.median_mib_per_second,
             measurement.samples,
+            measurement.verification_runs,
             measurement.relative_mad * 100.0,
         );
     }
 
-    println!("------------------------------------------------------------");
-    println!("Seleccion       : {} worker(s)", report.profile.workers);
-    if report.initial_selected_workers != report.profile.workers {
-        println!(
-            "Seleccion inicial: {} worker(s)",
-            report.initial_selected_workers
-        );
+    if !report.pairwise.is_empty() {
+        println!("------------------------------------------------------------");
+        println!(" CONFIRMACION PAREADA");
+        for comparison in &report.pairwise {
+            println!(
+                " {:>2} vs {:>2}: ratio {:>6.3} | victorias decisivas {}/{} | {}",
+                comparison.incumbent_workers,
+                comparison.challenger_workers,
+                comparison.median_ratio,
+                comparison.decisive_challenger_wins,
+                comparison.pairs,
+                if comparison.promoted {
+                    "PROMUEVE"
+                } else {
+                    "MANTIENE"
+                },
+            );
+        }
     }
+
+    println!("------------------------------------------------------------");
+    println!("Seleccion inicial: {} worker(s)", report.initial_selected_workers);
+    println!(
+        "Seleccion agregada: {} worker(s)",
+        report.aggregate_selected_workers
+    );
+    println!("Seleccion       : {} worker(s)", report.profile.workers);
     println!(
         "Rendimiento     : {:.1} MiB/s",
         report.profile.median_mib_per_second
@@ -111,10 +139,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.profile.selected_slowdown_vs_fastest * 100.0
     );
     println!(
-        "Estabilidad     : {} (MAD {:.2}%)",
-        report.profile.stability.label_es(),
+        "MAD seleccionado: {:.2}%",
         report.profile.relative_mad * 100.0
     );
+    println!(
+        "MAD global      : {:.2}%",
+        report.profile.global_relative_mad * 100.0
+    );
+    println!(
+        "Estabilidad     : {}",
+        report.profile.stability.label_es()
+    );
+    if report.profile.stability == CalibrationStability::Invalid {
+        println!("Perfil          : NO GUARDAR; repetir con el sistema menos cargado");
+    }
     println!("============================================================");
 
     Ok(())
