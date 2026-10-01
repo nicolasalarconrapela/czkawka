@@ -53,7 +53,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 2.9.2.1");
+    println!(" KROKIET - VERIFIER TUNING 2.9.2.2");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo            : calibracion local independiente");
@@ -72,6 +72,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Lectura/ronda   : {:.1} MiB",
         report.bytes_per_run as f64 / 1024.0 / 1024.0
     );
+    if report.rescue_attempted {
+        println!(
+            "Ventana inicial : {:.0} ms",
+            report.initial_target_sample_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "Resultado inicial: {}",
+            report
+                .initial_stability
+                .map(CalibrationStability::label_es)
+                .unwrap_or("desconocida")
+        );
+        println!("------------------------------------------------------------");
+        println!(" MODO DE RESCATE");
+    }
     println!("Rondas base     : {}", report.initial_rounds);
     println!(
         "Ventana/sample  : {:.0} ms",
@@ -155,7 +170,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.profile.stability.label_es()
     );
     if report.profile.stability == CalibrationStability::Invalid {
-        println!("Perfil          : NO GUARDAR; repetir con el sistema menos cargado");
+        if report.rescue_attempted {
+            println!("Perfil          : NO GUARDAR; sigue inestable tras rescate");
+        } else {
+            println!("Perfil          : NO GUARDAR");
+        }
+    } else if report.rescue_attempted {
+        println!("Perfil          : GUARDABLE (tras rescate)");
     } else {
         println!("Perfil          : GUARDABLE");
     }

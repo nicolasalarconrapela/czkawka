@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Version 4 keeps the robust timed/paired methodology from v3, but changes
-// stability qualification so clearly inferior noisy candidates cannot invalidate
-// an otherwise stable decision. Old profiles are deliberately ignored.
-const TUNING_FORMAT_VERSION: u64 = 4;
+// Version 5 adds an adaptive rescue pass. If the normal 250 ms calibration is
+// invalid, every candidate is measured again from scratch with a longer window
+// and stronger paired confirmation. Old profiles are deliberately ignored.
+const TUNING_FORMAT_VERSION: u64 = 5;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
 const DEFAULT_RECHECK_ROUNDS: usize = 4;
@@ -28,6 +28,8 @@ const DEFAULT_MAX_WORKERS: usize = 16;
 const DEFAULT_TIE_MARGIN: f64 = 0.05;
 const DEFAULT_RECHECK_MARGIN: f64 = 0.10;
 const DEFAULT_TARGET_SAMPLE_TIME: Duration = Duration::from_millis(250);
+const DEFAULT_RESCUE_SAMPLE_TIME: Duration = Duration::from_millis(750);
+const DEFAULT_RESCUE_PAIR_ROUNDS: usize = 7;
 const MIN_GROUPS: usize = 8;
 const HIGH_STABILITY_RELATIVE_MAD: f64 = 0.04;
 const LOW_STABILITY_RELATIVE_MAD: f64 = 0.08;
@@ -179,6 +181,13 @@ pub(crate) struct CalibrationReport {
     pub recheck_rounds: usize,
     pub pair_rounds: usize,
     pub target_sample_time: Duration,
+    /// True when the normal pass was rejected and the result comes from a
+    /// completely fresh, longer rescue pass.
+    pub rescue_attempted: bool,
+    /// Window used by the first pass. Useful for diagnostics when rescue ran.
+    pub initial_target_sample_time: Duration,
+    /// Stability returned by the first pass. Present only when rescue ran.
+    pub initial_stability: Option<CalibrationStability>,
     pub initial_selected_workers: usize,
     pub aggregate_selected_workers: usize,
     pub rechecked_workers: Vec<usize>,
@@ -472,6 +481,53 @@ pub(crate) fn calibrate_directory(
         .expect("candidate list always contains one worker")
         .verify_result(&mut warm)?;
 
+    let storage_key = storage_key_for_path(&calibrated_path)?;
+    let initial_report = run_calibration_pass(
+        &calibrated_path,
+        &storage_key,
+        logical_cpus,
+        &candidates,
+        options,
+        &executors,
+        &dataset,
+    )?;
+
+    if initial_report.profile.stability != CalibrationStability::Invalid {
+        return Ok(initial_report);
+    }
+
+    // The first pass proved that the current machine/storage combination is too
+    // noisy for short samples. Start over from empty buckets: noisy 250 ms data
+    // must not influence the rescue decision.
+    let mut rescue_options = options;
+    rescue_options.target_sample_time = rescue_target_sample_time(options.target_sample_time);
+    rescue_options.pair_rounds = rescue_pair_rounds(options.pair_rounds);
+
+    let mut rescue_report = run_calibration_pass(
+        &calibrated_path,
+        &storage_key,
+        logical_cpus,
+        &candidates,
+        rescue_options,
+        &executors,
+        &dataset,
+    )?;
+    rescue_report.rescue_attempted = true;
+    rescue_report.initial_target_sample_time = options.target_sample_time;
+    rescue_report.initial_stability = Some(initial_report.profile.stability);
+
+    Ok(rescue_report)
+}
+
+fn run_calibration_pass(
+    calibrated_path: &Path,
+    storage_key: &str,
+    logical_cpus: usize,
+    candidates: &[usize],
+    options: CalibrationOptions,
+    executors: &HashMap<usize, ExactVerifierExecutor>,
+    dataset: &CalibrationDataset,
+) -> io::Result<CalibrationReport> {
     let sample_capacity = options.rounds.saturating_add(options.recheck_rounds);
     let mut buckets: HashMap<usize, SampleBucket> = candidates
         .iter()
@@ -480,17 +536,18 @@ pub(crate) fn calibrate_directory(
         .collect();
 
     run_calibration_rounds(
-        &candidates,
+        candidates,
         options.rounds,
         0,
         options.target_sample_time,
-        &executors,
-        &dataset,
+        executors,
+        dataset,
         &mut buckets,
     )?;
 
-    let initial_measurements = build_measurements(&candidates, &buckets, dataset.bytes_per_run);
-    let initial_selected_workers = select_measurement(&initial_measurements, options.tie_margin).workers;
+    let initial_measurements = build_measurements(candidates, &buckets, dataset.bytes_per_run);
+    let initial_selected_workers =
+        select_measurement(&initial_measurements, options.tie_margin).workers;
 
     let rechecked_workers = if options.recheck_rounds == 0 {
         Vec::new()
@@ -504,13 +561,13 @@ pub(crate) fn calibrate_directory(
             options.recheck_rounds,
             options.rounds,
             options.target_sample_time,
-            &executors,
-            &dataset,
+            executors,
+            dataset,
             &mut buckets,
         )?;
     }
 
-    let measurements = build_measurements(&candidates, &buckets, dataset.bytes_per_run);
+    let measurements = build_measurements(candidates, &buckets, dataset.bytes_per_run);
     let aggregate_selected_workers = select_measurement(&measurements, options.tie_margin).workers;
     let paired_workers = close_candidates(&measurements, options.recheck_margin);
 
@@ -522,8 +579,8 @@ pub(crate) fn calibrate_directory(
             options.pair_rounds,
             options.target_sample_time,
             options.tie_margin,
-            &executors,
-            &dataset,
+            executors,
+            dataset,
         )?
     };
 
@@ -533,11 +590,7 @@ pub(crate) fn calibrate_directory(
         .expect("paired selection must refer to a measured worker count");
     let fastest = fastest_measurement(&measurements);
     let selected_slowdown_vs_fastest = slowdown_ratio(selected.median, fastest.median);
-    let decision_relative_mad = decision_relative_mad(
-        &measurements,
-        &paired_workers,
-        workers,
-    );
+    let decision_relative_mad = decision_relative_mad(&measurements, &paired_workers, workers);
     let global_relative_mad = global_relative_mad(&measurements);
     let stability = classify_stability(
         initial_selected_workers,
@@ -549,7 +602,6 @@ pub(crate) fn calibrate_directory(
         options.tie_margin,
     );
 
-    let storage_key = storage_key_for_path(&calibrated_path)?;
     let calibrated_at_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -557,8 +609,8 @@ pub(crate) fn calibrate_directory(
 
     Ok(CalibrationReport {
         profile: VerifierTuningProfile {
-            storage_key,
-            calibrated_path,
+            storage_key: storage_key.to_owned(),
+            calibrated_path: calibrated_path.to_path_buf(),
             workers,
             logical_cpus,
             median_mib_per_second: selected.median_mib_per_second,
@@ -579,11 +631,26 @@ pub(crate) fn calibrate_directory(
         recheck_rounds: options.recheck_rounds,
         pair_rounds: options.pair_rounds,
         target_sample_time: options.target_sample_time,
+        rescue_attempted: false,
+        initial_target_sample_time: options.target_sample_time,
+        initial_stability: None,
         initial_selected_workers,
         aggregate_selected_workers,
         rechecked_workers,
         paired_workers,
     })
+}
+
+fn rescue_target_sample_time(initial: Duration) -> Duration {
+    initial.max(DEFAULT_RESCUE_SAMPLE_TIME)
+}
+
+fn rescue_pair_rounds(initial: usize) -> usize {
+    if initial == 0 {
+        0
+    } else {
+        initial.max(DEFAULT_RESCUE_PAIR_ROUNDS)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1255,6 +1322,21 @@ mod tests {
             measurement(16, 120, 0.01),
         ];
         assert_eq!(close_candidates(&measurements, 0.10), vec![4, 8, 12]);
+    }
+
+    #[test]
+    fn rescue_uses_longer_fresh_measurements() {
+        assert_eq!(
+            rescue_target_sample_time(Duration::from_millis(250)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            rescue_target_sample_time(Duration::from_millis(900)),
+            Duration::from_millis(900)
+        );
+        assert_eq!(rescue_pair_rounds(5), 7);
+        assert_eq!(rescue_pair_rounds(9), 9);
+        assert_eq!(rescue_pair_rounds(0), 0);
     }
 
     #[test]
