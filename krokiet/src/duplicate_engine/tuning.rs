@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Version 3 changes the calibration methodology substantially: every timed
-// sample now spans a minimum verifier-time window and close finalists receive a
-// paired confirmation. Old profiles are deliberately ignored.
-const TUNING_FORMAT_VERSION: u64 = 3;
+// Version 4 keeps the robust timed/paired methodology from v3, but changes
+// stability qualification so clearly inferior noisy candidates cannot invalidate
+// an otherwise stable decision. Old profiles are deliberately ignored.
+const TUNING_FORMAT_VERSION: u64 = 4;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
 const DEFAULT_RECHECK_ROUNDS: usize = 4;
@@ -152,8 +152,13 @@ pub(crate) struct VerifierTuningProfile {
     pub selected_verification_runs: usize,
     /// Robust relative dispersion of the selected candidate.
     pub relative_mad: f64,
-    /// Median robust dispersion across all tested candidates. This catches
-    /// system-wide instability even when the final candidate itself looks quiet.
+    /// Robust dispersion of the decision set (paired finalists when available,
+    /// otherwise the aggregate finalists). This is the stability signal used to
+    /// decide whether a profile is trustworthy.
+    pub decision_relative_mad: f64,
+    /// Median robust dispersion across every tested candidate. This is retained
+    /// for diagnostics only: clearly inferior noisy candidates must not invalidate
+    /// an otherwise stable final decision.
     pub global_relative_mad: f64,
     /// How much slower the selected candidate is than the absolute fastest
     /// aggregate candidate. This can be non-zero because the tie policy prefers
@@ -299,6 +304,10 @@ impl VerifierTuningStore {
                 .get("relative_mad")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
+            let decision_relative_mad = item
+                .get("decision_relative_mad")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
             let global_relative_mad = item
                 .get("global_relative_mad")
                 .and_then(Value::as_f64)
@@ -341,6 +350,7 @@ impl VerifierTuningStore {
                 selected_samples,
                 selected_verification_runs,
                 relative_mad,
+                decision_relative_mad,
                 global_relative_mad,
                 selected_slowdown_vs_fastest,
                 stability,
@@ -371,6 +381,7 @@ impl VerifierTuningStore {
                     "selected_samples": profile.selected_samples,
                     "selected_verification_runs": profile.selected_verification_runs,
                     "relative_mad": profile.relative_mad,
+                    "decision_relative_mad": profile.decision_relative_mad,
                     "global_relative_mad": profile.global_relative_mad,
                     "selected_slowdown_vs_fastest": profile.selected_slowdown_vs_fastest,
                     "stability": profile.stability.as_str(),
@@ -522,13 +533,18 @@ pub(crate) fn calibrate_directory(
         .expect("paired selection must refer to a measured worker count");
     let fastest = fastest_measurement(&measurements);
     let selected_slowdown_vs_fastest = slowdown_ratio(selected.median, fastest.median);
+    let decision_relative_mad = decision_relative_mad(
+        &measurements,
+        &paired_workers,
+        workers,
+    );
     let global_relative_mad = global_relative_mad(&measurements);
     let stability = classify_stability(
         initial_selected_workers,
         aggregate_selected_workers,
         workers,
         selected.relative_mad,
-        global_relative_mad,
+        decision_relative_mad,
         &pairwise,
         options.tie_margin,
     );
@@ -549,6 +565,7 @@ pub(crate) fn calibrate_directory(
             selected_samples: selected.samples,
             selected_verification_runs: selected.verification_runs,
             relative_mad: selected.relative_mad,
+            decision_relative_mad,
             global_relative_mad,
             selected_slowdown_vs_fastest,
             stability,
@@ -820,12 +837,16 @@ fn classify_stability(
     aggregate_selected_workers: usize,
     final_selected_workers: usize,
     selected_relative_mad: f64,
-    global_relative_mad: f64,
+    decision_relative_mad: f64,
     pairwise: &[PairwiseMeasurement],
     tie_margin: f64,
 ) -> CalibrationStability {
+    // Only the selected candidate and the candidates that actually participated
+    // in the final decision can invalidate a profile. Slow/noisy candidates that
+    // were already eliminated remain useful diagnostics, but are not a reason to
+    // throw away a stable winner.
     if selected_relative_mad > INVALID_STABILITY_RELATIVE_MAD
-        || global_relative_mad > INVALID_STABILITY_RELATIVE_MAD
+        || decision_relative_mad > INVALID_STABILITY_RELATIVE_MAD
     {
         return CalibrationStability::Invalid;
     }
@@ -838,19 +859,51 @@ fn classify_stability(
     });
 
     if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
-        || global_relative_mad > LOW_STABILITY_RELATIVE_MAD
+        || decision_relative_mad > LOW_STABILITY_RELATIVE_MAD
     {
         CalibrationStability::Low
     } else if initial_selected_workers != aggregate_selected_workers
         || aggregate_selected_workers != final_selected_workers
         || selected_relative_mad > HIGH_STABILITY_RELATIVE_MAD
-        || global_relative_mad > HIGH_STABILITY_RELATIVE_MAD
+        || decision_relative_mad > HIGH_STABILITY_RELATIVE_MAD
         || pair_boundary_uncertain
     {
         CalibrationStability::Medium
     } else {
         CalibrationStability::High
     }
+}
+
+fn decision_relative_mad(
+    measurements: &[TuningMeasurement],
+    decision_workers: &[usize],
+    selected_workers: usize,
+) -> f64 {
+    let mut values = if decision_workers.is_empty() {
+        measurements
+            .iter()
+            .filter(|measurement| measurement.workers == selected_workers)
+            .map(|measurement| measurement.relative_mad)
+            .collect::<Vec<_>>()
+    } else {
+        measurements
+            .iter()
+            .filter(|measurement| decision_workers.contains(&measurement.workers))
+            .map(|measurement| measurement.relative_mad)
+            .collect::<Vec<_>>()
+    };
+
+    // `selected_workers` always refers to an existing measurement. Keep this
+    // fallback defensive in case the decision-set construction changes later.
+    if values.is_empty() {
+        values = measurements
+            .iter()
+            .filter(|measurement| measurement.workers == selected_workers)
+            .map(|measurement| measurement.relative_mad)
+            .collect();
+    }
+
+    median_f64(&mut values)
 }
 
 fn global_relative_mad(measurements: &[TuningMeasurement]) -> f64 {
@@ -1217,7 +1270,27 @@ mod tests {
     }
 
     #[test]
-    fn invalid_stability_rejects_globally_noisy_calibration() {
+    fn noisy_eliminated_candidates_do_not_invalidate_a_stable_decision() {
+        let measurements = vec![
+            measurement(1, 100, 0.25),
+            measurement(2, 80, 0.31),
+            measurement(4, 70, 0.039),
+            measurement(6, 68, 0.137),
+            measurement(8, 69, 0.044),
+        ];
+        let finalists = vec![4, 6, 8];
+        let decision_mad = decision_relative_mad(&measurements, &finalists, 4);
+
+        assert!(global_relative_mad(&measurements) > 0.12);
+        assert!(decision_mad < 0.05);
+        assert_ne!(
+            classify_stability(6, 4, 4, 0.039, decision_mad, &[], 0.05),
+            CalibrationStability::Invalid
+        );
+    }
+
+    #[test]
+    fn unstable_decision_set_is_still_invalid() {
         assert_eq!(
             classify_stability(4, 4, 8, 0.03, 0.19, &[], 0.05),
             CalibrationStability::Invalid
@@ -1240,6 +1313,7 @@ mod tests {
             selected_samples: 9,
             selected_verification_runs: 45,
             relative_mad: 0.02,
+            decision_relative_mad: 0.025,
             global_relative_mad: 0.03,
             selected_slowdown_vs_fastest: 0.01,
             stability: CalibrationStability::High,
@@ -1275,6 +1349,7 @@ mod tests {
             selected_samples: 9,
             selected_verification_runs: 45,
             relative_mad: 0.03,
+            decision_relative_mad: 0.20,
             global_relative_mad: 0.20,
             selected_slowdown_vs_fastest: 0.0,
             stability: CalibrationStability::Invalid,
@@ -1381,12 +1456,18 @@ mod tests {
             report.profile.relative_mad * 100.0
         );
         println!(
-            "MAD global    : {:.2}%",
+            "MAD decision  : {:.2}%",
+            report.profile.decision_relative_mad * 100.0
+        );
+        println!(
+            "MAD global    : {:.2}% (diagnostico)",
             report.profile.global_relative_mad * 100.0
         );
         println!("Estabilidad   : {}", report.profile.stability.label_es());
         if report.profile.stability == CalibrationStability::Invalid {
             println!("Perfil        : NO GUARDAR; repetir con el sistema menos cargado");
+        } else {
+            println!("Perfil        : GUARDABLE");
         }
         println!("============================================================");
     }

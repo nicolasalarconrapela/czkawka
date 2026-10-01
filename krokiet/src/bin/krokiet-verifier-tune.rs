@@ -53,7 +53,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 2.9.2");
+    println!(" KROKIET - VERIFIER TUNING 2.9.2.1");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo            : calibracion local independiente");
@@ -143,7 +143,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.profile.relative_mad * 100.0
     );
     println!(
-        "MAD global      : {:.2}%",
+        "MAD decision    : {:.2}%",
+        report.profile.decision_relative_mad * 100.0
+    );
+    println!(
+        "MAD global      : {:.2}% (diagnostico)",
         report.profile.global_relative_mad * 100.0
     );
     println!(
@@ -152,6 +156,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     if report.profile.stability == CalibrationStability::Invalid {
         println!("Perfil          : NO GUARDAR; repetir con el sistema menos cargado");
+    } else {
+        println!("Perfil          : GUARDABLE");
     }
     println!("============================================================");
 
