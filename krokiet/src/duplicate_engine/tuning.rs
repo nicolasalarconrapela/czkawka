@@ -1,9 +1,9 @@
 //! Storage-specific calibration for the exact duplicate verifier.
 //!
-//! This module is deliberately independent from duplicate scanning. A caller can
-//! calibrate a writable directory once, persist the resulting profile, and later
-//! feed only the selected worker count into the exact verifier. Normal scans do
-//! not benchmark or auto-tune anything.
+//! The normal scan does not need write access. Calibration is optional:
+//! - reuse a saved profile when available;
+//! - calibrate only when a writable place exists on the same storage;
+//! - otherwise continue with a conservative fallback.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -16,52 +16,40 @@ use serde_json::{Value, json};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Version 6 keeps the adaptive rescue pass and changes Windows storage identity
-// from a drive letter to the underlying volume when possible. It also adds a
-// read-only/permission-safe planning API so lack of write access never blocks a
-// duplicate scan. Old profiles are deliberately ignored.
+// Version 6 keeps the adaptive rescue pass and stable Windows volume identity.
+// The read-only planning tests below do not change the persisted profile format.
 const TUNING_FORMAT_VERSION: u64 = 6;
+
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
-const DEFAULT_RECHECK_ROUNDS: usize = 4;
-const DEFAULT_PAIR_ROUNDS: usize = 5;
 const DEFAULT_MAX_WORKERS: usize = 16;
 const DEFAULT_TIE_MARGIN: f64 = 0.05;
+const DEFAULT_RECHECK_ROUNDS: usize = 4;
 const DEFAULT_RECHECK_MARGIN: f64 = 0.10;
+const DEFAULT_PAIR_ROUNDS: usize = 5;
 const DEFAULT_TARGET_SAMPLE_TIME: Duration = Duration::from_millis(250);
 const DEFAULT_RESCUE_SAMPLE_TIME: Duration = Duration::from_millis(750);
 const DEFAULT_RESCUE_PAIR_ROUNDS: usize = 7;
 const MIN_GROUPS: usize = 8;
-const HIGH_STABILITY_RELATIVE_MAD: f64 = 0.04;
-const LOW_STABILITY_RELATIVE_MAD: f64 = 0.08;
-const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
 
-/// Conservative verifier concurrency used when a storage has no usable profile
-/// and no writable place where Krokiet can calibrate it. Correctness is unchanged;
-/// only performance can be lower until a real profile becomes available.
+const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
+const LOW_STABILITY_RELATIVE_MAD: f64 = 0.08;
+const MEDIUM_STABILITY_RELATIVE_MAD: f64 = 0.04;
+
+/// Safe value used when no saved profile exists and calibration cannot write
+/// temporary files on the target storage.
 pub(crate) const SAFE_FALLBACK_WORKERS: usize = 1;
 
-/// Controls the one-off calibration workload.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CalibrationOptions {
-    /// Size of each temporary file. Every group contains two identical files.
     pub file_size: u64,
-    /// Number of robust timed windows for every candidate worker count.
     pub rounds: usize,
-    /// Extra timed windows for candidates close to the initial winner.
-    pub recheck_rounds: usize,
-    /// Number of paired confirmation rounds between finalists.
-    pub pair_rounds: usize,
-    /// Minimum amount of actual verifier time represented by one timed sample.
-    pub target_sample_time: Duration,
-    /// Safety ceiling for the number of verifier workers tested.
     pub max_workers: usize,
-    /// If several candidates are within this fraction of the fastest median,
-    /// prefer the one using fewer workers.
     pub tie_margin: f64,
-    /// Candidates within this fraction of the fastest initial median are
-    /// re-measured and considered for paired confirmation.
+    pub recheck_rounds: usize,
     pub recheck_margin: f64,
+    pub pair_rounds: usize,
+    pub target_sample_time: Duration,
 }
 
 impl Default for CalibrationOptions {
@@ -69,39 +57,14 @@ impl Default for CalibrationOptions {
         Self {
             file_size: DEFAULT_FILE_SIZE,
             rounds: DEFAULT_ROUNDS,
-            recheck_rounds: DEFAULT_RECHECK_ROUNDS,
-            pair_rounds: DEFAULT_PAIR_ROUNDS,
-            target_sample_time: DEFAULT_TARGET_SAMPLE_TIME,
             max_workers: DEFAULT_MAX_WORKERS,
             tie_margin: DEFAULT_TIE_MARGIN,
+            recheck_rounds: DEFAULT_RECHECK_ROUNDS,
             recheck_margin: DEFAULT_RECHECK_MARGIN,
+            pair_rounds: DEFAULT_PAIR_ROUNDS,
+            target_sample_time: DEFAULT_TARGET_SAMPLE_TIME,
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct TuningMeasurement {
-    pub workers: usize,
-    pub samples: usize,
-    /// Total exact-verifier invocations represented by the robust samples.
-    pub verification_runs: usize,
-    /// Median normalized time for one exact-verifier pass.
-    pub median: Duration,
-    pub median_mib_per_second: f64,
-    /// Median absolute deviation divided by the median. Lower is more stable.
-    pub relative_mad: f64,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PairwiseMeasurement {
-    pub incumbent_workers: usize,
-    pub challenger_workers: usize,
-    pub pairs: usize,
-    /// challenger_time / incumbent_time. Values below 1.0 favor the challenger.
-    pub median_ratio: f64,
-    /// Number of pairs where the challenger was at least `tie_margin` faster.
-    pub decisive_challenger_wins: usize,
-    pub promoted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,21 +106,73 @@ impl CalibrationStability {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct TuningMeasurement {
+    pub workers: usize,
+    pub median: Duration,
+    pub median_mib_per_second: f64,
+    pub samples: usize,
+    pub verification_runs: usize,
+    pub relative_mad: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PairwiseConfirmation {
+    pub incumbent_workers: usize,
+    pub challenger_workers: usize,
+    pub median_challenger_to_incumbent_ratio: f64,
+    pub decisive_challenger_wins: usize,
+    pub rounds: usize,
+    pub promoted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifierTuningProfile {
+    pub storage_key: String,
+    pub calibrated_path: PathBuf,
+    pub workers: usize,
+    pub logical_cpus: usize,
+    pub median_mib_per_second: f64,
+    pub selected_samples: usize,
+    pub selected_verification_runs: usize,
+    pub relative_mad: f64,
+    pub decision_relative_mad: f64,
+    pub global_relative_mad: f64,
+    pub selected_slowdown_vs_fastest: f64,
+    pub stability: CalibrationStability,
+    pub calibrated_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CalibrationReport {
+    pub profile: VerifierTuningProfile,
+    pub measurements: Vec<TuningMeasurement>,
+    pub pairwise: Vec<PairwiseConfirmation>,
+    pub groups: usize,
+    pub bytes_per_run: u64,
+    pub initial_rounds: usize,
+    pub recheck_rounds: usize,
+    pub pair_rounds: usize,
+    pub target_sample_time: Duration,
+    pub rescue_attempted: bool,
+    pub initial_target_sample_time: Duration,
+    pub initial_stability: Option<CalibrationStability>,
+    pub initial_selected_workers: usize,
+    pub aggregate_selected_workers: usize,
+    pub rechecked_workers: Vec<usize>,
+    pub paired_workers: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum VerifierTuningPlan {
-    /// A previously calibrated profile can be reused immediately.
     UseProfile {
         storage_key: String,
         workers: usize,
         stability: CalibrationStability,
     },
-    /// No profile exists, but Krokiet found a writable directory on the same
-    /// storage and can calibrate there.
     Calibrate {
         storage_key: String,
         directory: PathBuf,
     },
-    /// No profile exists and calibration cannot safely create temporary files.
-    /// Scanning should continue with a conservative worker count.
     Fallback {
         storage_key: String,
         workers: usize,
@@ -181,67 +196,6 @@ impl VerifierTuningPlan {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct VerifierTuningProfile {
-    /// Stable storage identifier for the calibrated directory.
-    pub storage_key: String,
-    /// Informational path used for the calibration.
-    pub calibrated_path: PathBuf,
-    /// Worker count selected by the calibration.
-    pub workers: usize,
-    /// Logical CPU count observed while calibrating.
-    pub logical_cpus: usize,
-    /// Throughput of the selected configuration on the synthetic exact-verify workload.
-    pub median_mib_per_second: f64,
-    /// Number of robust samples that contributed to the selected result.
-    pub selected_samples: usize,
-    /// Total exact-verifier invocations represented by those samples.
-    pub selected_verification_runs: usize,
-    /// Robust relative dispersion of the selected candidate.
-    pub relative_mad: f64,
-    /// Robust dispersion of the decision set (paired finalists when available,
-    /// otherwise the aggregate finalists). This is the stability signal used to
-    /// decide whether a profile is trustworthy.
-    pub decision_relative_mad: f64,
-    /// Median robust dispersion across every tested candidate. This is retained
-    /// for diagnostics only: clearly inferior noisy candidates must not invalidate
-    /// an otherwise stable final decision.
-    pub global_relative_mad: f64,
-    /// How much slower the selected candidate is than the absolute fastest
-    /// aggregate candidate. This can be non-zero because the tie policy prefers
-    /// lower concurrency.
-    pub selected_slowdown_vs_fastest: f64,
-    pub stability: CalibrationStability,
-    pub calibrated_at_unix_seconds: u64,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CalibrationReport {
-    pub profile: VerifierTuningProfile,
-    pub measurements: Vec<TuningMeasurement>,
-    pub pairwise: Vec<PairwiseMeasurement>,
-    pub groups: usize,
-    pub bytes_per_run: u64,
-    pub initial_rounds: usize,
-    pub recheck_rounds: usize,
-    pub pair_rounds: usize,
-    pub target_sample_time: Duration,
-    /// True when the normal pass was rejected and the result comes from a
-    /// completely fresh, longer rescue pass.
-    pub rescue_attempted: bool,
-    /// Window used by the first pass. Useful for diagnostics when rescue ran.
-    pub initial_target_sample_time: Duration,
-    /// Stability returned by the first pass. Present only when rescue ran.
-    pub initial_stability: Option<CalibrationStability>,
-    pub initial_selected_workers: usize,
-    pub aggregate_selected_workers: usize,
-    pub rechecked_workers: Vec<usize>,
-    pub paired_workers: Vec<usize>,
-}
-
-/// Small persistent store. Krokiet can keep this alongside its normal settings.
-/// Profiles are keyed by storage rather than by PC, so one machine can have
-/// different settings for NVMe, SATA, HDD and network shares.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VerifierTuningStore {
     profiles: Vec<VerifierTuningProfile>,
@@ -252,18 +206,29 @@ impl VerifierTuningStore {
         &self.profiles
     }
 
-    pub(crate) fn profile_for_storage_key(&self, storage_key: &str) -> Option<&VerifierTuningProfile> {
-        self.profiles
-            .iter()
-            .find(|profile| profile.storage_key == storage_key && profile.stability != CalibrationStability::Invalid)
+    pub(crate) fn profile_for_storage_key(
+        &self,
+        storage_key: &str,
+    ) -> Option<&VerifierTuningProfile> {
+        self.profiles.iter().find(|profile| {
+            profile.storage_key == storage_key
+                && profile.stability != CalibrationStability::Invalid
+        })
     }
 
-    pub(crate) fn profile_for_path(&self, path: &Path) -> io::Result<Option<&VerifierTuningProfile>> {
+    pub(crate) fn profile_for_path(
+        &self,
+        path: &Path,
+    ) -> io::Result<Option<&VerifierTuningProfile>> {
         let storage_key = storage_key_for_path(path)?;
         Ok(self.profile_for_storage_key(&storage_key))
     }
 
     pub(crate) fn upsert(&mut self, profile: VerifierTuningProfile) {
+        if profile.stability == CalibrationStability::Invalid {
+            return;
+        }
+
         if let Some(existing) = self
             .profiles
             .iter_mut()
@@ -277,19 +242,23 @@ impl VerifierTuningStore {
         }
     }
 
-    /// Returns the worker budget for all requested paths.
-    ///
-    /// If every path has a valid profile, the most conservative worker count is
-    /// used across storages. If at least one storage is unknown or invalid,
-    /// `None` is returned so the caller can stay sequential or request tuning.
-    pub(crate) fn workers_for_paths(&self, paths: &[PathBuf]) -> io::Result<Option<usize>> {
+    pub(crate) fn workers_for_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> io::Result<Option<usize>> {
         if paths.is_empty() {
             return Ok(None);
         }
 
         let mut selected: Option<usize> = None;
+        let mut seen = BTreeSet::new();
+
         for path in paths {
             let key = storage_key_for_path(path)?;
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+
             let Some(profile) = self.profile_for_storage_key(&key) else {
                 return Ok(None);
             };
@@ -306,7 +275,9 @@ impl VerifierTuningStore {
     pub(crate) fn load(path: &Path) -> io::Result<Self> {
         let file = match File::open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
             Err(error) => return Err(error),
         };
 
@@ -322,6 +293,7 @@ impl VerifierTuningStore {
         };
 
         let mut store = Self::default();
+
         for item in items {
             let Some(storage_key) = item.get("storage_key").and_then(Value::as_str) else {
                 continue;
@@ -335,16 +307,6 @@ impl VerifierTuningStore {
             let Some(logical_cpus) = item.get("logical_cpus").and_then(Value::as_u64) else {
                 continue;
             };
-            let Some(selected_samples) = item.get("selected_samples").and_then(Value::as_u64)
-            else {
-                continue;
-            };
-            let Some(selected_verification_runs) = item
-                .get("selected_verification_runs")
-                .and_then(Value::as_u64)
-            else {
-                continue;
-            };
             let Some(stability) = item
                 .get("stability")
                 .and_then(Value::as_str)
@@ -353,65 +315,31 @@ impl VerifierTuningStore {
                 continue;
             };
 
-            let median_mib_per_second = item
-                .get("median_mib_per_second")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let relative_mad = item
-                .get("relative_mad")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let decision_relative_mad = item
-                .get("decision_relative_mad")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let global_relative_mad = item
-                .get("global_relative_mad")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let selected_slowdown_vs_fastest = item
-                .get("selected_slowdown_vs_fastest")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let calibrated_at_unix_seconds = item
-                .get("calibrated_at_unix_seconds")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-
-            let Ok(workers) = usize::try_from(workers) else {
-                continue;
-            };
-            let Ok(logical_cpus) = usize::try_from(logical_cpus) else {
-                continue;
-            };
-            let Ok(selected_samples) = usize::try_from(selected_samples) else {
-                continue;
-            };
-            let Ok(selected_verification_runs) = usize::try_from(selected_verification_runs) else {
-                continue;
-            };
-            if workers == 0
-                || logical_cpus == 0
-                || selected_samples == 0
-                || selected_verification_runs == 0
-            {
+            if stability == CalibrationStability::Invalid {
                 continue;
             }
 
             store.upsert(VerifierTuningProfile {
                 storage_key: storage_key.to_owned(),
                 calibrated_path: PathBuf::from(calibrated_path),
-                workers,
-                logical_cpus,
-                median_mib_per_second,
-                selected_samples,
-                selected_verification_runs,
-                relative_mad,
-                decision_relative_mad,
-                global_relative_mad,
-                selected_slowdown_vs_fastest,
+                workers: workers as usize,
+                logical_cpus: logical_cpus as usize,
+                median_mib_per_second: json_f64(item, "median_mib_per_second"),
+                selected_samples: json_u64(item, "selected_samples") as usize,
+                selected_verification_runs: json_u64(item, "selected_verification_runs")
+                    as usize,
+                relative_mad: json_f64(item, "relative_mad"),
+                decision_relative_mad: json_f64(item, "decision_relative_mad"),
+                global_relative_mad: json_f64(item, "global_relative_mad"),
+                selected_slowdown_vs_fastest: json_f64(
+                    item,
+                    "selected_slowdown_vs_fastest",
+                ),
                 stability,
-                calibrated_at_unix_seconds,
+                calibrated_at_unix_seconds: json_u64(
+                    item,
+                    "calibrated_at_unix_seconds",
+                ),
             });
         }
 
@@ -419,15 +347,14 @@ impl VerifierTuningStore {
     }
 
     pub(crate) fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let profiles = self
             .profiles
             .iter()
+            .filter(|profile| profile.stability != CalibrationStability::Invalid)
             .map(|profile| {
                 json!({
                     "storage_key": profile.storage_key,
@@ -447,36 +374,54 @@ impl VerifierTuningStore {
             })
             .collect::<Vec<_>>();
 
-        let document = json!({
+        let value = json!({
             "version": TUNING_FORMAT_VERSION,
             "profiles": profiles,
         });
 
-        let temporary = path.with_extension("tmp");
+        let temp_path = path.with_extension("tmp");
         {
-            let file = File::create(&temporary)?;
+            let file = File::create(&temp_path)?;
             let mut writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut writer, &document).map_err(io::Error::other)?;
+            serde_json::to_writer_pretty(&mut writer, &value)
+                .map_err(io::Error::other)?;
             writer.write_all(b"\n")?;
             writer.flush()?;
-            writer.get_ref().sync_all()?;
         }
 
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(temporary, path)
+        fs::rename(temp_path, path)?;
+        Ok(())
     }
 }
 
-/// Decides what Krokiet should do for one path without ever requiring write
-/// access just to continue a scan. Existing profiles win first; otherwise a
-/// writable location on the same storage is selected for calibration. If none
-/// exists, Krokiet falls back to one verifier worker and skips calibration.
+fn json_u64(value: &Value, field: &str) -> u64 {
+    value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn json_f64(value: &Value, field: &str) -> f64 {
+    value.get(field).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+/// Production planning entry point.
+///
+/// Existing profiles are reused without probing write access. If no profile
+/// exists, Krokiet tries to find a writable directory on the same storage.
+/// If that is impossible, scanning continues with SAFE_FALLBACK_WORKERS.
 pub(crate) fn tuning_plan_for_path(
     store: &VerifierTuningStore,
     path: &Path,
 ) -> io::Result<VerifierTuningPlan> {
+    tuning_plan_for_path_with_probe(store, path, calibration_write_probe)
+}
+
+fn tuning_plan_for_path_with_probe<F>(
+    store: &VerifierTuningStore,
+    path: &Path,
+    mut can_write: F,
+) -> io::Result<VerifierTuningPlan>
+where
+    F: FnMut(&Path) -> bool,
+{
     let storage_key = storage_key_for_path(path)?;
 
     if let Some(profile) = store.profile_for_storage_key(&storage_key) {
@@ -487,7 +432,9 @@ pub(crate) fn tuning_plan_for_path(
         });
     }
 
-    if let Some(directory) = find_writable_calibration_directory(path)? {
+    if let Some(directory) =
+        find_writable_calibration_directory_with_probe(path, &mut can_write)?
+    {
         return Ok(VerifierTuningPlan::Calibrate {
             storage_key,
             directory,
@@ -500,19 +447,34 @@ pub(crate) fn tuning_plan_for_path(
     })
 }
 
-/// Finds a place on the same storage where temporary calibration files can be
-/// created. The requested directory is preferred. If it is protected, ancestors
-/// on the same storage are tried. Nothing outside that storage is used.
-pub(crate) fn find_writable_calibration_directory(path: &Path) -> io::Result<Option<PathBuf>> {
+pub(crate) fn find_writable_calibration_directory(
+    path: &Path,
+) -> io::Result<Option<PathBuf>> {
+    find_writable_calibration_directory_with_probe(path, &mut calibration_write_probe)
+}
+
+fn find_writable_calibration_directory_with_probe<F>(
+    path: &Path,
+    can_write: &mut F,
+) -> io::Result<Option<PathBuf>>
+where
+    F: FnMut(&Path) -> bool,
+{
     let canonical = fs::canonicalize(path)?;
     let metadata = fs::metadata(&canonical)?;
+
     let start = if metadata.is_dir() {
         canonical
     } else {
         canonical
             .parent()
             .map(Path::to_path_buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory"))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path has no parent directory",
+                )
+            })?
     };
 
     let target_storage = storage_key_for_path(&start)?;
@@ -525,11 +487,12 @@ pub(crate) fn find_writable_calibration_directory(path: &Path) -> io::Result<Opt
         let Ok(candidate_storage) = storage_key_for_path(candidate) else {
             continue;
         };
+
         if candidate_storage != target_storage {
             continue;
         }
 
-        if calibration_write_probe(candidate) {
+        if can_write(candidate) {
             return Ok(Some(candidate.to_path_buf()));
         }
     }
@@ -558,6 +521,7 @@ fn calibration_write_probe(parent: &Path) -> bool {
                     file.flush()?;
                     Ok(())
                 })();
+
                 let _ = fs::remove_dir_all(&root);
                 return result.is_ok();
             }
@@ -569,18 +533,16 @@ fn calibration_write_probe(parent: &Path) -> bool {
     false
 }
 
-/// Performs a one-off calibration and persists it only when the measurement is
-/// considered usable. An invalid/noisy calibration is returned as an error so a
-/// previous good profile cannot be overwritten by a bad run.
 pub(crate) fn calibrate_and_store(
     directory: &Path,
     store_path: &Path,
     options: CalibrationOptions,
 ) -> io::Result<CalibrationReport> {
     let report = calibrate_directory(directory, options)?;
+
     if report.profile.stability == CalibrationStability::Invalid {
         return Err(io::Error::other(
-            "verifier calibration is too unstable; profile was not stored",
+            "verifier calibration is too unstable to persist",
         ));
     }
 
@@ -614,15 +576,14 @@ pub(crate) fn calibrate_directory(
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
     let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
 
-    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)?;
+    let dataset =
+        CalibrationDataset::create(&calibrated_path, group_count, options.file_size)?;
 
     let mut executors = HashMap::with_capacity(candidates.len());
     for &workers in &candidates {
         executors.insert(workers, ExactVerifierExecutor::new(workers)?);
     }
 
-    // Warm the same file/metadata/page-cache path that the real post-fclones
-    // verifier commonly sees. Warm-up is not timed.
     let mut warm = dataset.result.clone();
     executors
         .get(&1)
@@ -630,6 +591,7 @@ pub(crate) fn calibrate_directory(
         .verify_result(&mut warm)?;
 
     let storage_key = storage_key_for_path(&calibrated_path)?;
+
     let initial_report = run_calibration_pass(
         &calibrated_path,
         &storage_key,
@@ -644,11 +606,9 @@ pub(crate) fn calibrate_directory(
         return Ok(initial_report);
     }
 
-    // The first pass proved that the current machine/storage combination is too
-    // noisy for short samples. Start over from empty buckets: noisy 250 ms data
-    // must not influence the rescue decision.
     let mut rescue_options = options;
-    rescue_options.target_sample_time = rescue_target_sample_time(options.target_sample_time);
+    rescue_options.target_sample_time =
+        rescue_target_sample_time(options.target_sample_time);
     rescue_options.pair_rounds = rescue_pair_rounds(options.pair_rounds);
 
     let mut rescue_report = run_calibration_pass(
@@ -660,11 +620,40 @@ pub(crate) fn calibrate_directory(
         &executors,
         &dataset,
     )?;
+
     rescue_report.rescue_attempted = true;
     rescue_report.initial_target_sample_time = options.target_sample_time;
     rescue_report.initial_stability = Some(initial_report.profile.stability);
 
     Ok(rescue_report)
+}
+
+fn validate_options(options: CalibrationOptions) -> io::Result<()> {
+    if options.file_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "calibration file size must be greater than zero",
+        ));
+    }
+    if options.rounds == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "calibration rounds must be greater than zero",
+        ));
+    }
+    if options.max_workers == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max workers must be greater than zero",
+        ));
+    }
+    if options.target_sample_time.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target sample time must be greater than zero",
+        ));
+    }
+    Ok(())
 }
 
 fn run_calibration_pass(
@@ -676,11 +665,11 @@ fn run_calibration_pass(
     executors: &HashMap<usize, ExactVerifierExecutor>,
     dataset: &CalibrationDataset,
 ) -> io::Result<CalibrationReport> {
-    let sample_capacity = options.rounds.saturating_add(options.recheck_rounds);
+    let capacity = options.rounds.saturating_add(options.recheck_rounds);
     let mut buckets: HashMap<usize, SampleBucket> = candidates
         .iter()
         .copied()
-        .map(|workers| (workers, SampleBucket::with_capacity(sample_capacity)))
+        .map(|workers| (workers, SampleBucket::with_capacity(capacity)))
         .collect();
 
     run_calibration_rounds(
@@ -693,7 +682,8 @@ fn run_calibration_pass(
         &mut buckets,
     )?;
 
-    let initial_measurements = build_measurements(candidates, &buckets, dataset.bytes_per_run);
+    let initial_measurements =
+        build_measurements(candidates, &buckets, dataset.bytes_per_run);
     let initial_selected_workers =
         select_measurement(&initial_measurements, options.tie_margin).workers;
 
@@ -716,30 +706,36 @@ fn run_calibration_pass(
     }
 
     let measurements = build_measurements(candidates, &buckets, dataset.bytes_per_run);
-    let aggregate_selected_workers = select_measurement(&measurements, options.tie_margin).workers;
+    let aggregate_selected_workers =
+        select_measurement(&measurements, options.tie_margin).workers;
     let paired_workers = close_candidates(&measurements, options.recheck_margin);
 
-    let (workers, pairwise) = if options.pair_rounds == 0 || paired_workers.len() <= 1 {
-        (aggregate_selected_workers, Vec::new())
-    } else {
-        paired_confirmation(
-            &paired_workers,
-            options.pair_rounds,
-            options.target_sample_time,
-            options.tie_margin,
-            executors,
-            dataset,
-        )?
-    };
+    let (workers, pairwise) =
+        if options.pair_rounds == 0 || paired_workers.len() <= 1 {
+            (aggregate_selected_workers, Vec::new())
+        } else {
+            paired_confirmation(
+                &paired_workers,
+                options.pair_rounds,
+                options.target_sample_time,
+                options.tie_margin,
+                executors,
+                dataset,
+            )?
+        };
 
     let selected = measurements
         .iter()
         .find(|measurement| measurement.workers == workers)
-        .expect("paired selection must refer to a measured worker count");
+        .expect("selected workers must exist");
     let fastest = fastest_measurement(&measurements);
-    let selected_slowdown_vs_fastest = slowdown_ratio(selected.median, fastest.median);
-    let decision_relative_mad = decision_relative_mad(&measurements, &paired_workers, workers);
+
+    let selected_slowdown_vs_fastest =
+        slowdown_ratio(selected.median, fastest.median);
+    let decision_relative_mad =
+        decision_relative_mad(&measurements, &paired_workers, workers);
     let global_relative_mad = global_relative_mad(&measurements);
+
     let stability = classify_stability(
         initial_selected_workers,
         aggregate_selected_workers,
@@ -803,21 +799,21 @@ fn rescue_pair_rounds(initial: usize) -> usize {
 
 #[derive(Clone, Debug, Default)]
 struct SampleBucket {
-    normalized_times: Vec<Duration>,
+    samples: Vec<Duration>,
     verification_runs: usize,
 }
 
 impl SampleBucket {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            normalized_times: Vec::with_capacity(capacity),
+            samples: Vec::with_capacity(capacity),
             verification_runs: 0,
         }
     }
 }
 
 fn run_calibration_rounds(
-    candidates: &[usize],
+    workers: &[usize],
     rounds: usize,
     round_offset: usize,
     target_sample_time: Duration,
@@ -825,70 +821,70 @@ fn run_calibration_rounds(
     dataset: &CalibrationDataset,
     buckets: &mut HashMap<usize, SampleBucket>,
 ) -> io::Result<()> {
-    if candidates.is_empty() || rounds == 0 {
-        return Ok(());
-    }
-
-    for local_round in 0..rounds {
-        let global_round = round_offset.saturating_add(local_round);
-        let mut order = candidates.to_vec();
-        let order_len = order.len();
-        order.rotate_left(global_round % order_len);
-        if global_round % 2 == 1 {
-            order.reverse();
-        }
+    for round in 0..rounds {
+        let order = rotated_order(workers, round + round_offset);
 
         for workers in order {
-            let (normalized, verification_runs) = measure_candidate_window(
-                executors
-                    .get(&workers)
-                    .expect("executor exists for every candidate"),
-                dataset,
-                target_sample_time,
-            )?;
+            let executor = executors
+                .get(&workers)
+                .expect("executor must exist for candidate");
+
+            let sample =
+                timed_window(executor, dataset, target_sample_time)?;
 
             let bucket = buckets
                 .get_mut(&workers)
-                .expect("sample bucket exists for every candidate");
-            bucket.normalized_times.push(normalized);
-            bucket.verification_runs = bucket.verification_runs.saturating_add(verification_runs);
+                .expect("sample bucket must exist");
+            bucket.samples.push(sample.average);
+            bucket.verification_runs += sample.runs;
         }
     }
 
     Ok(())
 }
 
-fn measure_candidate_window(
+#[derive(Clone, Copy, Debug)]
+struct TimedWindow {
+    average: Duration,
+    runs: usize,
+}
+
+fn timed_window(
     executor: &ExactVerifierExecutor,
     dataset: &CalibrationDataset,
     target_sample_time: Duration,
-) -> io::Result<(Duration, usize)> {
-    let mut measured = Duration::ZERO;
-    let mut verification_runs = 0_usize;
+) -> io::Result<TimedWindow> {
+    let mut timed = Duration::ZERO;
+    let mut runs = 0usize;
 
-    while verification_runs == 0 || measured < target_sample_time {
-        // Result cloning is intentionally outside the timed verifier interval.
+    while timed < target_sample_time || runs == 0 {
         let mut result = dataset.result.clone();
         let started = Instant::now();
-        let verified = executor.verify_result(&mut result)?;
-        let elapsed = started.elapsed();
-
-        if verified != dataset.group_count || result.groups.len() != dataset.group_count {
-            return Err(io::Error::other(format!(
-                "calibration verifier returned {verified}/{} groups with {} worker(s)",
-                dataset.group_count,
-                executor.workers()
-            )));
-        }
-
-        measured = measured.saturating_add(elapsed);
-        verification_runs = verification_runs.saturating_add(1);
+        executor.verify_result(&mut result)?;
+        timed += started.elapsed();
+        runs += 1;
     }
 
-    let normalized = Duration::from_secs_f64(
-        measured.as_secs_f64() / verification_runs.max(1) as f64,
-    );
-    Ok((normalized, verification_runs))
+    Ok(TimedWindow {
+        average: timed / runs as u32,
+        runs,
+    })
+}
+
+fn rotated_order(workers: &[usize], round: usize) -> Vec<usize> {
+    if workers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut order = workers.to_vec();
+    let len = order.len();
+    order.rotate_left(round % len);
+
+    if round % 2 == 1 {
+        order.reverse();
+    }
+
+    order
 }
 
 fn build_measurements(
@@ -896,146 +892,151 @@ fn build_measurements(
     buckets: &HashMap<usize, SampleBucket>,
     bytes_per_run: u64,
 ) -> Vec<TuningMeasurement> {
-    let mut measurements = Vec::with_capacity(candidates.len());
-
-    for &workers in candidates {
-        let bucket = buckets
-            .get(&workers)
-            .expect("sample bucket exists for every candidate");
-        let median = median_duration(&bucket.normalized_times);
-        let seconds = median.as_secs_f64().max(f64::MIN_POSITIVE);
-        let median_mib_per_second = bytes_per_run as f64 / (1024.0 * 1024.0) / seconds;
-        measurements.push(TuningMeasurement {
-            workers,
-            samples: bucket.normalized_times.len(),
-            verification_runs: bucket.verification_runs,
-            median,
-            median_mib_per_second,
-            relative_mad: relative_mad(&bucket.normalized_times, median),
-        });
-    }
-
-    measurements.sort_by_key(|measurement| measurement.workers);
-    measurements
+    candidates
+        .iter()
+        .map(|workers| {
+            let bucket = buckets.get(workers).expect("bucket must exist");
+            measurement_from_samples(
+                *workers,
+                &bucket.samples,
+                bucket.verification_runs,
+                bytes_per_run,
+            )
+        })
+        .collect()
 }
 
-fn select_measurement(measurements: &[TuningMeasurement], tie_margin: f64) -> &TuningMeasurement {
-    let fastest_seconds = fastest_measurement(measurements).median.as_secs_f64();
-    let acceptable_seconds = fastest_seconds * (1.0 + tie_margin);
+fn measurement_from_samples(
+    workers: usize,
+    samples: &[Duration],
+    verification_runs: usize,
+    bytes_per_run: u64,
+) -> TuningMeasurement {
+    let median = median_duration(samples);
+    let seconds = median.as_secs_f64().max(f64::MIN_POSITIVE);
+    let mib = bytes_per_run as f64 / (1024.0 * 1024.0);
+
+    TuningMeasurement {
+        workers,
+        median,
+        median_mib_per_second: mib / seconds,
+        samples: samples.len(),
+        verification_runs,
+        relative_mad: relative_mad(samples, median),
+    }
+}
+
+fn select_measurement(
+    measurements: &[TuningMeasurement],
+    tie_margin: f64,
+) -> &TuningMeasurement {
+    let fastest = fastest_measurement(measurements);
+    let threshold =
+        fastest.median.as_secs_f64() * (1.0 + tie_margin.max(0.0));
 
     measurements
         .iter()
-        .filter(|measurement| measurement.median.as_secs_f64() <= acceptable_seconds)
+        .filter(|measurement| {
+            measurement.median.as_secs_f64() <= threshold
+        })
         .min_by_key(|measurement| measurement.workers)
-        .expect("at least one tuning measurement")
+        .unwrap_or(fastest)
 }
 
-fn fastest_measurement(measurements: &[TuningMeasurement]) -> &TuningMeasurement {
+fn fastest_measurement(
+    measurements: &[TuningMeasurement],
+) -> &TuningMeasurement {
     measurements
         .iter()
-        .min_by(|left, right| left.median.cmp(&right.median))
-        .expect("at least one tuning measurement")
+        .min_by_key(|measurement| measurement.median)
+        .expect("at least one measurement")
 }
 
-fn close_candidates(measurements: &[TuningMeasurement], margin: f64) -> Vec<usize> {
-    if measurements.is_empty() {
-        return Vec::new();
-    }
-
-    let fastest_seconds = fastest_measurement(measurements).median.as_secs_f64();
-    let threshold = fastest_seconds * (1.0 + margin);
+fn close_candidates(
+    measurements: &[TuningMeasurement],
+    margin: f64,
+) -> Vec<usize> {
+    let fastest = fastest_measurement(measurements);
+    let threshold =
+        fastest.median.as_secs_f64() * (1.0 + margin.max(0.0));
 
     measurements
         .iter()
-        .filter(|measurement| measurement.median.as_secs_f64() <= threshold)
+        .filter(|measurement| {
+            measurement.median.as_secs_f64() <= threshold
+        })
         .map(|measurement| measurement.workers)
         .collect()
 }
 
 fn paired_confirmation(
     candidates: &[usize],
-    pair_rounds: usize,
+    rounds: usize,
     target_sample_time: Duration,
     tie_margin: f64,
     executors: &HashMap<usize, ExactVerifierExecutor>,
     dataset: &CalibrationDataset,
-) -> io::Result<(usize, Vec<PairwiseMeasurement>)> {
+) -> io::Result<(usize, Vec<PairwiseConfirmation>)> {
     let mut ordered = candidates.to_vec();
     ordered.sort_unstable();
-    ordered.dedup();
 
-    let Some(&first) = ordered.first() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "paired confirmation requires at least one candidate",
-        ));
-    };
-
-    let mut incumbent = first;
-    let mut comparisons = Vec::with_capacity(ordered.len().saturating_sub(1));
+    let mut incumbent = ordered[0];
+    let mut reports = Vec::new();
 
     for challenger in ordered.into_iter().skip(1) {
-        let mut ratios = Vec::with_capacity(pair_rounds);
+        let mut ratios = Vec::with_capacity(rounds);
+        let mut decisive_wins = 0usize;
 
-        for pair_index in 0..pair_rounds {
-            let (incumbent_time, challenger_time) = if pair_index % 2 == 0 {
-                let incumbent_time = measure_candidate_window(
-                    executors
-                        .get(&incumbent)
-                        .expect("executor exists for paired incumbent"),
+        for round in 0..rounds {
+            let (incumbent_time, challenger_time) = if round % 2 == 0 {
+                let incumbent_time = timed_window(
+                    executors.get(&incumbent).expect("incumbent executor"),
                     dataset,
                     target_sample_time,
                 )?
-                .0;
-                let challenger_time = measure_candidate_window(
-                    executors
-                        .get(&challenger)
-                        .expect("executor exists for paired challenger"),
+                .average;
+                let challenger_time = timed_window(
+                    executors.get(&challenger).expect("challenger executor"),
                     dataset,
                     target_sample_time,
                 )?
-                .0;
+                .average;
                 (incumbent_time, challenger_time)
             } else {
-                let challenger_time = measure_candidate_window(
-                    executors
-                        .get(&challenger)
-                        .expect("executor exists for paired challenger"),
+                let challenger_time = timed_window(
+                    executors.get(&challenger).expect("challenger executor"),
                     dataset,
                     target_sample_time,
                 )?
-                .0;
-                let incumbent_time = measure_candidate_window(
-                    executors
-                        .get(&incumbent)
-                        .expect("executor exists for paired incumbent"),
+                .average;
+                let incumbent_time = timed_window(
+                    executors.get(&incumbent).expect("incumbent executor"),
                     dataset,
                     target_sample_time,
                 )?
-                .0;
+                .average;
                 (incumbent_time, challenger_time)
             };
 
-            let incumbent_seconds = incumbent_time.as_secs_f64().max(f64::MIN_POSITIVE);
-            ratios.push(challenger_time.as_secs_f64() / incumbent_seconds);
+            let ratio = duration_ratio(challenger_time, incumbent_time);
+            ratios.push(ratio);
+
+            if ratio <= 1.0 - tie_margin {
+                decisive_wins += 1;
+            }
         }
 
-        let median_ratio = median_f64_owned(&ratios);
-        let decisive_threshold = 1.0 - tie_margin;
-        let decisive_challenger_wins = ratios
-            .iter()
-            .filter(|ratio| **ratio < decisive_threshold)
-            .count();
-        let required_wins = pair_rounds / 2 + 1;
-        let promoted = median_ratio < decisive_threshold
-            && decisive_challenger_wins >= required_wins;
+        let median_ratio = median_f64(&ratios);
+        let majority = rounds / 2 + 1;
+        let promoted =
+            median_ratio <= 1.0 - tie_margin && decisive_wins >= majority;
 
-        comparisons.push(PairwiseMeasurement {
+        reports.push(PairwiseConfirmation {
             incumbent_workers: incumbent,
             challenger_workers: challenger,
-            pairs: pair_rounds,
-            median_ratio,
-            decisive_challenger_wins,
+            median_challenger_to_incumbent_ratio: median_ratio,
+            decisive_challenger_wins: decisive_wins,
+            rounds,
             promoted,
         });
 
@@ -1044,207 +1045,153 @@ fn paired_confirmation(
         }
     }
 
-    Ok((incumbent, comparisons))
+    Ok((incumbent, reports))
 }
 
 fn classify_stability(
-    initial_selected_workers: usize,
-    aggregate_selected_workers: usize,
-    final_selected_workers: usize,
+    initial_workers: usize,
+    aggregate_workers: usize,
+    selected_workers: usize,
     selected_relative_mad: f64,
     decision_relative_mad: f64,
-    pairwise: &[PairwiseMeasurement],
+    pairwise: &[PairwiseConfirmation],
     tie_margin: f64,
 ) -> CalibrationStability {
-    // Only the selected candidate and the candidates that actually participated
-    // in the final decision can invalidate a profile. Slow/noisy candidates that
-    // were already eliminated remain useful diagnostics, but are not a reason to
-    // throw away a stable winner.
     if selected_relative_mad > INVALID_STABILITY_RELATIVE_MAD
         || decision_relative_mad > INVALID_STABILITY_RELATIVE_MAD
     {
         return CalibrationStability::Invalid;
     }
 
-    // A comparison sitting very close to the promotion boundary means the exact
-    // worker count is sensitive to small system noise, even if its MAD is low.
-    let pair_boundary_uncertain = pairwise.iter().any(|comparison| {
-        let boundary = 1.0 - tie_margin;
-        (comparison.median_ratio - boundary).abs() <= 0.015
-    });
-
     if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
         || decision_relative_mad > LOW_STABILITY_RELATIVE_MAD
     {
-        CalibrationStability::Low
-    } else if initial_selected_workers != aggregate_selected_workers
-        || aggregate_selected_workers != final_selected_workers
-        || selected_relative_mad > HIGH_STABILITY_RELATIVE_MAD
-        || decision_relative_mad > HIGH_STABILITY_RELATIVE_MAD
-        || pair_boundary_uncertain
-    {
-        CalibrationStability::Medium
-    } else {
-        CalibrationStability::High
+        return CalibrationStability::Low;
     }
+
+    let changed =
+        initial_workers != aggregate_workers || aggregate_workers != selected_workers;
+
+    let near_boundary = pairwise.iter().any(|pair| {
+        let promotion_boundary = 1.0 - tie_margin;
+        (pair.median_challenger_to_incumbent_ratio - promotion_boundary).abs()
+            <= 0.015
+    });
+
+    if changed
+        || selected_relative_mad > MEDIUM_STABILITY_RELATIVE_MAD
+        || decision_relative_mad > MEDIUM_STABILITY_RELATIVE_MAD
+        || near_boundary
+    {
+        return CalibrationStability::Medium;
+    }
+
+    CalibrationStability::High
 }
 
 fn decision_relative_mad(
     measurements: &[TuningMeasurement],
-    decision_workers: &[usize],
+    paired_workers: &[usize],
     selected_workers: usize,
 ) -> f64 {
-    let mut values = if decision_workers.is_empty() {
-        measurements
-            .iter()
-            .filter(|measurement| measurement.workers == selected_workers)
-            .map(|measurement| measurement.relative_mad)
-            .collect::<Vec<_>>()
+    let workers = if paired_workers.is_empty() {
+        vec![selected_workers]
     } else {
-        measurements
-            .iter()
-            .filter(|measurement| decision_workers.contains(&measurement.workers))
-            .map(|measurement| measurement.relative_mad)
-            .collect::<Vec<_>>()
+        paired_workers.to_vec()
     };
 
-    // `selected_workers` always refers to an existing measurement. Keep this
-    // fallback defensive in case the decision-set construction changes later.
-    if values.is_empty() {
-        values = measurements
-            .iter()
-            .filter(|measurement| measurement.workers == selected_workers)
-            .map(|measurement| measurement.relative_mad)
-            .collect();
-    }
+    let values = workers
+        .iter()
+        .filter_map(|workers| {
+            measurements
+                .iter()
+                .find(|measurement| measurement.workers == *workers)
+                .map(|measurement| measurement.relative_mad)
+        })
+        .collect::<Vec<_>>();
 
-    median_f64(&mut values)
+    median_f64(&values)
 }
 
 fn global_relative_mad(measurements: &[TuningMeasurement]) -> f64 {
-    let mut values = measurements
+    let values = measurements
         .iter()
         .map(|measurement| measurement.relative_mad)
         .collect::<Vec<_>>();
-    median_f64(&mut values)
+
+    median_f64(&values)
 }
 
 fn slowdown_ratio(selected: Duration, fastest: Duration) -> f64 {
-    let fastest_seconds = fastest.as_secs_f64().max(f64::MIN_POSITIVE);
-    (selected.as_secs_f64() / fastest_seconds - 1.0).max(0.0)
+    let fastest = fastest.as_secs_f64();
+    if fastest <= f64::MIN_POSITIVE {
+        return 0.0;
+    }
+
+    (selected.as_secs_f64() / fastest - 1.0).max(0.0)
 }
 
-fn validate_options(options: CalibrationOptions) -> io::Result<()> {
-    if options.file_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "calibration file size must be greater than zero",
-        ));
-    }
-    if options.rounds == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "calibration rounds must be greater than zero",
-        ));
-    }
-    if options.target_sample_time.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "calibration target_sample_time must be greater than zero",
-        ));
-    }
-    if options.max_workers == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "calibration max_workers must be greater than zero",
-        ));
-    }
-    if !options.tie_margin.is_finite() || !(0.0..=0.50).contains(&options.tie_margin) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "calibration tie_margin must be between 0.0 and 0.50",
-        ));
-    }
-    if !options.recheck_margin.is_finite()
-        || !(0.0..=0.50).contains(&options.recheck_margin)
-        || options.recheck_margin < options.tie_margin
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "calibration recheck_margin must be between tie_margin and 0.50",
-        ));
-    }
-    Ok(())
-}
-
-fn candidate_worker_counts(logical_cpus: usize, max_workers: usize) -> Vec<usize> {
-    let limit = logical_cpus.max(1).min(max_workers.max(1));
-    let mut candidates = BTreeSet::new();
-    candidates.insert(1);
-
-    let mut power = 2_usize;
-    while power <= limit {
-        candidates.insert(power);
-        let Some(next) = power.checked_mul(2) else {
-            break;
-        };
-        power = next;
+fn relative_mad(samples: &[Duration], median: Duration) -> f64 {
+    let median_seconds = median.as_secs_f64();
+    if samples.is_empty() || median_seconds <= f64::MIN_POSITIVE {
+        return 0.0;
     }
 
-    if (3..=4).contains(&limit) {
-        candidates.insert(3);
-    }
-    if limit >= 6 {
-        candidates.insert(6);
-    }
-    if limit >= 12 {
-        candidates.insert(12);
-    }
-    candidates.insert(limit);
+    let deviations = samples
+        .iter()
+        .map(|sample| (sample.as_secs_f64() - median_seconds).abs())
+        .collect::<Vec<_>>();
 
-    candidates
-        .into_iter()
-        .filter(|workers| *workers <= limit)
-        .collect()
+    median_f64(&deviations) / median_seconds
 }
 
 fn median_duration(values: &[Duration]) -> Duration {
-    assert!(!values.is_empty(), "median requires at least one sample");
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        sorted[middle]
-    } else {
-        Duration::from_secs_f64(
-            (sorted[middle - 1].as_secs_f64() + sorted[middle].as_secs_f64()) / 2.0,
-        )
+    if values.is_empty() {
+        return Duration::ZERO;
     }
-}
 
-fn median_f64(values: &mut [f64]) -> f64 {
-    assert!(!values.is_empty(), "median requires at least one sample");
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values[middle]
-    } else {
-        (values[middle - 1] + values[middle]) / 2.0
-    }
-}
-
-fn median_f64_owned(values: &[f64]) -> f64 {
     let mut values = values.to_vec();
-    median_f64(&mut values)
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
-fn relative_mad(values: &[Duration], median: Duration) -> f64 {
-    let median_seconds = median.as_secs_f64().max(f64::MIN_POSITIVE);
-    let mut deviations = values
-        .iter()
-        .map(|value| (value.as_secs_f64() - median_seconds).abs())
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let mut values = values.to_vec();
+    values.sort_by(|left, right| left.total_cmp(right));
+    values[values.len() / 2]
+}
+
+fn duration_ratio(left: Duration, right: Duration) -> f64 {
+    let right = right.as_secs_f64();
+    if right <= f64::MIN_POSITIVE {
+        return 1.0;
+    }
+    left.as_secs_f64() / right
+}
+
+fn candidate_worker_counts(
+    logical_cpus: usize,
+    max_workers: usize,
+) -> Vec<usize> {
+    let ceiling = logical_cpus.max(1).min(max_workers.max(1)).min(16);
+    let preferred = [1usize, 2, 4, 6, 8, 12, 16];
+
+    let mut candidates = preferred
+        .into_iter()
+        .filter(|workers| *workers <= ceiling)
         .collect::<Vec<_>>();
-    median_f64(&mut deviations) / median_seconds
+
+    if !candidates.contains(&ceiling) {
+        candidates.push(ceiling);
+    }
+
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
 }
 
 struct CalibrationDataset {
@@ -1255,42 +1202,45 @@ struct CalibrationDataset {
 }
 
 impl CalibrationDataset {
-    fn create(parent: &Path, group_count: usize, file_size: u64) -> io::Result<Self> {
-        let root = create_unique_calibration_dir(parent)?;
-        let creation_result = Self::populate(root.clone(), group_count, file_size);
-        if creation_result.is_err() {
-            let _ = fs::remove_dir_all(&root);
-        }
-        creation_result
-    }
+    fn create(
+        parent: &Path,
+        group_count: usize,
+        file_size: u64,
+    ) -> io::Result<Self> {
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
 
-    fn populate(root: PathBuf, group_count: usize, file_size: u64) -> io::Result<Self> {
+        let root = parent.join(format!(
+            ".krokiet-verifier-tuning-{pid}-{nanos}"
+        ));
+        fs::create_dir(&root)?;
+
         let mut groups = Vec::with_capacity(group_count);
+        let mut bytes_per_run = 0u64;
 
         for group_index in 0..group_count {
-            let left = root.join(format!("group-{group_index:03}-a.bin"));
-            let right = root.join(format!("group-{group_index:03}-b.bin"));
-            write_identical_pair(
-                &left,
-                &right,
-                file_size,
-                0x9E37_79B9_7F4A_7C15_u64 ^ group_index as u64,
-            )?;
+            let left = root.join(format!("group-{group_index:04}-a.bin"));
+            let right = root.join(format!("group-{group_index:04}-b.bin"));
 
-            groups.push(DuplicateGroup::new(vec![
-                DuplicateFile::from_path(left)?,
-                DuplicateFile::from_path(right)?,
-            ]));
+            write_pattern_file(&left, file_size, group_index as u64)?;
+            fs::copy(&left, &right)?;
+
+            let left_file = DuplicateFile::from_path(left)?;
+            let right_file = DuplicateFile::from_path(right)?;
+
+            bytes_per_run =
+                bytes_per_run.saturating_add(file_size.saturating_mul(2));
+
+            groups.push(DuplicateGroup::new(vec![left_file, right_file]));
         }
-
-        let bytes_per_run = file_size
-            .saturating_mul(group_count as u64)
-            .saturating_mul(2);
 
         Ok(Self {
             root,
             result: DuplicateScanResult {
-                engine: "tuning",
+                engine: "verifier-tuning",
                 groups,
                 elapsed: Duration::ZERO,
             },
@@ -1306,66 +1256,30 @@ impl Drop for CalibrationDataset {
     }
 }
 
-fn create_unique_calibration_dir(parent: &Path) -> io::Result<PathBuf> {
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+fn write_pattern_file(
+    path: &Path,
+    file_size: u64,
+    seed: u64,
+) -> io::Result<()> {
+    const CHUNK: usize = 1024 * 1024;
+    let mut file = BufWriter::new(File::create(path)?);
+    let mut buffer = vec![0u8; CHUNK];
 
-    for attempt in 0..32_u32 {
-        let candidate = parent.join(format!(
-            ".krokiet-verifier-tuning-{pid}-{nanos}-{attempt}"
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
+    for (index, value) in buffer.iter_mut().enumerate() {
+        *value = ((index as u64)
+            .wrapping_mul(31)
+            .wrapping_add(seed.wrapping_mul(17))
+            & 0xFF) as u8;
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "failed to create a unique verifier calibration directory",
-    ))
-}
-
-fn write_identical_pair(left: &Path, right: &Path, size: u64, seed: u64) -> io::Result<()> {
-    const WRITE_BUFFER: usize = 1024 * 1024;
-
-    let mut left_writer = BufWriter::new(File::create(left)?);
-    let mut right_writer = BufWriter::new(File::create(right)?);
-    let mut buffer = vec![0_u8; WRITE_BUFFER];
-    let mut state = seed.max(1);
-    let mut remaining = size;
-
+    let mut remaining = file_size;
     while remaining > 0 {
-        let amount = remaining.min(WRITE_BUFFER as u64) as usize;
-        fill_pseudorandom(&mut buffer[..amount], &mut state);
-        left_writer.write_all(&buffer[..amount])?;
-        right_writer.write_all(&buffer[..amount])?;
+        let amount = remaining.min(buffer.len() as u64) as usize;
+        file.write_all(&buffer[..amount])?;
         remaining -= amount as u64;
     }
 
-    left_writer.flush()?;
-    right_writer.flush()?;
-    left_writer.get_ref().sync_all()?;
-    right_writer.get_ref().sync_all()?;
-    Ok(())
-}
-
-fn fill_pseudorandom(buffer: &mut [u8], state: &mut u64) {
-    for chunk in buffer.chunks_mut(8) {
-        // xorshift64*: deterministic, cheap and sufficiently non-repetitive for
-        // a storage benchmark. This is not cryptographic data.
-        let mut value = *state;
-        value ^= value >> 12;
-        value ^= value << 25;
-        value ^= value >> 27;
-        *state = value;
-        let bytes = value.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
+    file.flush()
 }
 
 #[cfg(windows)]
@@ -1373,28 +1287,31 @@ pub(crate) fn storage_key_for_path(path: &Path) -> io::Result<String> {
     use std::path::{Component, Prefix};
 
     let canonical = fs::canonicalize(path)?;
-    let Some(Component::Prefix(prefix_component)) = canonical.components().next() else {
+    let Some(Component::Prefix(prefix_component)) = canonical.components().next()
+    else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("path has no Windows volume prefix: {}", canonical.display()),
+            format!(
+                "path has no Windows volume prefix: {}",
+                canonical.display()
+            ),
         ));
     };
 
     let key = match prefix_component.kind() {
-        // Network shares are already identified independently from a mapped drive
-        // letter, so keep server/share as the stable key.
-        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
-            "windows-unc:{}\\{}",
-            server.to_string_lossy().to_ascii_lowercase(),
-            share.to_string_lossy().to_ascii_lowercase(),
-        ),
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            format!(
+                "windows-unc:{}\\{}",
+                server.to_string_lossy().to_ascii_lowercase(),
+                share.to_string_lossy().to_ascii_lowercase(),
+            )
+        }
         Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
-            // Prefer the Windows volume GUID. This survives a USB changing from,
-            // for example, Q: to F: on the same machine. If Windows cannot expose
-            // a volume GUID, retain the old drive-letter fallback rather than
-            // making tuning fail.
             windows_volume_key(&canonical).unwrap_or_else(|_| {
-                format!("windows-disk:{}", (letter as char).to_ascii_uppercase())
+                format!(
+                    "windows-disk:{}",
+                    (letter as char).to_ascii_uppercase()
+                )
             })
         }
         Prefix::DeviceNS(device) => {
@@ -1416,7 +1333,7 @@ pub(crate) fn storage_key_for_path(path: &Path) -> io::Result<String> {
 
 #[cfg(windows)]
 fn windows_volume_key(path: &Path) -> io::Result<String> {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     #[link(name = "kernel32")]
@@ -1426,6 +1343,7 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
             lpsz_volume_path_name: *mut u16,
             cch_buffer_length: u32,
         ) -> i32;
+
         fn GetVolumeNameForVolumeMountPointW(
             lpsz_volume_mount_point: *const u16,
             lpsz_volume_name: *mut u16,
@@ -1433,12 +1351,19 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
         ) -> i32;
     }
 
-    fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
-        value.encode_wide().chain(std::iter::once(0)).collect()
+    fn wide_null(value: &OsStr) -> Vec<u16> {
+        value
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     fn wide_to_string(buffer: &[u16]) -> String {
-        let end = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+        let end = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
+
         OsString::from_wide(&buffer[..end])
             .to_string_lossy()
             .into_owned()
@@ -1448,14 +1373,19 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
     const VOLUME_CAPACITY: usize = 1_024;
 
     let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    // `canonicalize` commonly returns `\\?\C:\...`. The volume APIs are
-    // most compatible with the regular `C:\...` spelling for drive paths.
-    if input.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+
+    if input.starts_with(&[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+    ]) {
         input.drain(..4);
     }
+
     input.push(0);
 
-    let mut mount_point = vec![0_u16; PATH_CAPACITY];
+    let mut mount_point = vec![0u16; PATH_CAPACITY];
     let mount_ok = unsafe {
         GetVolumePathNameW(
             input.as_ptr(),
@@ -1463,13 +1393,16 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
             PATH_CAPACITY as u32,
         )
     };
+
     if mount_ok == 0 {
         return Err(io::Error::last_os_error());
     }
 
     let mount_point_string = wide_to_string(&mount_point);
-    let mount_point_wide = wide_null(std::ffi::OsStr::new(&mount_point_string));
-    let mut volume_name = vec![0_u16; VOLUME_CAPACITY];
+    let mount_point_wide =
+        wide_null(OsStr::new(&mount_point_string));
+
+    let mut volume_name = vec![0u16; VOLUME_CAPACITY];
     let volume_ok = unsafe {
         GetVolumeNameForVolumeMountPointW(
             mount_point_wide.as_ptr(),
@@ -1477,6 +1410,7 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
             VOLUME_CAPACITY as u32,
         )
     };
+
     if volume_ok == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1488,7 +1422,9 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
         .to_ascii_lowercase();
 
     if normalized.is_empty() {
-        return Err(io::Error::other("Windows returned an empty volume identifier"));
+        return Err(io::Error::other(
+            "Windows returned an empty volume identifier",
+        ));
     }
 
     Ok(format!("windows-volume:{normalized}"))
@@ -1498,66 +1434,57 @@ fn windows_volume_key(path: &Path) -> io::Result<String> {
 pub(crate) fn storage_key_for_path(path: &Path) -> io::Result<String> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = fs::metadata(path)?;
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::metadata(canonical)?;
     Ok(format!("unix-dev:{}", metadata.dev()))
 }
 
 #[cfg(not(any(windows, unix)))]
 pub(crate) fn storage_key_for_path(path: &Path) -> io::Result<String> {
     let canonical = fs::canonicalize(path)?;
-    Ok(format!("path-root:{}", canonical.display()))
+    Ok(format!(
+        "path:{}",
+        canonical.to_string_lossy().to_ascii_lowercase()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn measurement(workers: usize, milliseconds: u64, relative_mad: f64) -> TuningMeasurement {
-        let median = Duration::from_millis(milliseconds);
-        TuningMeasurement {
+    fn sample_profile(
+        storage_key: String,
+        calibrated_path: PathBuf,
+        workers: usize,
+        stability: CalibrationStability,
+    ) -> VerifierTuningProfile {
+        VerifierTuningProfile {
+            storage_key,
+            calibrated_path,
             workers,
-            samples: 5,
-            verification_runs: 25,
-            median,
-            median_mib_per_second: 1000.0 / median.as_secs_f64(),
-            relative_mad,
+            logical_cpus: 8,
+            median_mib_per_second: 4000.0,
+            selected_samples: 9,
+            selected_verification_runs: 45,
+            relative_mad: 0.03,
+            decision_relative_mad: 0.04,
+            global_relative_mad: 0.05,
+            selected_slowdown_vs_fastest: 0.01,
+            stability,
+            calibrated_at_unix_seconds: 42,
         }
     }
 
     #[test]
-    fn eight_logical_cpus_include_the_development_sweet_spots() {
-        assert_eq!(candidate_worker_counts(8, 16), vec![1, 2, 4, 6, 8]);
-    }
-
-    #[test]
-    fn worker_candidates_respect_cpu_and_safety_caps() {
-        assert_eq!(candidate_worker_counts(1, 16), vec![1]);
-        assert_eq!(candidate_worker_counts(4, 16), vec![1, 2, 3, 4]);
+    fn candidate_workers_cover_common_machine_sizes() {
         assert_eq!(
-            candidate_worker_counts(32, 16),
+            candidate_worker_counts(8, 16),
+            vec![1, 2, 4, 6, 8]
+        );
+        assert_eq!(
+            candidate_worker_counts(16, 16),
             vec![1, 2, 4, 6, 8, 12, 16]
         );
-    }
-
-    #[test]
-    fn tie_policy_prefers_fewer_workers_within_margin() {
-        let measurements = vec![
-            measurement(4, 100, 0.01),
-            measurement(8, 97, 0.01),
-            measurement(12, 110, 0.01),
-        ];
-        assert_eq!(select_measurement(&measurements, 0.05).workers, 4);
-    }
-
-    #[test]
-    fn recheck_window_keeps_nearby_finalists() {
-        let measurements = vec![
-            measurement(4, 100, 0.01),
-            measurement(8, 96, 0.01),
-            measurement(12, 104, 0.01),
-            measurement(16, 120, 0.01),
-        ];
-        assert_eq!(close_candidates(&measurements, 0.10), vec![4, 8, 12]);
     }
 
     #[test]
@@ -1576,156 +1503,220 @@ mod tests {
     }
 
     #[test]
-    fn global_mad_detects_system_wide_noise() {
-        let measurements = vec![
-            measurement(1, 100, 0.02),
-            measurement(2, 80, 0.19),
-            measurement(4, 70, 0.21),
-            measurement(8, 68, 0.03),
-            measurement(16, 67, 0.18),
-        ];
-        assert!(global_relative_mad(&measurements) > 0.12);
-    }
-
-    #[test]
-    fn noisy_eliminated_candidates_do_not_invalidate_a_stable_decision() {
-        let measurements = vec![
-            measurement(1, 100, 0.25),
-            measurement(2, 80, 0.31),
-            measurement(4, 70, 0.039),
-            measurement(6, 68, 0.137),
-            measurement(8, 69, 0.044),
-        ];
-        let finalists = vec![4, 6, 8];
-        let decision_mad = decision_relative_mad(&measurements, &finalists, 4);
-
-        assert!(global_relative_mad(&measurements) > 0.12);
-        assert!(decision_mad < 0.05);
-        assert_ne!(
-            classify_stability(6, 4, 4, 0.039, decision_mad, &[], 0.05),
-            CalibrationStability::Invalid
-        );
-    }
-
-    #[test]
-    fn unstable_decision_set_is_still_invalid() {
-        assert_eq!(
-            classify_stability(4, 4, 8, 0.03, 0.19, &[], 0.05),
-            CalibrationStability::Invalid
-        );
-    }
-
-    #[test]
-    fn tuning_store_round_trips_and_matches_storage() {
+    fn writable_storage_without_profile_requests_calibration() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let settings = dir.path().join("verifier-tuning.json");
-        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let store = VerifierTuningStore::default();
+        let mut probes = 0usize;
+
+        let plan = tuning_plan_for_path_with_probe(
+            &store,
+            dir.path(),
+            |_| {
+                probes += 1;
+                true
+            },
+        )
+        .expect("plan");
+
+        match plan {
+            VerifierTuningPlan::Calibrate {
+                directory,
+                storage_key,
+            } => {
+                assert_eq!(
+                    fs::canonicalize(directory).expect("selected canonical"),
+                    fs::canonicalize(dir.path()).expect("temp canonical")
+                );
+                assert_eq!(
+                    storage_key,
+                    storage_key_for_path(dir.path()).expect("storage key")
+                );
+            }
+            other => panic!("expected calibration plan, got {other:?}"),
+        }
+
+        assert!(probes >= 1);
+    }
+
+    #[test]
+    fn readonly_storage_without_profile_uses_safe_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = VerifierTuningStore::default();
+        let mut probes = 0usize;
+
+        let plan = tuning_plan_for_path_with_probe(
+            &store,
+            dir.path(),
+            |_| {
+                probes += 1;
+                false
+            },
+        )
+        .expect("plan");
+
+        match plan {
+            VerifierTuningPlan::Fallback {
+                workers,
+                storage_key,
+            } => {
+                assert_eq!(workers, SAFE_FALLBACK_WORKERS);
+                assert_eq!(
+                    storage_key,
+                    storage_key_for_path(dir.path()).expect("storage key")
+                );
+            }
+            other => panic!("expected fallback plan, got {other:?}"),
+        }
+
+        assert!(probes >= 1);
+    }
+
+    #[test]
+    fn existing_profile_wins_even_when_storage_is_readonly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_key =
+            storage_key_for_path(dir.path()).expect("storage key");
 
         let mut store = VerifierTuningStore::default();
-        store.upsert(VerifierTuningProfile {
-            storage_key,
-            calibrated_path: dir.path().to_path_buf(),
-            workers: 3,
-            logical_cpus: 4,
-            median_mib_per_second: 1234.5,
-            selected_samples: 9,
-            selected_verification_runs: 45,
-            relative_mad: 0.02,
-            decision_relative_mad: 0.025,
-            global_relative_mad: 0.03,
-            selected_slowdown_vs_fastest: 0.01,
-            stability: CalibrationStability::High,
-            calibrated_at_unix_seconds: 42,
-        });
-        store.save(&settings).expect("save");
+        store.upsert(sample_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::Medium,
+        ));
 
-        let loaded = VerifierTuningStore::load(&settings).expect("load");
-        assert_eq!(loaded.profiles().len(), 1);
-        assert_eq!(loaded.profiles()[0].workers, 3);
-        assert_eq!(loaded.profiles()[0].selected_samples, 9);
-        assert_eq!(loaded.profiles()[0].selected_verification_runs, 45);
-        assert_eq!(loaded.profiles()[0].stability, CalibrationStability::High);
-        assert_eq!(
-            loaded
-                .workers_for_paths(&[dir.path().to_path_buf()])
-                .expect("match"),
-            Some(3)
-        );
+        let mut probes = 0usize;
+        let plan = tuning_plan_for_path_with_probe(
+            &store,
+            dir.path(),
+            |_| {
+                probes += 1;
+                false
+            },
+        )
+        .expect("plan");
+
+        match plan {
+            VerifierTuningPlan::UseProfile {
+                workers,
+                stability,
+                storage_key: key,
+            } => {
+                assert_eq!(workers, 6);
+                assert_eq!(stability, CalibrationStability::Medium);
+                assert_eq!(key, storage_key);
+            }
+            other => panic!("expected existing profile, got {other:?}"),
+        }
+
+        // Important: a saved profile must be reusable without attempting any
+        // write at all on a read-only USB/storage.
+        assert_eq!(probes, 0);
     }
 
     #[test]
-    fn invalid_profile_is_not_used_for_scanning() {
+    fn invalid_profile_is_not_reused_and_readonly_falls_back() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let storage_key =
+            storage_key_for_path(dir.path()).expect("storage key");
+
         let mut store = VerifierTuningStore::default();
-        store.upsert(VerifierTuningProfile {
+        // Direct push is intentional here because upsert rejects Invalid.
+        store.profiles.push(sample_profile(
             storage_key,
-            calibrated_path: dir.path().to_path_buf(),
-            workers: 8,
-            logical_cpus: 16,
-            median_mib_per_second: 6000.0,
-            selected_samples: 9,
-            selected_verification_runs: 45,
-            relative_mad: 0.03,
-            decision_relative_mad: 0.20,
-            global_relative_mad: 0.20,
-            selected_slowdown_vs_fastest: 0.0,
-            stability: CalibrationStability::Invalid,
-            calibrated_at_unix_seconds: 42,
-        });
-        assert_eq!(
-            store
-                .workers_for_paths(&[dir.path().to_path_buf()])
-                .expect("lookup"),
-            None
-        );
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Invalid,
+        ));
+
+        let plan =
+            tuning_plan_for_path_with_probe(&store, dir.path(), |_| false)
+                .expect("plan");
+
+        assert!(matches!(
+            plan,
+            VerifierTuningPlan::Fallback {
+                workers: SAFE_FALLBACK_WORKERS,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn writable_calibration_directory_prefers_requested_directory() {
+    fn writable_directory_lookup_prefers_requested_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let selected = find_writable_calibration_directory(dir.path())
-            .expect("writable lookup")
-            .expect("temporary directory should be writable");
+
+        let selected = find_writable_calibration_directory_with_probe(
+            dir.path(),
+            &mut |candidate| candidate == dir.path(),
+        )
+        .expect("lookup")
+        .expect("directory should be selected");
+
         assert_eq!(
-            fs::canonicalize(&selected).expect("selected canonical"),
+            fs::canonicalize(selected).expect("selected canonical"),
             fs::canonicalize(dir.path()).expect("temp canonical")
         );
     }
 
     #[test]
-    fn tuning_plan_reuses_an_existing_profile_without_probing_for_calibration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
-        let mut store = VerifierTuningStore::default();
-        store.upsert(VerifierTuningProfile {
-            storage_key: storage_key.clone(),
-            calibrated_path: dir.path().to_path_buf(),
-            workers: 6,
-            logical_cpus: 8,
-            median_mib_per_second: 4000.0,
-            selected_samples: 9,
-            selected_verification_runs: 45,
-            relative_mad: 0.03,
-            decision_relative_mad: 0.04,
-            global_relative_mad: 0.05,
-            selected_slowdown_vs_fastest: 0.01,
-            stability: CalibrationStability::Medium,
-            calibrated_at_unix_seconds: 42,
-        });
+    fn noisy_eliminated_candidate_does_not_invalidate_stable_decision() {
+        let measurements = vec![
+            TuningMeasurement {
+                workers: 1,
+                median: Duration::from_millis(100),
+                median_mib_per_second: 1000.0,
+                samples: 5,
+                verification_runs: 10,
+                relative_mad: 0.40,
+            },
+            TuningMeasurement {
+                workers: 4,
+                median: Duration::from_millis(50),
+                median_mib_per_second: 2000.0,
+                samples: 9,
+                verification_runs: 30,
+                relative_mad: 0.03,
+            },
+            TuningMeasurement {
+                workers: 6,
+                median: Duration::from_millis(49),
+                median_mib_per_second: 2040.0,
+                samples: 9,
+                verification_runs: 30,
+                relative_mad: 0.04,
+            },
+        ];
 
-        match tuning_plan_for_path(&store, dir.path()).expect("plan") {
-            VerifierTuningPlan::UseProfile {
-                storage_key: key,
-                workers,
-                stability,
-            } => {
-                assert_eq!(key, storage_key);
-                assert_eq!(workers, 6);
-                assert_eq!(stability, CalibrationStability::Medium);
-            }
-            other => panic!("expected stored profile, got {other:?}"),
-        }
+        let decision_mad =
+            decision_relative_mad(&measurements, &[4, 6], 4);
+
+        let stability = classify_stability(
+            4,
+            4,
+            4,
+            0.03,
+            decision_mad,
+            &[],
+            0.05,
+        );
+
+        assert_ne!(stability, CalibrationStability::Invalid);
+    }
+
+    #[test]
+    fn unstable_decision_set_is_invalid() {
+        let stability = classify_stability(
+            4,
+            4,
+            4,
+            0.13,
+            0.02,
+            &[],
+            0.05,
+        );
+
+        assert_eq!(stability, CalibrationStability::Invalid);
     }
 
     #[cfg(feature = "fast_duplicates")]
@@ -1733,107 +1724,24 @@ mod tests {
     #[ignore = "manual storage calibration; set KROKIET_TUNING_PATH"]
     fn manual_storage_calibration() {
         let path = std::env::var_os("KROKIET_TUNING_PATH")
-            .or_else(|| std::env::var_os("KROKIET_DUP_BENCH_PATH"))
             .map(PathBuf::from)
-            .expect("set KROKIET_TUNING_PATH or KROKIET_DUP_BENCH_PATH");
+            .expect("set KROKIET_TUNING_PATH");
 
-        let report = calibrate_directory(&path, CalibrationOptions::default())
-            .expect("storage calibration failed");
+        let report = calibrate_directory(
+            &path,
+            CalibrationOptions::default(),
+        )
+        .expect("calibration");
 
-        print_report(&report);
-    }
-
-    #[cfg(feature = "fast_duplicates")]
-    fn print_report(report: &CalibrationReport) {
-        println!();
-        println!("============================================================");
-        println!(" KROKIET - CALIBRACION ROBUSTA DEL EXACT VERIFIER");
-        println!("============================================================");
-        println!("Ruta          : {}", report.profile.calibrated_path.display());
-        println!("Storage key   : {}", report.profile.storage_key);
-        println!("CPU logicos   : {}", report.profile.logical_cpus);
-        println!("Grupos        : {}", report.groups);
+        println!("Storage key: {}", report.profile.storage_key);
+        println!("Workers: {}", report.profile.workers);
         println!(
-            "Lectura/ronda : {:.1} MiB",
-            report.bytes_per_run as f64 / 1024.0 / 1024.0
-        );
-        println!("Rondas base   : {}", report.initial_rounds);
-        println!(
-            "Ventana/sample: {:.0} ms",
-            report.target_sample_time.as_secs_f64() * 1000.0
-        );
-        if report.rechecked_workers.is_empty() {
-            println!("Recheck       : no necesario");
-        } else {
-            println!(
-                "Recheck       : {} ronda(s) extra para {:?}",
-                report.recheck_rounds, report.rechecked_workers
-            );
-        }
-        println!(
-            "Final pareada : {} ronda(s) para {:?}",
-            report.pair_rounds, report.paired_workers
-        );
-        println!();
-        for measurement in &report.measurements {
-            println!(
-                "workers-{:>2}: {:>10.3?} | {:>9.1} MiB/s | n={:<2} | runs={:<3} | MAD {:>5.1}%",
-                measurement.workers,
-                measurement.median,
-                measurement.median_mib_per_second,
-                measurement.samples,
-                measurement.verification_runs,
-                measurement.relative_mad * 100.0,
-            );
-        }
-        if !report.pairwise.is_empty() {
-            println!("------------------------------------------------------------");
-            println!(" CONFIRMACION PAREADA");
-            for comparison in &report.pairwise {
-                println!(
-                    " {:>2} vs {:>2}: ratio {:>6.3} | victorias decisivas {}/{} | {}",
-                    comparison.incumbent_workers,
-                    comparison.challenger_workers,
-                    comparison.median_ratio,
-                    comparison.decisive_challenger_wins,
-                    comparison.pairs,
-                    if comparison.promoted { "PROMUEVE" } else { "MANTIENE" },
-                );
-            }
-        }
-        println!("------------------------------------------------------------");
-        println!("Seleccion ini : {} worker(s)", report.initial_selected_workers);
-        println!(
-            "Seleccion agg : {} worker(s)",
-            report.aggregate_selected_workers
-        );
-        println!("Seleccion     : {} worker(s)", report.profile.workers);
-        println!(
-            "Rendimiento   : {:.1} MiB/s",
-            report.profile.median_mib_per_second
+            "Stability: {}",
+            report.profile.stability.label_es()
         );
         println!(
-            "Margen mejor  : {:.2}%",
-            report.profile.selected_slowdown_vs_fastest * 100.0
-        );
-        println!(
-            "MAD seleccionado: {:.2}%",
-            report.profile.relative_mad * 100.0
-        );
-        println!(
-            "MAD decision  : {:.2}%",
+            "Decision MAD: {:.2}%",
             report.profile.decision_relative_mad * 100.0
         );
-        println!(
-            "MAD global    : {:.2}% (diagnostico)",
-            report.profile.global_relative_mad * 100.0
-        );
-        println!("Estabilidad   : {}", report.profile.stability.label_es());
-        if report.profile.stability == CalibrationStability::Invalid {
-            println!("Perfil        : NO GUARDAR; repetir con el sistema menos cargado");
-        } else {
-            println!("Perfil        : GUARDABLE");
-        }
-        println!("============================================================");
     }
 }
