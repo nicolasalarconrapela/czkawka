@@ -2,8 +2,9 @@
 //!
 //! This module is deliberately independent from duplicate scanning. A caller can
 //! calibrate a writable directory once, persist the resulting profile, and later
-//! feed only the selected worker count into the exact verifier. Normal scans do
-//! not benchmark or auto-tune anything.
+//! feed only the selected worker count into the exact verifier. It also exposes a
+//! resolver that can reuse an existing profile, calibrate when needed, or fall
+//! back safely when calibration is unavailable.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -16,10 +17,9 @@ use serde_json::{Value, json};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Version 6 keeps the adaptive rescue pass and changes Windows storage identity
-// from a drive letter to the underlying volume when possible. It also adds a
-// read-only/permission-safe planning API so lack of write access never blocks a
-// duplicate scan. Old profiles are deliberately ignored.
+// Persistence schema version 6. The 2.9.3 behaviour keeps the same on-disk
+// format and adds safe profile replacement/reuse rules, so no format bump is
+// needed.
 const TUNING_FORMAT_VERSION: u64 = 6;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
@@ -181,6 +181,36 @@ impl VerifierTuningPlan {
     }
 }
 
+/// Final worker choice returned to a future CLI/UI integration. The caller can
+/// expose the source for diagnostics without needing to understand persistence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VerifierTuningResolution {
+    ReusedProfile {
+        storage_key: String,
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    Calibrated {
+        storage_key: String,
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    Fallback {
+        storage_key: String,
+        workers: usize,
+    },
+}
+
+impl VerifierTuningResolution {
+    pub(crate) fn workers(&self) -> usize {
+        match self {
+            Self::ReusedProfile { workers, .. }
+            | Self::Calibrated { workers, .. }
+            | Self::Fallback { workers, .. } => *workers,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VerifierTuningProfile {
     /// Stable storage identifier for the calibrated directory.
@@ -274,6 +304,53 @@ impl VerifierTuningStore {
             self.profiles.push(profile);
             self.profiles
                 .sort_by(|left, right| left.storage_key.cmp(&right.storage_key));
+        }
+    }
+
+    /// Stores a freshly calibrated profile only when doing so cannot reduce the
+    /// confidence of the profile already known for that storage.
+    ///
+    /// Policy:
+    /// - Invalid is never stored.
+    /// - High can replace High/Medium/Low.
+    /// - Medium can replace Medium/Low.
+    /// - Low is stored only when no usable profile exists yet.
+    pub(crate) fn upsert_calibrated_if_preferred(
+        &mut self,
+        profile: VerifierTuningProfile,
+    ) -> bool {
+        if profile.stability == CalibrationStability::Invalid {
+            return false;
+        }
+
+        let existing_index = self
+            .profiles
+            .iter()
+            .position(|existing| existing.storage_key == profile.storage_key);
+
+        let Some(index) = existing_index else {
+            self.upsert(profile);
+            return true;
+        };
+
+        let existing_stability = self.profiles[index].stability;
+        let should_replace = match profile.stability {
+            CalibrationStability::High => true,
+            CalibrationStability::Medium => matches!(
+                existing_stability,
+                CalibrationStability::Medium
+                    | CalibrationStability::Low
+                    | CalibrationStability::Invalid
+            ),
+            CalibrationStability::Low => existing_stability == CalibrationStability::Invalid,
+            CalibrationStability::Invalid => false,
+        };
+
+        if should_replace {
+            self.profiles[index] = profile;
+            true
+        } else {
+            false
         }
     }
 
@@ -618,9 +695,90 @@ where
     }
 
     let mut store = VerifierTuningStore::load(store_path)?;
-    store.upsert(report.profile.clone());
-    store.save(store_path)?;
+    if store.upsert_calibrated_if_preferred(report.profile.clone()) {
+        store.save(store_path)?;
+    }
     Ok(report)
+}
+
+/// Resolves the verifier worker count for one storage and persists a useful
+/// calibration when necessary. This is the single entry point intended for the
+/// upcoming command/UI integration. A failed or unstable calibration never
+/// prevents the duplicate scan: it falls back to the conservative worker count.
+pub(crate) fn resolve_tuning_for_path(
+    path: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+) -> io::Result<VerifierTuningResolution> {
+    resolve_tuning_for_path_with(
+        path,
+        store_path,
+        options,
+        calibration_write_probe,
+        calibrate_directory,
+    )
+}
+
+fn resolve_tuning_for_path_with<P, C>(
+    path: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+    probe: P,
+    calibrate: C,
+) -> io::Result<VerifierTuningResolution>
+where
+    P: FnMut(&Path) -> bool,
+    C: FnOnce(&Path, CalibrationOptions) -> io::Result<CalibrationReport>,
+{
+    let store = VerifierTuningStore::load(store_path)?;
+    let plan = tuning_plan_for_path_with_probe(&store, path, probe)?;
+
+    match plan {
+        VerifierTuningPlan::UseProfile {
+            storage_key,
+            workers,
+            stability,
+        } => Ok(VerifierTuningResolution::ReusedProfile {
+            storage_key,
+            workers,
+            stability,
+        }),
+        VerifierTuningPlan::Fallback {
+            storage_key,
+            workers,
+        } => Ok(VerifierTuningResolution::Fallback {
+            storage_key,
+            workers,
+        }),
+        VerifierTuningPlan::Calibrate {
+            storage_key,
+            directory,
+        } => match calibrate_and_store_with(&directory, store_path, options, calibrate) {
+            Ok(report) => {
+                // The replacement policy may deliberately keep a stronger old
+                // profile. Reload the persisted store so the returned worker
+                // count always matches what future scans will reuse.
+                let persisted = VerifierTuningStore::load(store_path)?;
+                if let Some(profile) = persisted.profile_for_storage_key(&storage_key) {
+                    Ok(VerifierTuningResolution::Calibrated {
+                        storage_key,
+                        workers: profile.workers,
+                        stability: profile.stability,
+                    })
+                } else {
+                    Ok(VerifierTuningResolution::Calibrated {
+                        storage_key,
+                        workers: report.profile.workers,
+                        stability: report.profile.stability,
+                    })
+                }
+            }
+            Err(_) => Ok(VerifierTuningResolution::Fallback {
+                storage_key,
+                workers: SAFE_FALLBACK_WORKERS,
+            }),
+        },
+    }
 }
 
 pub(crate) fn calibrate_directory(
@@ -2031,6 +2189,199 @@ mod tests {
             leftovers.is_empty(),
             "calibration temporary directories were not removed: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn high_profile_replaces_medium_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            4,
+            CalibrationStability::Medium,
+        ));
+
+        let replaced = store.upsert_calibrated_if_preferred(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::High,
+        ));
+
+        assert!(replaced);
+        let profile = store.profile_for_storage_key(&key).expect("profile");
+        assert_eq!(profile.workers, 6);
+        assert_eq!(profile.stability, CalibrationStability::High);
+    }
+
+    #[test]
+    fn medium_profile_does_not_replace_high_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::High,
+        ));
+
+        let replaced = store.upsert_calibrated_if_preferred(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Medium,
+        ));
+
+        assert!(!replaced);
+        let profile = store.profile_for_storage_key(&key).expect("profile");
+        assert_eq!(profile.workers, 6);
+        assert_eq!(profile.stability, CalibrationStability::High);
+    }
+
+    #[test]
+    fn low_profile_does_not_replace_stronger_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::High,
+        ));
+
+        let replaced = store.upsert_calibrated_if_preferred(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Low,
+        ));
+
+        assert!(!replaced);
+        let profile = store.profile_for_storage_key(&key).expect("profile");
+        assert_eq!(profile.workers, 6);
+        assert_eq!(profile.stability, CalibrationStability::High);
+    }
+
+    #[test]
+    fn low_profile_is_saved_when_storage_has_no_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+
+        let stored = store.upsert_calibrated_if_preferred(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            4,
+            CalibrationStability::Low,
+        ));
+
+        assert!(stored);
+        assert_eq!(
+            store.profile_for_storage_key(&key).expect("profile").workers,
+            4
+        );
+    }
+
+    #[test]
+    fn resolver_reuses_saved_profile_without_calibrating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("save profile");
+
+        let mut probes = 0_usize;
+        let resolution = resolve_tuning_for_path_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_| {
+                probes += 1;
+                false
+            },
+            |_, _| panic!("saved profile must skip calibration"),
+        )
+        .expect("resolve");
+
+        assert_eq!(probes, 0);
+        assert_eq!(resolution.workers(), 6);
+        assert!(matches!(
+            resolution,
+            VerifierTuningResolution::ReusedProfile {
+                stability: CalibrationStability::High,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolver_calibrates_persists_and_next_run_reuses_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let expected = test_profile(
+            key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::Medium,
+        );
+
+        let first = resolve_tuning_for_path_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_| true,
+            |_, _| Ok(test_report(expected.clone())),
+        )
+        .expect("first resolve");
+        assert_eq!(first.workers(), 6);
+        assert!(matches!(first, VerifierTuningResolution::Calibrated { .. }));
+
+        let mut probes = 0_usize;
+        let second = resolve_tuning_for_path_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_| {
+                probes += 1;
+                false
+            },
+            |_, _| panic!("second run must reuse persisted profile"),
+        )
+        .expect("second resolve");
+
+        assert_eq!(probes, 0);
+        assert_eq!(second.workers(), 6);
+        assert!(matches!(second, VerifierTuningResolution::ReusedProfile { .. }));
+    }
+
+    #[test]
+    fn resolver_falls_back_when_calibration_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+
+        let resolution = resolve_tuning_for_path_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_| true,
+            |_, _| Err(io::Error::other("synthetic calibration failure")),
+        )
+        .expect("resolve");
+
+        assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
+        assert!(matches!(resolution, VerifierTuningResolution::Fallback { .. }));
+        assert!(!store_path.exists());
     }
 
     #[cfg(feature = "fast_duplicates")]
