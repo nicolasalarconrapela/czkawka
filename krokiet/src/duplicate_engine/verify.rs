@@ -5,8 +5,6 @@ use std::path::Path;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-#[cfg(feature = "fast_duplicates")]
-use std::sync::OnceLock;
 #[cfg(all(test, feature = "fast_duplicates"))]
 use std::time::Duration;
 
@@ -20,11 +18,6 @@ use super::types::DuplicateScanResult;
 const VERIFY_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_CANDIDATES_PER_BATCH: usize = 16;
 const MAX_PINNED_FILES_PER_GROUP: usize = 256;
-
-#[cfg(feature = "fast_duplicates")]
-const PRODUCTION_GROUP_THREADS: usize = 6;
-#[cfg(feature = "fast_duplicates")]
-const MIN_GROUPS_FOR_PARALLEL_VERIFY: usize = 8;
 
 // Win32 FILE_FLAG_SEQUENTIAL_SCAN. Kept local so the exact verifier does not
 // need another direct Windows dependency just to pass an OpenOptions hint.
@@ -42,19 +35,17 @@ pub(crate) trait ExactVerifier {
 
     fn verify_group(&self, group: &mut DuplicateGroup) -> io::Result<bool>;
 
-    /// Verifies all groups and removes every group that did not complete exact
-    /// byte verification successfully. Callers therefore cannot accidentally
-    /// surface an unverified hash candidate as a real duplicate group.
+    /// Default result verification is intentionally sequential.
+    ///
+    /// Worker selection belongs to the independent tuning layer. Callers that
+    /// already have a calibrated worker budget should use `ExactVerifierExecutor`.
     #[cfg(feature = "fast_duplicates")]
     fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        for group in &mut result.groups {
-            self.verify_group(group)?;
-        }
-        Ok(retain_verified_groups(result))
+        verify_result_sequential(result)
     }
 }
 
-/// Production exact verifier.
+/// Production exact verifier for one duplicate group.
 ///
 /// Normal-sized groups keep all handles open for the whole comparison, read the
 /// reference once, use 1 MiB buffers and Rust slice equality, and on Windows
@@ -73,52 +64,48 @@ impl ExactVerifier for StdBufferedVerifier {
         let mut workspace = VerificationWorkspace::new(VERIFY_BUFFER_SIZE);
         verify_group_pinned_handles(group, &mut workspace, true)
     }
+}
 
-    #[cfg(feature = "fast_duplicates")]
-    fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
-        let logical_cpus = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1);
-        let threads = select_production_group_threads(result.groups.len(), logical_cpus);
+/// Reusable result-level executor with an explicit worker budget.
+///
+/// It contains no auto-tuning logic. A calibration/profile layer chooses the
+/// number once; this executor only applies that decision to a scan result.
+#[cfg(feature = "fast_duplicates")]
+pub(crate) struct ExactVerifierExecutor {
+    workers: usize,
+    pool: Option<rayon::ThreadPool>,
+}
 
-        if threads == 1 {
+#[cfg(feature = "fast_duplicates")]
+impl ExactVerifierExecutor {
+    pub(crate) fn new(workers: usize) -> io::Result<Self> {
+        let workers = workers.max(1);
+        let pool = if workers == 1 {
+            None
+        } else {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .thread_name(move |index| format!("krokiet-exact-{workers}-{index}"))
+                    .build()
+                    .map_err(|error| io::Error::other(format!("failed to build exact-verifier thread pool: {error}")))?,
+            )
+        };
+
+        Ok(Self { workers, pool })
+    }
+
+    pub(crate) fn workers(&self) -> usize {
+        self.workers
+    }
+
+    pub(crate) fn verify_result(&self, result: &mut DuplicateScanResult) -> io::Result<usize> {
+        if self.workers == 1 || result.groups.len() <= 1 {
             verify_result_sequential(result)
         } else {
-            verify_result_parallel_groups(result)
+            verify_result_parallel_groups(result, self.pool.as_ref().expect("parallel executor has a pool"))
         }
     }
-}
-
-#[cfg(feature = "fast_duplicates")]
-static VERIFY_POOL_6: OnceLock<rayon::ThreadPool> = OnceLock::new();
-
-#[cfg(feature = "fast_duplicates")]
-fn select_production_group_threads(group_count: usize, logical_cpus: usize) -> usize {
-    if group_count >= MIN_GROUPS_FOR_PARALLEL_VERIFY && logical_cpus >= PRODUCTION_GROUP_THREADS {
-        PRODUCTION_GROUP_THREADS
-    } else {
-        1
-    }
-}
-
-#[cfg(feature = "fast_duplicates")]
-fn verification_pool() -> io::Result<&'static rayon::ThreadPool> {
-    if let Some(pool) = VERIFY_POOL_6.get() {
-        return Ok(pool);
-    }
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(PRODUCTION_GROUP_THREADS)
-        .thread_name(|index| format!("krokiet-exact-{PRODUCTION_GROUP_THREADS}-{index}"))
-        .build()
-        .map_err(|error| io::Error::other(format!("failed to build exact-verifier thread pool: {error}")))?;
-
-    // Another caller can race us only during initialization. If it wins, use
-    // the already-installed equivalent pool and drop this one.
-    let _ = VERIFY_POOL_6.set(pool);
-    Ok(VERIFY_POOL_6
-        .get()
-        .expect("verification pool must be initialized"))
 }
 
 #[cfg(feature = "fast_duplicates")]
@@ -138,18 +125,18 @@ fn verify_result_sequential(result: &mut DuplicateScanResult) -> io::Result<usiz
     Ok(retain_verified_groups(result))
 }
 
-/// Production group-parallel verifier.
-///
-/// Candidate reads inside each duplicate group remain serial. Only independent
-/// groups run concurrently. Each Rayon worker reuses its own 1 MiB reference
-/// and candidate buffers, avoiding one allocation pair per group.
+/// Group-parallel verifier used only when a caller supplies an explicit worker
+/// budget. Candidate reads inside each duplicate group remain serial. Each Rayon
+/// worker reuses its own 1 MiB reference and candidate buffers.
 #[cfg(feature = "fast_duplicates")]
-fn verify_result_parallel_groups(result: &mut DuplicateScanResult) -> io::Result<usize> {
+fn verify_result_parallel_groups(
+    result: &mut DuplicateScanResult,
+    pool: &rayon::ThreadPool,
+) -> io::Result<usize> {
     if result.groups.len() <= 1 {
         return verify_result_sequential(result);
     }
 
-    let pool = verification_pool()?;
     let results: Vec<io::Result<bool>> = pool.install(|| {
         result
             .groups
@@ -473,6 +460,16 @@ pub(crate) fn verify_result(result: &mut DuplicateScanResult) -> io::Result<usiz
     StdBufferedVerifier.verify_result(result)
 }
 
+/// Applies an externally selected worker budget. This is the entry point used
+/// by the independent tuning/profile layer and, later, by the GUI integration.
+#[cfg(feature = "fast_duplicates")]
+pub(crate) fn verify_result_with_workers(
+    result: &mut DuplicateScanResult,
+    workers: usize,
+) -> io::Result<usize> {
+    ExactVerifierExecutor::new(workers)?.verify_result(result)
+}
+
 /// Compatibility shim for older `mod.rs` revisions that re-export
 /// `verify_result` even without `fast_duplicates` enabled.
 #[cfg(not(feature = "fast_duplicates"))]
@@ -718,24 +715,11 @@ mod tests {
 
     #[cfg(feature = "fast_duplicates")]
     #[test]
-    fn production_parallelism_policy_is_conservative() {
-        assert_eq!(select_production_group_threads(0, 8), 1);
-        assert_eq!(
-            select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY - 1, 8),
-            1
-        );
-        assert_eq!(
-            select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY, 5),
-            1
-        );
-        assert_eq!(
-            select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY, 6),
-            PRODUCTION_GROUP_THREADS
-        );
-        assert_eq!(
-            select_production_group_threads(MIN_GROUPS_FOR_PARALLEL_VERIFY + 20, 32),
-            PRODUCTION_GROUP_THREADS
-        );
+    fn explicit_executor_keeps_worker_selection_external() {
+        let sequential = ExactVerifierExecutor::new(0).expect("sequential executor");
+        let parallel = ExactVerifierExecutor::new(6).expect("parallel executor");
+        assert_eq!(sequential.workers(), 1);
+        assert_eq!(parallel.workers(), 6);
     }
 
     #[cfg(feature = "fast_duplicates")]
@@ -774,23 +758,30 @@ mod tests {
         assert_eq!(sequential.groups.len(), 12);
         assert!(sequential.groups.iter().all(|group| group.verified));
 
-        let mut parallel = candidates.clone();
-        let parallel_verified = verify_result_parallel_groups(&mut parallel).expect("parallel verify");
-        assert_eq!(parallel_verified, 12);
-        assert_eq!(parallel.groups.len(), 12);
-        assert!(parallel.groups.iter().all(|group| group.verified));
-        assert!(compare_results(&sequential, &parallel).identical());
+        for workers in [2_usize, 4, 6, 8] {
+            let mut parallel = candidates.clone();
+            let executor = ExactVerifierExecutor::new(workers).expect("parallel executor");
+            let parallel_verified = executor
+                .verify_result(&mut parallel)
+                .expect("parallel verify");
+            assert_eq!(parallel_verified, 12);
+            assert_eq!(parallel.groups.len(), 12);
+            assert!(parallel.groups.iter().all(|group| group.verified));
+            assert!(
+                compare_results(&sequential, &parallel).identical(),
+                "workers={workers}"
+            );
+        }
 
-        // The public production verifier must preserve the same result regardless
-        // of whether this machine selects the serial or the six-worker path.
-        let mut production = candidates;
-        let production_verified = StdBufferedVerifier
-            .verify_result(&mut production)
-            .expect("production verify");
-        assert_eq!(production_verified, 12);
-        assert_eq!(production.groups.len(), 12);
-        assert!(production.groups.iter().all(|group| group.verified));
-        assert!(compare_results(&sequential, &production).identical());
+        // The compatibility entry point is intentionally sequential now. Worker
+        // selection is injected by the tuning/profile layer instead of being
+        // guessed inside the verifier.
+        let mut default_path = candidates;
+        let default_verified = StdBufferedVerifier
+            .verify_result(&mut default_path)
+            .expect("default verify");
+        assert_eq!(default_verified, 12);
+        assert!(compare_results(&sequential, &default_path).identical());
     }
 
     #[cfg(feature = "fast_duplicates")]
@@ -816,17 +807,23 @@ mod tests {
         let logical_cpus = std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1);
+        let configured_workers = std::env::var("KROKIET_VERIFIER_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| logical_cpus.min(6).max(1));
+        let executor = ExactVerifierExecutor::new(configured_workers)
+            .expect("failed to create configured verifier executor");
 
         println!();
         println!("============================================================");
-        println!(" KROKIET - BENCHMARK VERIFIER DE PRODUCCION");
+        println!(" KROKIET - BENCHMARK VERIFIER CONFIGURABLE");
         println!("============================================================");
         println!("Carpeta       : {}", path.display());
         println!("Detector      : fclones full hash (una vez por ronda)");
         println!("Verifier      : pinned handles + path/handle fingerprints + 1 MiB");
-        println!("Comparacion   : secuencial vs politica productiva");
+        println!("Comparacion   : secuencial vs workers configurados");
         println!("CPU logicos   : {logical_cpus}");
-        println!("Politica      : 6 workers si CPU>=6 y grupos>=8; si no, secuencial");
+        println!("Workers       : {} (seleccion externa; KROKIET_VERIFIER_WORKERS)", executor.workers());
         println!("Rondas        : {runs}");
         println!("Medicion      : mismo scan y mismo resultado para ambos caminos");
         println!("Resumen       : ratio/delta emparejado contra secuencial");
@@ -840,28 +837,25 @@ mod tests {
             "el dataset no contiene grupos duplicados"
         );
 
-        let selected_threads =
-            select_production_group_threads(baseline_candidates.groups.len(), logical_cpus);
-
         let mut sequential_warm = baseline_candidates.clone();
         let seq_count =
             verify_result_sequential(&mut sequential_warm).expect("fallo warm-up secuencial");
         assert_eq!(seq_count, sequential_warm.groups.len());
 
         let mut production_warm = baseline_candidates.clone();
-        let production_count = StdBufferedVerifier
+        let production_count = executor
             .verify_result(&mut production_warm)
-            .expect("fallo warm-up produccion");
+            .expect("fallo warm-up configurado");
         assert_eq!(production_count, production_warm.groups.len());
         assert!(compare_results(&sequential_warm, &production_warm).identical());
 
         println!("Warm-up       : resultados exactos identicos [OK]");
         println!("Grupos        : {}", baseline_candidates.groups.len());
         println!("Archivos      : {}", baseline_candidates.file_count());
-        if selected_threads == 1 {
-            println!("Produccion    : sequential");
+        if executor.workers() == 1 {
+            println!("Configurado   : sequential");
         } else {
-            println!("Produccion    : groups-{selected_threads}");
+            println!("Configurado   : groups-{}", executor.workers());
         }
 
         let mut scan_times = Vec::with_capacity(runs);
@@ -898,9 +892,9 @@ mod tests {
             let run_production = |candidates: &DuplicateScanResult| {
                 let mut result = candidates.clone();
                 let started = Instant::now();
-                let verified = StdBufferedVerifier
+                let verified = executor
                     .verify_result(&mut result)
-                    .expect("fallo produccion");
+                    .expect("fallo configurado");
                 let elapsed = started.elapsed();
                 assert_eq!(verified, result.groups.len());
                 assert!(result.groups.iter().all(|group| group.verified));
@@ -927,7 +921,7 @@ mod tests {
                 scan_elapsed + sequential_elapsed,
             );
             println!(
-                "  production : exact {:>10.3?} | pipeline {:>10.3?}",
+                "  configured : exact {:>10.3?} | pipeline {:>10.3?}",
                 production_elapsed,
                 scan_elapsed + production_elapsed,
             );
@@ -960,12 +954,12 @@ mod tests {
         println!("------------------------------------------------------------");
         println!(" scan comun   : {:>10.3?}", scan_median);
         println!(" sequential   : exact {:>10.3?}", sequential_median);
-        println!(" production   : exact {:>10.3?}", production_median);
+        println!(" configured   : exact {:>10.3?}", production_median);
         println!("------------------------------------------------------------");
         println!(" COMPARACION EMPAREJADA");
         println!("------------------------------------------------------------");
         println!(
-            " production   : speedup mediano {:>6.3}x | delta mediana {:+8.3} ms | gana {wins}/{runs}",
+            " configured   : speedup mediano {:>6.3}x | delta mediana {:+8.3} ms | gana {wins}/{runs}",
             paired_speedup,
             paired_delta_ms,
         );
