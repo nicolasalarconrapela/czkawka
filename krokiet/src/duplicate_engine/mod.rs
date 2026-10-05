@@ -6,15 +6,19 @@
 //!
 //! Migration plan:
 //! 1. Keep `connect_scan/duplicate.rs` as the production path while tests mature.
-//! 2. Reach settings/progress/cancellation parity in this abstraction.
-//! 3. Route the GUI scan through `DuplicateEngine`.
-//! 4. Remove only the duplicated direct `DuplicateFinder` plumbing from the GUI
+//! 2. Add a service boundary that owns engine selection, verifier tuning and exact
+//!    verification without changing the GUI path yet.
+//! 3. Reach settings/progress/cancellation parity in this abstraction.
+//! 4. Route command/UI callers through the service boundary.
+//! 5. Remove only the duplicated direct `DuplicateFinder` plumbing from the GUI
 //!    layer; keep `CzkawkaEngine` as a reference/fallback for comparison.
 
 mod compare;
 mod czkawka;
 #[cfg(feature = "fast_duplicates")]
 mod fclones;
+#[cfg(feature = "fast_duplicates")]
+mod service;
 mod types;
 #[cfg(feature = "fast_duplicates")]
 mod tuning;
@@ -24,14 +28,20 @@ pub(crate) use compare::{DuplicateComparison, compare_results};
 pub(crate) use czkawka::CzkawkaEngine;
 #[cfg(feature = "fast_duplicates")]
 pub(crate) use fclones::FclonesEngine;
+#[cfg(feature = "fast_duplicates")]
+#[allow(unused_imports)]
+pub(crate) use service::{
+    DuplicateScanExecution, DuplicateScanServiceOptions, DuplicateServiceEngine, StorageTuningTrace,
+    TuningSource, run_duplicate_scan,
+};
 pub(crate) use types::{DuplicateEngine, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
 pub(crate) use tuning::{
     CalibrationOptions, CalibrationReport, CalibrationStability, TuningMeasurement,
-    VerifierTuningPlan, VerifierTuningProfile, VerifierTuningStore, SAFE_FALLBACK_WORKERS,
+    VerifierTuningPlan, VerifierTuningProfile, VerifierTuningResolution, VerifierTuningStore, SAFE_FALLBACK_WORKERS,
     calibrate_and_store, calibrate_directory, find_writable_calibration_directory,
-    storage_key_for_path, tuning_plan_for_path,
+    resolve_tuning_for_path, storage_key_for_path, tuning_plan_for_path,
 };
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
