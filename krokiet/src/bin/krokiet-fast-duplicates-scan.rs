@@ -24,7 +24,7 @@ mod duplicate_engine;
 #[cfg(all(not(test), feature = "fast_duplicates"))]
 use duplicate_engine::{
     DuplicateScanRequest, DuplicateScanServiceOptions, DuplicateServiceEngine,
-    StorageTuningTrace, TuningSource, run_duplicate_scan,
+    StorageTuningTrace, TuningFallbackReason, TuningSource, run_duplicate_scan,
 };
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
@@ -128,6 +128,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Grupos          : {}", execution.result.groups.len());
     println!("Archivos        : {}", execution.result.file_count());
     println!("Tiempo detector : {:.3?}", execution.result.elapsed);
+    println!("Tiempo tuning   : {:.3?}", execution.tuning_elapsed);
     println!("Tiempo verifier : {:.3?}", execution.verification_elapsed);
     println!("Tiempo total    : {:.3?}", execution.total_elapsed);
 
@@ -143,6 +144,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         for trace in &execution.storage_tuning {
             print_tuning_trace(trace);
         }
+    } else if options.engine == DuplicateServiceEngine::Fast && execution.result.groups.is_empty() {
+        println!("Tuning          : omitido (sin candidatos que verificar)");
     }
 
     let all_verified = execution.result.groups.iter().all(|group| group.verified);
@@ -150,7 +153,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Verificacion    : {}",
         if options.engine == DuplicateServiceEngine::Fast {
-            if all_verified { "EXACTA [OK]" } else { "ERROR" }
+            if execution.result.groups.is_empty() {
+                "no necesaria (sin candidatos)"
+            } else if all_verified {
+                "EXACTA [OK]"
+            } else {
+                "ERROR"
+            }
         } else {
             "gestionada por Czkawka"
         }
@@ -178,6 +187,19 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
             .map(|stability| stability.label_es())
             .unwrap_or("no disponible")
     );
+    if let Some(reason) = trace.fallback_reason {
+        let reason = match reason {
+            TuningFallbackReason::NoWritableCalibrationDirectory => {
+                "sin directorio escribible para calibrar"
+            }
+            TuningFallbackReason::CalibrationFailed => "calibracion fallida o inestable",
+            TuningFallbackReason::TuningUnavailable => "tuning no disponible",
+            TuningFallbackReason::StorageIdentificationFailed => {
+                "no se pudo identificar el almacenamiento"
+            }
+        };
+        println!("Motivo fallback : {reason}");
+    }
     println!();
 }
 

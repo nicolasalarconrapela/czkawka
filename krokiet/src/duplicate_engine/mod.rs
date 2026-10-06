@@ -32,14 +32,15 @@ pub(crate) use fclones::FclonesEngine;
 #[allow(unused_imports)]
 pub(crate) use service::{
     DuplicateScanExecution, DuplicateScanServiceOptions, DuplicateServiceEngine, StorageTuningTrace,
-    TuningSource, run_duplicate_scan,
+    TuningFallbackReason, TuningSource, run_duplicate_scan,
 };
 pub(crate) use types::{DuplicateEngine, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
 pub(crate) use tuning::{
     CalibrationOptions, CalibrationReport, CalibrationStability, TuningMeasurement,
-    VerifierTuningPlan, VerifierTuningProfile, VerifierTuningResolution, VerifierTuningStore, SAFE_FALLBACK_WORKERS,
+    VerifierTuningFallbackReason, VerifierTuningPlan, VerifierTuningProfile,
+    VerifierTuningResolution, VerifierTuningStore, SAFE_FALLBACK_WORKERS,
     calibrate_and_store, calibrate_directory, find_writable_calibration_directory,
     resolve_tuning_for_path, storage_key_for_path, tuning_plan_for_path,
 };

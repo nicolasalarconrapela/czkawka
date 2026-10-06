@@ -142,6 +142,15 @@ impl CalibrationStability {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VerifierTuningFallbackReason {
+    /// Krokiet could not find a writable directory on the target storage, so
+    /// creating synthetic calibration files would be unsafe or impossible.
+    NoWritableCalibrationDirectory,
+    /// The calibration ran but failed or was rejected as too unstable.
+    CalibrationFailed,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum VerifierTuningPlan {
     /// A previously calibrated profile can be reused immediately.
@@ -161,6 +170,7 @@ pub(crate) enum VerifierTuningPlan {
     Fallback {
         storage_key: String,
         workers: usize,
+        reason: VerifierTuningFallbackReason,
     },
 }
 
@@ -198,6 +208,7 @@ pub(crate) enum VerifierTuningResolution {
     Fallback {
         storage_key: String,
         workers: usize,
+        reason: VerifierTuningFallbackReason,
     },
 }
 
@@ -585,6 +596,7 @@ where
     Ok(VerifierTuningPlan::Fallback {
         storage_key,
         workers: SAFE_FALLBACK_WORKERS,
+        reason: VerifierTuningFallbackReason::NoWritableCalibrationDirectory,
     })
 }
 
@@ -746,9 +758,11 @@ where
         VerifierTuningPlan::Fallback {
             storage_key,
             workers,
+            reason,
         } => Ok(VerifierTuningResolution::Fallback {
             storage_key,
             workers,
+            reason,
         }),
         VerifierTuningPlan::Calibrate {
             storage_key,
@@ -776,6 +790,7 @@ where
             Err(_) => Ok(VerifierTuningResolution::Fallback {
                 storage_key,
                 workers: SAFE_FALLBACK_WORKERS,
+                reason: VerifierTuningFallbackReason::CalibrationFailed,
             }),
         },
     }
@@ -2008,9 +2023,14 @@ mod tests {
             VerifierTuningPlan::Fallback {
                 storage_key,
                 workers,
+                reason,
             } => {
                 assert_eq!(storage_key, storage_key_for_path(dir.path()).expect("storage key"));
                 assert_eq!(workers, SAFE_FALLBACK_WORKERS);
+                assert_eq!(
+                    reason,
+                    VerifierTuningFallbackReason::NoWritableCalibrationDirectory
+                );
             }
             other => panic!("expected fallback plan, got {other:?}"),
         }
@@ -2380,7 +2400,13 @@ mod tests {
         .expect("resolve");
 
         assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
-        assert!(matches!(resolution, VerifierTuningResolution::Fallback { .. }));
+        assert!(matches!(
+            resolution,
+            VerifierTuningResolution::Fallback {
+                reason: VerifierTuningFallbackReason::CalibrationFailed,
+                ..
+            }
+        ));
         assert!(!store_path.exists());
     }
 
