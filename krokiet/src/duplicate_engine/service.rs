@@ -44,7 +44,9 @@ pub(crate) enum TuningSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuningFallbackReason {
     NoWritableCalibrationDirectory,
-    CalibrationFailed,
+    CalibrationInvalid,
+    CalibrationExecutionFailed,
+    ProfilePersistenceFailed,
     TuningUnavailable,
     StorageIdentificationFailed,
 }
@@ -55,7 +57,13 @@ impl From<VerifierTuningFallbackReason> for TuningFallbackReason {
             VerifierTuningFallbackReason::NoWritableCalibrationDirectory => {
                 Self::NoWritableCalibrationDirectory
             }
-            VerifierTuningFallbackReason::CalibrationFailed => Self::CalibrationFailed,
+            VerifierTuningFallbackReason::CalibrationInvalid => Self::CalibrationInvalid,
+            VerifierTuningFallbackReason::CalibrationExecutionFailed => {
+                Self::CalibrationExecutionFailed
+            }
+            VerifierTuningFallbackReason::ProfilePersistenceFailed => {
+                Self::ProfilePersistenceFailed
+            }
         }
     }
 }
@@ -71,6 +79,10 @@ pub(crate) struct StorageTuningTrace {
     pub source: TuningSource,
     pub stability: Option<CalibrationStability>,
     pub fallback_reason: Option<TuningFallbackReason>,
+    /// Raw diagnostic detail for the standalone diagnostic command/tests. It may
+    /// contain a local path or OS error and must not be emitted by future GUI
+    /// production logging without sanitization.
+    pub diagnostic_detail: Option<String>,
 }
 
 /// Options owned by the orchestration layer.
@@ -187,9 +199,10 @@ where
                                 options.calibration_options,
                             ) {
                                 Ok(resolution) => trace_from_resolution(resolution),
-                                Err(_) => fallback_trace(
+                                Err(error) => fallback_trace(
                                     storage_key,
                                     TuningFallbackReason::TuningUnavailable,
+                                    Some(error.to_string()),
                                 ),
                             };
                             traces.push(trace);
@@ -208,10 +221,11 @@ where
 
                         (traces, workers)
                     }
-                    Err(_) => (
+                    Err(error) => (
                         vec![fallback_trace(
                             "unavailable".to_string(),
                             TuningFallbackReason::StorageIdentificationFailed,
+                            Some(error.to_string()),
                         )],
                         SAFE_FALLBACK_WORKERS,
                     ),
@@ -255,13 +269,18 @@ fn candidate_storage_representatives(
     Ok(representatives)
 }
 
-fn fallback_trace(storage_key: String, reason: TuningFallbackReason) -> StorageTuningTrace {
+fn fallback_trace(
+    storage_key: String,
+    reason: TuningFallbackReason,
+    diagnostic_detail: Option<String>,
+) -> StorageTuningTrace {
     StorageTuningTrace {
         storage_key,
         workers: SAFE_FALLBACK_WORKERS,
         source: TuningSource::Fallback,
         stability: None,
         fallback_reason: Some(reason),
+        diagnostic_detail,
     }
 }
 
@@ -277,6 +296,7 @@ fn trace_from_resolution(resolution: VerifierTuningResolution) -> StorageTuningT
             source: TuningSource::ReusedProfile,
             stability: Some(stability),
             fallback_reason: None,
+            diagnostic_detail: None,
         },
         VerifierTuningResolution::Calibrated {
             storage_key,
@@ -288,17 +308,20 @@ fn trace_from_resolution(resolution: VerifierTuningResolution) -> StorageTuningT
             source: TuningSource::Calibrated,
             stability: Some(stability),
             fallback_reason: None,
+            diagnostic_detail: None,
         },
         VerifierTuningResolution::Fallback {
             storage_key,
             workers,
             reason,
+            detail,
         } => StorageTuningTrace {
             storage_key,
             workers,
             source: TuningSource::Fallback,
             stability: None,
             fallback_reason: Some(reason.into()),
+            diagnostic_detail: detail,
         },
     }
 }
@@ -402,7 +425,8 @@ mod tests {
             Ok(VerifierTuningResolution::Fallback {
                 storage_key: key.clone(),
                 workers: SAFE_FALLBACK_WORKERS,
-                reason: VerifierTuningFallbackReason::CalibrationFailed,
+                reason: VerifierTuningFallbackReason::CalibrationExecutionFailed,
+                detail: Some("synthetic calibration failure".to_string()),
             })
         })
         .expect("service scan");
@@ -412,7 +436,11 @@ mod tests {
         assert_eq!(execution.storage_tuning[0].stability, None);
         assert_eq!(
             execution.storage_tuning[0].fallback_reason,
-            Some(TuningFallbackReason::CalibrationFailed)
+            Some(TuningFallbackReason::CalibrationExecutionFailed)
+        );
+        assert_eq!(
+            execution.storage_tuning[0].diagnostic_detail.as_deref(),
+            Some("synthetic calibration failure")
         );
         assert!(execution.result.groups.iter().all(|group| group.verified));
     }
@@ -457,6 +485,10 @@ mod tests {
         assert_eq!(
             execution.storage_tuning[0].fallback_reason,
             Some(TuningFallbackReason::TuningUnavailable)
+        );
+        assert_eq!(
+            execution.storage_tuning[0].diagnostic_detail.as_deref(),
+            Some("synthetic tuning store failure")
         );
         assert!(execution.result.groups.iter().all(|group| group.verified));
     }

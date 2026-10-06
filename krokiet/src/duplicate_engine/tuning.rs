@@ -147,8 +147,15 @@ pub(crate) enum VerifierTuningFallbackReason {
     /// Krokiet could not find a writable directory on the target storage, so
     /// creating synthetic calibration files would be unsafe or impossible.
     NoWritableCalibrationDirectory,
-    /// The calibration ran but failed or was rejected as too unstable.
-    CalibrationFailed,
+    /// The calibration completed, but its statistical decision was too unstable
+    /// to trust or persist.
+    CalibrationInvalid,
+    /// The calibration could not complete because the synthetic workload or
+    /// exact verifier returned an I/O/runtime error.
+    CalibrationExecutionFailed,
+    /// Calibration completed successfully, but its profile could not be loaded,
+    /// updated or persisted.
+    ProfilePersistenceFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +216,9 @@ pub(crate) enum VerifierTuningResolution {
         storage_key: String,
         workers: usize,
         reason: VerifierTuningFallbackReason,
+        /// Diagnostic-only detail explaining the precise failure. This may
+        /// contain an OS error/path and must be sanitized before future GUI logs.
+        detail: Option<String>,
     },
 }
 
@@ -763,36 +773,76 @@ where
             storage_key,
             workers,
             reason,
+            detail: None,
         }),
         VerifierTuningPlan::Calibrate {
             storage_key,
             directory,
-        } => match calibrate_and_store_with(&directory, store_path, options, calibrate) {
-            Ok(report) => {
-                // The replacement policy may deliberately keep a stronger old
-                // profile. Reload the persisted store so the returned worker
-                // count always matches what future scans will reuse.
+        } => {
+            let report = match calibrate(&directory, options) {
+                Ok(report) => report,
+                Err(error) => {
+                    return Ok(VerifierTuningResolution::Fallback {
+                        storage_key,
+                        workers: SAFE_FALLBACK_WORKERS,
+                        reason: VerifierTuningFallbackReason::CalibrationExecutionFailed,
+                        detail: Some(error.to_string()),
+                    });
+                }
+            };
+
+            if report.profile.stability == CalibrationStability::Invalid {
+                return Ok(VerifierTuningResolution::Fallback {
+                    storage_key,
+                    workers: SAFE_FALLBACK_WORKERS,
+                    reason: VerifierTuningFallbackReason::CalibrationInvalid,
+                    detail: Some(format!(
+                        "rescue={}; selected={} workers; selected MAD={:.2}%; decision MAD={:.2}%; global MAD={:.2}%",
+                        report.rescue_attempted,
+                        report.profile.workers,
+                        report.profile.relative_mad * 100.0,
+                        report.profile.decision_relative_mad * 100.0,
+                        report.profile.global_relative_mad * 100.0,
+                    )),
+                });
+            }
+
+            // Persistence is deliberately kept as a separate stage so a future
+            // diagnostic can distinguish a good calibration from a store error.
+            let persistence = (|| -> io::Result<VerifierTuningResolution> {
+                let mut persisted = VerifierTuningStore::load(store_path)?;
+                if persisted.upsert_calibrated_if_preferred(report.profile.clone()) {
+                    persisted.save(store_path)?;
+                }
+
+                // Reload what future scans will actually consume. A stronger
+                // pre-existing profile may intentionally have won replacement.
                 let persisted = VerifierTuningStore::load(store_path)?;
                 if let Some(profile) = persisted.profile_for_storage_key(&storage_key) {
                     Ok(VerifierTuningResolution::Calibrated {
-                        storage_key,
+                        storage_key: storage_key.clone(),
                         workers: profile.workers,
                         stability: profile.stability,
                     })
                 } else {
                     Ok(VerifierTuningResolution::Calibrated {
-                        storage_key,
+                        storage_key: storage_key.clone(),
                         workers: report.profile.workers,
                         stability: report.profile.stability,
                     })
                 }
+            })();
+
+            match persistence {
+                Ok(resolution) => Ok(resolution),
+                Err(error) => Ok(VerifierTuningResolution::Fallback {
+                    storage_key,
+                    workers: SAFE_FALLBACK_WORKERS,
+                    reason: VerifierTuningFallbackReason::ProfilePersistenceFailed,
+                    detail: Some(error.to_string()),
+                }),
             }
-            Err(_) => Ok(VerifierTuningResolution::Fallback {
-                storage_key,
-                workers: SAFE_FALLBACK_WORKERS,
-                reason: VerifierTuningFallbackReason::CalibrationFailed,
-            }),
-        },
+        }
     }
 }
 
@@ -802,8 +852,21 @@ pub(crate) fn calibrate_directory(
 ) -> io::Result<CalibrationReport> {
     validate_options(options)?;
 
-    let calibrated_path = fs::canonicalize(directory)?;
-    if !fs::metadata(&calibrated_path)?.is_dir() {
+    let calibrated_path = fs::canonicalize(directory).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("stage=canonicalize-calibration-directory: {error}"),
+        )
+    })?;
+    if !fs::metadata(&calibrated_path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("stage=read-calibration-directory-metadata: {error}"),
+            )
+        })?
+        .is_dir()
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -820,11 +883,23 @@ pub(crate) fn calibrate_directory(
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
     let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
 
-    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)?;
+    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("stage=create-calibration-dataset: {error}"),
+            )
+        })?;
 
     let mut executors = HashMap::with_capacity(candidates.len());
     for &workers in &candidates {
-        executors.insert(workers, ExactVerifierExecutor::new(workers)?);
+        let executor = ExactVerifierExecutor::new(workers).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("stage=create-verifier-executor workers={workers}: {error}"),
+            )
+        })?;
+        executors.insert(workers, executor);
     }
 
     // Warm the same file/metadata/page-cache path that the real post-fclones
@@ -833,9 +908,20 @@ pub(crate) fn calibrate_directory(
     executors
         .get(&1)
         .expect("candidate list always contains one worker")
-        .verify_result(&mut warm)?;
+        .verify_result(&mut warm)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("stage=warmup-exact-verifier: {error}"),
+            )
+        })?;
 
-    let storage_key = storage_key_for_path(&calibrated_path)?;
+    let storage_key = storage_key_for_path(&calibrated_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("stage=identify-calibration-storage: {error}"),
+        )
+    })?;
     let initial_report = run_calibration_pass(
         &calibrated_path,
         &storage_key,
@@ -844,7 +930,13 @@ pub(crate) fn calibrate_directory(
         options,
         &executors,
         &dataset,
-    )?;
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("stage=initial-calibration-pass: {error}"),
+        )
+    })?;
 
     if initial_report.profile.stability != CalibrationStability::Invalid {
         return Ok(initial_report);
@@ -865,7 +957,13 @@ pub(crate) fn calibrate_directory(
         rescue_options,
         &executors,
         &dataset,
-    )?;
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("stage=rescue-calibration-pass: {error}"),
+        )
+    })?;
     rescue_report.rescue_attempted = true;
     rescue_report.initial_target_sample_time = options.target_sample_time;
     rescue_report.initial_stability = Some(initial_report.profile.stability);
@@ -2403,11 +2501,79 @@ mod tests {
         assert!(matches!(
             resolution,
             VerifierTuningResolution::Fallback {
-                reason: VerifierTuningFallbackReason::CalibrationFailed,
+                reason: VerifierTuningFallbackReason::CalibrationExecutionFailed,
                 ..
             }
         ));
         assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn resolver_reports_invalid_calibration_separately_from_execution_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut profile = test_profile(
+            key,
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Invalid,
+        );
+        profile.relative_mad = 0.15;
+        profile.decision_relative_mad = 0.18;
+        profile.global_relative_mad = 0.20;
+
+        let resolution = resolve_tuning_for_path_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_| true,
+            |_, _| Ok(test_report(profile)),
+        )
+        .expect("resolve");
+
+        assert!(matches!(
+            resolution,
+            VerifierTuningResolution::Fallback {
+                reason: VerifierTuningFallbackReason::CalibrationInvalid,
+                detail: Some(ref detail),
+                ..
+            } if detail.contains("decision MAD=18.00%")
+        ));
+        assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn resolver_accepts_file_path_and_calibrates_in_parent_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("candidate.bin");
+        fs::write(&candidate, b"candidate").expect("write candidate");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(&candidate).expect("storage key");
+        let expected_directory = fs::canonicalize(dir.path()).expect("canonical parent");
+        let expected_profile = test_profile(
+            storage_key,
+            expected_directory.clone(),
+            4,
+            CalibrationStability::Medium,
+        );
+        let mut received_directory = None::<PathBuf>;
+
+        let resolution = resolve_tuning_for_path_with(
+            &candidate,
+            &store_path,
+            CalibrationOptions::default(),
+            |_| true,
+            |directory, _| {
+                received_directory = Some(directory.to_path_buf());
+                Ok(test_report(expected_profile.clone()))
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(received_directory.as_deref(), Some(expected_directory.as_path()));
+        assert_eq!(resolution.workers(), 4);
+        assert!(matches!(resolution, VerifierTuningResolution::Calibrated { .. }));
     }
 
     #[cfg(feature = "fast_duplicates")]

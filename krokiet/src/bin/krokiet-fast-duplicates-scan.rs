@@ -87,7 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.1");
+    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.1.2");
     println!("============================================================");
     println!(
         "Motor           : {}",
@@ -192,13 +192,18 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
             TuningFallbackReason::NoWritableCalibrationDirectory => {
                 "sin directorio escribible para calibrar"
             }
-            TuningFallbackReason::CalibrationFailed => "calibracion fallida o inestable",
+            TuningFallbackReason::CalibrationInvalid => "calibracion estadisticamente invalida",
+            TuningFallbackReason::CalibrationExecutionFailed => "error ejecutando la calibracion",
+            TuningFallbackReason::ProfilePersistenceFailed => "error guardando el perfil de tuning",
             TuningFallbackReason::TuningUnavailable => "tuning no disponible",
             TuningFallbackReason::StorageIdentificationFailed => {
                 "no se pudo identificar el almacenamiento"
             }
         };
         println!("Motivo fallback : {reason}");
+    }
+    if let Some(detail) = trace.diagnostic_detail.as_deref() {
+        println!("Detalle         : {detail}");
     }
     println!();
 }
