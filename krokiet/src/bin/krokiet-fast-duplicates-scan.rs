@@ -1,10 +1,5 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
-// Phase 3.1 diagnostic command for Krokiet's duplicate scan integration service.
-//
-// This binary deliberately reuses the real `duplicate_engine` module sources.
-// It does not copy the scanning/tuning/verifier logic. The GUI is still untouched.
-
 #[cfg(all(not(test), feature = "fast_duplicates"))]
 use std::env;
 #[cfg(all(not(test), feature = "fast_duplicates"))]
@@ -61,8 +56,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Match Krokiet's normal application identity so the diagnostic command uses
-    // the same config/cache root family as the GUI.
     let _ = set_config_cache_path("Czkawka", "Krokiet");
 
     let mut request = DuplicateScanRequest::for_paths(parsed.paths.clone());
@@ -87,7 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.1.2");
+    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.1.3");
     println!("============================================================");
     println!(
         "Motor           : {}",
@@ -174,7 +167,8 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
     let source = match trace.source {
         TuningSource::ReusedProfile => "perfil guardado",
         TuningSource::Calibrated => "calibracion nueva",
-        TuningSource::Fallback => "fallback seguro",
+        TuningSource::CalibratedUnpersisted => "calibracion valida (no persistida)",
+        TuningSource::Fallback => "fallback heuristico/seguro",
     };
 
     println!("Storage key     : {}", trace.storage_key);
@@ -187,21 +181,39 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
             .map(|stability| stability.label_es())
             .unwrap_or("no disponible")
     );
+
     if let Some(reason) = trace.fallback_reason {
-        let reason = match reason {
+        let reason_text = match reason {
             TuningFallbackReason::NoWritableCalibrationDirectory => {
                 "sin directorio escribible para calibrar"
             }
+            TuningFallbackReason::InsufficientFreeSpace => {
+                "espacio insuficiente para calibracion"
+            }
             TuningFallbackReason::CalibrationInvalid => "calibracion estadisticamente invalida",
             TuningFallbackReason::CalibrationExecutionFailed => "error ejecutando la calibracion",
-            TuningFallbackReason::ProfilePersistenceFailed => "error guardando el perfil de tuning",
+            TuningFallbackReason::ProfilePersistenceFailed => {
+                "perfil no persistido; se mantiene la medicion para este scan"
+            }
             TuningFallbackReason::TuningUnavailable => "tuning no disponible",
             TuningFallbackReason::StorageIdentificationFailed => {
                 "no se pudo identificar el almacenamiento"
             }
         };
-        println!("Motivo fallback : {reason}");
+        println!("Motivo fallback : {reason_text}");
+
+        if reason == TuningFallbackReason::InsufficientFreeSpace {
+            println!("------------------------------------------------------------");
+            println!(" CAMBIO 3.1.3 - BEFORE / AFTER");
+            println!("------------------------------------------------------------");
+            println!("ANTES           : intentaba crear el dataset aunque no cupiera");
+            println!("                  -> error del SO -> fallback de 1 worker");
+            println!("DESPUES         : comprueba espacio antes de crear el dataset");
+            println!("                  -> omite calibracion -> fallback por storage");
+            println!("Workers despues : {}", trace.workers);
+        }
     }
+
     if let Some(detail) = trace.diagnostic_detail.as_deref() {
         println!("Detalle         : {detail}");
     }

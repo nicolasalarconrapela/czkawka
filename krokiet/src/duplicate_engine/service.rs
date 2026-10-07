@@ -14,36 +14,34 @@ use super::czkawka::CzkawkaEngine;
 use super::fclones::FclonesEngine;
 use super::tuning::{
     CalibrationOptions, CalibrationStability, SAFE_FALLBACK_WORKERS,
-    VerifierTuningFallbackReason, VerifierTuningResolution, resolve_tuning_for_path,
-    storage_key_for_path,
+    VerifierTuningFallbackReason, VerifierTuningResolution, is_internal_tuning_path,
+    resolve_tuning_for_path, storage_key_for_path,
 };
 use super::types::{
     DuplicateEngine, DuplicateEngineError, DuplicateScanRequest, DuplicateScanResult,
 };
 use super::verify::verify_result_with_workers;
 
-/// Engine selected by the future command/UI layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DuplicateServiceEngine {
     Czkawka,
     Fast,
 }
 
-/// Where the exact-verifier worker count came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuningSource {
     ReusedProfile,
     Calibrated,
+    /// A valid calibration was used for this scan, but its profile could not be
+    /// persisted. A later scan may have to calibrate again.
+    CalibratedUnpersisted,
     Fallback,
 }
 
-/// Why the service had to use the conservative verifier worker count.
-///
-/// These are intentionally category-only reasons: they are useful in production
-/// logs without embedding user paths or raw OS error strings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuningFallbackReason {
     NoWritableCalibrationDirectory,
+    InsufficientFreeSpace,
     CalibrationInvalid,
     CalibrationExecutionFailed,
     ProfilePersistenceFailed,
@@ -57,6 +55,7 @@ impl From<VerifierTuningFallbackReason> for TuningFallbackReason {
             VerifierTuningFallbackReason::NoWritableCalibrationDirectory => {
                 Self::NoWritableCalibrationDirectory
             }
+            VerifierTuningFallbackReason::InsufficientFreeSpace => Self::InsufficientFreeSpace,
             VerifierTuningFallbackReason::CalibrationInvalid => Self::CalibrationInvalid,
             VerifierTuningFallbackReason::CalibrationExecutionFailed => {
                 Self::CalibrationExecutionFailed
@@ -68,10 +67,6 @@ impl From<VerifierTuningFallbackReason> for TuningFallbackReason {
     }
 }
 
-/// Production-friendly tuning trace for one storage.
-///
-/// This is intentionally small so it can later be written to logs, surfaced by a
-/// CLI command, or shown in a diagnostic UI without exposing tuning internals.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StorageTuningTrace {
     pub storage_key: String,
@@ -85,7 +80,6 @@ pub(crate) struct StorageTuningTrace {
     pub diagnostic_detail: Option<String>,
 }
 
-/// Options owned by the orchestration layer.
 #[derive(Clone, Debug)]
 pub(crate) struct DuplicateScanServiceOptions {
     pub engine: DuplicateServiceEngine,
@@ -111,11 +105,6 @@ impl DuplicateScanServiceOptions {
     }
 }
 
-/// Result returned by the service boundary.
-///
-/// `result.elapsed` remains the detector's own scan time. The extra timings below
-/// make the full Fast pipeline observable without changing the existing common
-/// result format.
 #[derive(Clone, Debug)]
 pub(crate) struct DuplicateScanExecution {
     pub result: DuplicateScanResult,
@@ -126,13 +115,6 @@ pub(crate) struct DuplicateScanExecution {
     pub total_elapsed: Duration,
 }
 
-/// Future command/UI entry point.
-///
-/// Czkawka keeps behaving as the reference engine. The Fast path first lets
-/// fclones discover real candidate groups. Only when candidates exist does it
-/// resolve tuning for the storages that actually contain candidate files. The
-/// smallest worker budget is used across those storages, and only groups that
-/// pass the independent exact byte-for-byte verifier are returned.
 pub(crate) fn run_duplicate_scan(
     request: &DuplicateScanRequest,
     options: &DuplicateScanServiceOptions,
@@ -166,9 +148,14 @@ where
             })
         }
         DuplicateServiceEngine::Fast => {
-            // Detection comes first. A scan with no candidate groups has nothing
-            // to exact-verify, so it must not pay the calibration cost.
             let mut result = FclonesEngine.scan(request)?;
+
+            // A calibration interrupted by Ctrl+C/crash can leave synthetic
+            // files behind. They are implementation detail, never user data, so
+            // they must not appear as duplicate candidates even before cleanup
+            // gets a chance to reclaim their disk space.
+            remove_internal_tuning_candidates(&mut result);
+
             if result.groups.is_empty() {
                 return Ok(DuplicateScanExecution {
                     result,
@@ -208,10 +195,6 @@ where
                             traces.push(trace);
                         }
 
-                        // A scan may span NVMe + HDD + USB at the same time. Until
-                        // we have a per-storage scheduler, use the smallest budget
-                        // so the verifier never assumes every candidate storage is
-                        // as fast as the fastest one.
                         let workers = traces
                             .iter()
                             .map(|trace| trace.workers)
@@ -248,10 +231,13 @@ where
     }
 }
 
-/// Candidate storage discovery deliberately happens after fclones. This avoids
-/// calibrating a requested root that produced no duplicate candidates and also
-/// notices candidate files reached through mounts/junctions when one-file-system
-/// mode is disabled.
+fn remove_internal_tuning_candidates(result: &mut DuplicateScanResult) {
+    for group in &mut result.groups {
+        group.files.retain(|file| !is_internal_tuning_path(&file.path));
+    }
+    result.groups.retain(|group| group.files.len() >= 2);
+}
+
 fn candidate_storage_representatives(
     result: &DuplicateScanResult,
 ) -> io::Result<BTreeMap<String, PathBuf>> {
@@ -310,6 +296,19 @@ fn trace_from_resolution(resolution: VerifierTuningResolution) -> StorageTuningT
             fallback_reason: None,
             diagnostic_detail: None,
         },
+        VerifierTuningResolution::CalibratedUnpersisted {
+            storage_key,
+            workers,
+            stability,
+            detail,
+        } => StorageTuningTrace {
+            storage_key,
+            workers,
+            source: TuningSource::CalibratedUnpersisted,
+            stability: Some(stability),
+            fallback_reason: Some(TuningFallbackReason::ProfilePersistenceFailed),
+            diagnostic_detail: Some(detail),
+        },
         VerifierTuningResolution::Fallback {
             storage_key,
             workers,
@@ -345,16 +344,8 @@ mod tests {
     fn fast_service_runs_detector_and_exact_verifier() {
         let dir = tempdir().expect("tempdir");
         write_pair(dir.path(), "same", 0x4B, 96 * 1024);
-        fs::write(
-            dir.path().join("different-a.bin"),
-            vec![0x11; 80 * 1024],
-        )
-        .expect("write different a");
-        fs::write(
-            dir.path().join("different-b.bin"),
-            vec![0x22; 80 * 1024],
-        )
-        .expect("write different b");
+        fs::write(dir.path().join("different-a.bin"), vec![0x11; 80 * 1024]).expect("write different a");
+        fs::write(dir.path().join("different-b.bin"), vec![0x22; 80 * 1024]).expect("write different b");
 
         let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
@@ -371,10 +362,7 @@ mod tests {
 
         assert_eq!(execution.verifier_workers, Some(4));
         assert_eq!(execution.storage_tuning.len(), 1);
-        assert_eq!(
-            execution.storage_tuning[0].source,
-            TuningSource::ReusedProfile
-        );
+        assert_eq!(execution.storage_tuning[0].source, TuningSource::ReusedProfile);
         assert_eq!(execution.storage_tuning[0].fallback_reason, None);
         assert_eq!(execution.result.groups.len(), 1);
         assert_eq!(execution.result.file_count(), 2);
@@ -434,14 +422,8 @@ mod tests {
         assert_eq!(execution.verifier_workers, Some(SAFE_FALLBACK_WORKERS));
         assert_eq!(execution.storage_tuning[0].source, TuningSource::Fallback);
         assert_eq!(execution.storage_tuning[0].stability, None);
-        assert_eq!(
-            execution.storage_tuning[0].fallback_reason,
-            Some(TuningFallbackReason::CalibrationExecutionFailed)
-        );
-        assert_eq!(
-            execution.storage_tuning[0].diagnostic_detail.as_deref(),
-            Some("synthetic calibration failure")
-        );
+        assert_eq!(execution.storage_tuning[0].fallback_reason, Some(TuningFallbackReason::CalibrationExecutionFailed));
+        assert_eq!(execution.storage_tuning[0].diagnostic_detail.as_deref(), Some("synthetic calibration failure"));
         assert!(execution.result.groups.iter().all(|group| group.verified));
     }
 
@@ -467,6 +449,24 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_tuning_files_never_reach_user_results() {
+        let dir = tempdir().expect("tempdir");
+        let internal = dir.path().join(".krokiet-verifier-tuning-123-456-0");
+        fs::create_dir(&internal).expect("internal dir");
+        write_pair(&internal, "synthetic", 0x44, 32 * 1024);
+
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
+        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
+            panic!("internal-only candidates must be removed before tuning")
+        })
+        .expect("service scan");
+
+        assert!(execution.result.groups.is_empty());
+        assert_eq!(execution.verifier_workers, None);
+    }
+
+    #[test]
     fn tuning_error_uses_safe_fallback_without_aborting_scan() {
         let dir = tempdir().expect("tempdir");
         write_pair(dir.path(), "same", 0x6C, 48 * 1024);
@@ -482,15 +482,32 @@ mod tests {
         assert_eq!(execution.verifier_workers, Some(SAFE_FALLBACK_WORKERS));
         assert_eq!(execution.storage_tuning.len(), 1);
         assert_eq!(execution.storage_tuning[0].source, TuningSource::Fallback);
-        assert_eq!(
-            execution.storage_tuning[0].fallback_reason,
-            Some(TuningFallbackReason::TuningUnavailable)
-        );
-        assert_eq!(
-            execution.storage_tuning[0].diagnostic_detail.as_deref(),
-            Some("synthetic tuning store failure")
-        );
+        assert_eq!(execution.storage_tuning[0].fallback_reason, Some(TuningFallbackReason::TuningUnavailable));
+        assert_eq!(execution.storage_tuning[0].diagnostic_detail.as_deref(), Some("synthetic tuning store failure"));
         assert!(execution.result.groups.iter().all(|group| group.verified));
+    }
+
+    #[test]
+    fn unpersisted_calibration_keeps_measured_workers_for_current_scan() {
+        let dir = tempdir().expect("tempdir");
+        write_pair(dir.path(), "same", 0x7A, 48 * 1024);
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
+            Ok(VerifierTuningResolution::CalibratedUnpersisted {
+                storage_key: key.clone(),
+                workers: 6,
+                stability: CalibrationStability::Medium,
+                detail: "disk full while saving profile".to_string(),
+            })
+        })
+        .expect("service scan");
+
+        assert_eq!(execution.verifier_workers, Some(6));
+        assert_eq!(execution.storage_tuning[0].source, TuningSource::CalibratedUnpersisted);
+        assert_eq!(execution.storage_tuning[0].fallback_reason, Some(TuningFallbackReason::ProfilePersistenceFailed));
     }
 
     #[test]

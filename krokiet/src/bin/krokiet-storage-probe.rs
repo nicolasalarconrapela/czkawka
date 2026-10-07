@@ -42,7 +42,7 @@ fn main() {
     system.refresh_disks_list();
 
     println!("============================================================");
-    println!(" KROKIET - STORAGE PROBE 3.1.3-PRE");
+    println!(" KROKIET - STORAGE PROBE 3.1.3");
     println!("============================================================");
     println!("CPU logicos     : {logical_cpus}");
     println!("Discos sysinfo  : {}", system.disks().len());
@@ -78,6 +78,16 @@ fn main() {
         println!("Clase Krokiet   : {}", class.as_str());
         println!("Espacio total   : {}", format_bytes(disk.total_space()));
         println!("Espacio libre   : {}", format_bytes(disk.available_space()));
+        let required = default_calibration_required_space(logical_cpus);
+        println!("Min. tuning     : {}", format_bytes(required));
+        println!(
+            "Preflight tuning: {}",
+            if disk.available_space() >= required {
+                "PERMITIDO"
+            } else {
+                "OMITIDO (espacio insuficiente)"
+            }
+        );
         println!();
         println!("fclones 0.35.0  : random={fclones_random}, sequential={fclones_sequential}");
         println!("Fallback prop.  : {proposed_workers} worker(s) para verifier exacto");
@@ -186,6 +196,20 @@ fn display_os(value: &OsStr) -> String {
     } else {
         text.into_owned()
     }
+}
+
+fn default_calibration_required_space(logical_cpus: usize) -> u64 {
+    const FILE_SIZE: u64 = 4 * 1024 * 1024;
+    const MIN_GROUPS: usize = 8;
+    const MAX_WORKERS: usize = 16;
+    const SAFETY_MARGIN: u64 = 128 * 1024 * 1024;
+
+    let largest_candidate = logical_cpus.max(1).min(MAX_WORKERS);
+    let groups = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
+    FILE_SIZE
+        .saturating_mul(groups as u64)
+        .saturating_mul(2)
+        .saturating_add(SAFETY_MARGIN)
 }
 
 fn format_bytes(bytes: u64) -> String {
