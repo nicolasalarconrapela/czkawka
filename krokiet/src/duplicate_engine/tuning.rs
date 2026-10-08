@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sysinfo::{DiskExt, DiskKind, System, SystemExt};
 
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
@@ -35,6 +36,9 @@ const MIN_GROUPS: usize = 8;
 const HIGH_STABILITY_RELATIVE_MAD: f64 = 0.04;
 const LOW_STABILITY_RELATIVE_MAD: f64 = 0.08;
 const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
+const CALIBRATION_TEMP_PREFIX: &str = ".krokiet-verifier-tuning-";
+const CALIBRATION_SAFETY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
+const STALE_CALIBRATION_MIN_AGE: Duration = Duration::from_secs(60);
 
 /// Conservative verifier concurrency used when a storage has no usable profile
 /// and no writable place where Krokiet can calibrate it. Correctness is unchanged;
@@ -142,6 +146,40 @@ impl CalibrationStability {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageClass {
+    Ssd,
+    Hdd,
+    Removable,
+    Unknown,
+}
+
+impl StorageClass {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ssd => "SSD",
+            Self::Hdd => "HDD",
+            Self::Removable => "removable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StorageSnapshot {
+    pub class: StorageClass,
+    pub available_space: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VerifierTuningFallbackReason {
+    NoWritableCalibrationDirectory,
+    InsufficientFreeSpace,
+    CalibrationInvalid,
+    CalibrationExecutionFailed,
+    ProfilePersistenceFailed,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum VerifierTuningPlan {
     /// A previously calibrated profile can be reused immediately.
@@ -161,6 +199,7 @@ pub(crate) enum VerifierTuningPlan {
     Fallback {
         storage_key: String,
         workers: usize,
+        reason: VerifierTuningFallbackReason,
     },
 }
 
@@ -195,9 +234,20 @@ pub(crate) enum VerifierTuningResolution {
         workers: usize,
         stability: CalibrationStability,
     },
+    /// Calibration produced a valid worker decision for this scan, but the
+    /// profile could not be persisted. Reuse the measured workers now and try
+    /// persistence again on a future scan.
+    CalibratedUnpersisted {
+        storage_key: String,
+        workers: usize,
+        stability: CalibrationStability,
+        detail: String,
+    },
     Fallback {
         storage_key: String,
         workers: usize,
+        reason: VerifierTuningFallbackReason,
+        detail: Option<String>,
     },
 }
 
@@ -206,6 +256,7 @@ impl VerifierTuningResolution {
         match self {
             Self::ReusedProfile { workers, .. }
             | Self::Calibrated { workers, .. }
+            | Self::CalibratedUnpersisted { workers, .. }
             | Self::Fallback { workers, .. } => *workers,
         }
     }
@@ -585,6 +636,7 @@ where
     Ok(VerifierTuningPlan::Fallback {
         storage_key,
         workers: SAFE_FALLBACK_WORKERS,
+        reason: VerifierTuningFallbackReason::NoWritableCalibrationDirectory,
     })
 }
 
@@ -745,39 +797,121 @@ where
         }),
         VerifierTuningPlan::Fallback {
             storage_key,
-            workers,
-        } => Ok(VerifierTuningResolution::Fallback {
-            storage_key,
-            workers,
-        }),
+            reason,
+            ..
+        } => {
+            let snapshot = storage_snapshot_for_path(path);
+            let workers = snapshot
+                .map(|snapshot| fallback_workers_for_storage(snapshot.class))
+                .unwrap_or(SAFE_FALLBACK_WORKERS);
+            let detail = Some(format_fallback_context(path, snapshot, None, None, None));
+            Ok(VerifierTuningResolution::Fallback {
+                storage_key,
+                workers,
+                reason,
+                detail,
+            })
+        }
         VerifierTuningPlan::Calibrate {
             storage_key,
             directory,
-        } => match calibrate_and_store_with(&directory, store_path, options, calibrate) {
-            Ok(report) => {
-                // The replacement policy may deliberately keep a stronger old
-                // profile. Reload the persisted store so the returned worker
-                // count always matches what future scans will reuse.
-                let persisted = VerifierTuningStore::load(store_path)?;
-                if let Some(profile) = persisted.profile_for_storage_key(&storage_key) {
-                    Ok(VerifierTuningResolution::Calibrated {
-                        storage_key,
-                        workers: profile.workers,
-                        stability: profile.stability,
-                    })
-                } else {
-                    Ok(VerifierTuningResolution::Calibrated {
-                        storage_key,
-                        workers: report.profile.workers,
-                        stability: report.profile.stability,
-                    })
-                }
+        } => {
+            // Best-effort cleanup happens before checking free space, so an old
+            // interrupted calibration can give its space back. Only directories
+            // with our exact tuning prefix and a minimum age are considered.
+            let cleanup = cleanup_abandoned_calibration_dirs(&directory).ok();
+            let required = required_calibration_free_space(options);
+            let snapshot = storage_snapshot_for_path(&directory);
+
+            if let Some(snapshot) = snapshot
+                && let Some(available) = snapshot.available_space
+                && available < required
+            {
+                let workers = fallback_workers_for_storage(snapshot.class);
+                let detail = Some(format_fallback_context(
+                    &directory,
+                    Some(snapshot),
+                    Some(required),
+                    cleanup,
+                    Some("calibration skipped before dataset creation"),
+                ));
+                return Ok(VerifierTuningResolution::Fallback {
+                    storage_key,
+                    workers,
+                    reason: VerifierTuningFallbackReason::InsufficientFreeSpace,
+                    detail,
+                });
             }
-            Err(_) => Ok(VerifierTuningResolution::Fallback {
-                storage_key,
-                workers: SAFE_FALLBACK_WORKERS,
-            }),
-        },
+
+            let report = match calibrate(&directory, options) {
+                Ok(report) => report,
+                Err(error) => {
+                    let workers = snapshot
+                        .map(|snapshot| fallback_workers_for_storage(snapshot.class))
+                        .unwrap_or(SAFE_FALLBACK_WORKERS);
+                    return Ok(VerifierTuningResolution::Fallback {
+                        storage_key,
+                        workers,
+                        reason: VerifierTuningFallbackReason::CalibrationExecutionFailed,
+                        detail: Some(format!(
+                            "{}; error={error}",
+                            format_fallback_context(&directory, snapshot, Some(required), cleanup, None)
+                        )),
+                    });
+                }
+            };
+
+            if report.profile.stability == CalibrationStability::Invalid {
+                let workers = snapshot
+                    .map(|snapshot| fallback_workers_for_storage(snapshot.class))
+                    .unwrap_or(SAFE_FALLBACK_WORKERS);
+                return Ok(VerifierTuningResolution::Fallback {
+                    storage_key,
+                    workers,
+                    reason: VerifierTuningFallbackReason::CalibrationInvalid,
+                    detail: Some(format!(
+                        "rescue_attempted={}, selected_workers={}, selected_mad={:.2}%, decision_mad={:.2}%, global_mad={:.2}%",
+                        report.rescue_attempted,
+                        report.profile.workers,
+                        report.profile.relative_mad * 100.0,
+                        report.profile.decision_relative_mad * 100.0,
+                        report.profile.global_relative_mad * 100.0,
+                    )),
+                });
+            }
+
+            // Persist as a separate stage. If it fails, the benchmark result is
+            // still valid for this scan; do not throw away a measurement we just
+            // paid for and replace it with a heuristic.
+            let persistence = (|| -> io::Result<Option<VerifierTuningProfile>> {
+                let mut persisted = VerifierTuningStore::load(store_path)?;
+                let changed = persisted.upsert_calibrated_if_preferred(report.profile.clone());
+                if changed {
+                    persisted.save(store_path)?;
+                }
+                let persisted = VerifierTuningStore::load(store_path)?;
+                Ok(persisted.profile_for_storage_key(&storage_key).cloned())
+            })();
+
+            match persistence {
+                Ok(Some(profile)) => Ok(VerifierTuningResolution::Calibrated {
+                    storage_key,
+                    workers: profile.workers,
+                    stability: profile.stability,
+                }),
+                Ok(None) => Ok(VerifierTuningResolution::Calibrated {
+                    storage_key,
+                    workers: report.profile.workers,
+                    stability: report.profile.stability,
+                }),
+                Err(error) => Ok(VerifierTuningResolution::CalibratedUnpersisted {
+                    storage_key,
+                    workers: report.profile.workers,
+                    stability: report.profile.stability,
+                    detail: format!("profile persistence failed: {error}"),
+                }),
+            }
+        }
     }
 }
 
@@ -786,13 +920,28 @@ pub(crate) fn calibrate_directory(
     options: CalibrationOptions,
 ) -> io::Result<CalibrationReport> {
     validate_options(options)?;
+    calibrate_directory_with_executor_factory(directory, options, ExactVerifierExecutor::new)
+}
 
-    let calibrated_path = fs::canonicalize(directory)?;
-    if !fs::metadata(&calibrated_path)?.is_dir() {
+fn calibrate_directory_with_executor_factory<F>(
+    directory: &Path,
+    options: CalibrationOptions,
+    mut make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
+    let calibrated_path = fs::canonicalize(directory).map_err(|error| {
+        io::Error::new(error.kind(), format!("stage=canonicalize-calibration-directory: {error}"))
+    })?;
+    let metadata = fs::metadata(&calibrated_path).map_err(|error| {
+        io::Error::new(error.kind(), format!("stage=read-calibration-directory-metadata: {error}"))
+    })?;
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "calibration path is not a directory: {}",
+                "stage=read-calibration-directory-metadata: calibration path is not a directory: {}",
                 calibrated_path.display()
             ),
         ));
@@ -805,22 +954,30 @@ pub(crate) fn calibrate_directory(
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
     let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
 
-    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)?;
+    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)
+        .map_err(|error| io::Error::new(error.kind(), format!("stage=create-calibration-dataset: {error}")))?;
 
     let mut executors = HashMap::with_capacity(candidates.len());
     for &workers in &candidates {
-        executors.insert(workers, ExactVerifierExecutor::new(workers)?);
+        let executor = make_executor(workers).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("stage=create-verifier-executor workers={workers}: {error}"),
+            )
+        })?;
+        executors.insert(workers, executor);
     }
 
-    // Warm the same file/metadata/page-cache path that the real post-fclones
-    // verifier commonly sees. Warm-up is not timed.
     let mut warm = dataset.result.clone();
     executors
         .get(&1)
         .expect("candidate list always contains one worker")
-        .verify_result(&mut warm)?;
+        .verify_result(&mut warm)
+        .map_err(|error| io::Error::new(error.kind(), format!("stage=warmup-exact-verifier: {error}")))?;
 
-    let storage_key = storage_key_for_path(&calibrated_path)?;
+    let storage_key = storage_key_for_path(&calibrated_path).map_err(|error| {
+        io::Error::new(error.kind(), format!("stage=identify-calibration-storage: {error}"))
+    })?;
     let initial_report = run_calibration_pass(
         &calibrated_path,
         &storage_key,
@@ -829,15 +986,13 @@ pub(crate) fn calibrate_directory(
         options,
         &executors,
         &dataset,
-    )?;
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("stage=initial-calibration-pass: {error}")))?;
 
     if initial_report.profile.stability != CalibrationStability::Invalid {
         return Ok(initial_report);
     }
 
-    // The first pass proved that the current machine/storage combination is too
-    // noisy for short samples. Start over from empty buckets: noisy 250 ms data
-    // must not influence the rescue decision.
     let mut rescue_options = options;
     rescue_options.target_sample_time = rescue_target_sample_time(options.target_sample_time);
     rescue_options.pair_rounds = rescue_pair_rounds(options.pair_rounds);
@@ -850,7 +1005,8 @@ pub(crate) fn calibrate_directory(
         rescue_options,
         &executors,
         &dataset,
-    )?;
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("stage=rescue-calibration-pass: {error}")))?;
     rescue_report.rescue_attempted = true;
     rescue_report.initial_target_sample_time = options.target_sample_time;
     rescue_report.initial_stability = Some(initial_report.profile.stability);
@@ -1438,6 +1594,181 @@ fn relative_mad(values: &[Duration], median: Duration) -> f64 {
     median_f64(&mut deviations) / median_seconds
 }
 
+pub(crate) fn required_calibration_free_space(options: CalibrationOptions) -> u64 {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let candidates = candidate_worker_counts(logical_cpus, options.max_workers);
+    let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
+    let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
+    let dataset_bytes = options
+        .file_size
+        .saturating_mul(group_count as u64)
+        .saturating_mul(2);
+    dataset_bytes.saturating_add(CALIBRATION_SAFETY_MARGIN_BYTES)
+}
+
+pub(crate) fn fallback_workers_for_storage(class: StorageClass) -> usize {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1);
+    match class {
+        StorageClass::Ssd => logical_cpus.clamp(1, 4),
+        StorageClass::Hdd | StorageClass::Removable | StorageClass::Unknown => {
+            SAFE_FALLBACK_WORKERS
+        }
+    }
+}
+
+pub(crate) fn storage_snapshot_for_path(path: &Path) -> Option<StorageSnapshot> {
+    let absolute = absolute_path(path);
+    let mut system = System::new();
+    system.refresh_disks_list();
+    let disk = system
+        .disks()
+        .iter()
+        .filter(|disk| mount_matches(&absolute, disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())?;
+
+    let class = if disk.is_removable() {
+        StorageClass::Removable
+    } else {
+        match disk.kind() {
+            DiskKind::SSD => StorageClass::Ssd,
+            DiskKind::HDD => StorageClass::Hdd,
+            DiskKind::Unknown(_) => StorageClass::Unknown,
+        }
+    };
+
+    Some(StorageSnapshot {
+        class,
+        available_space: Some(disk.available_space()),
+    })
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+#[cfg(windows)]
+fn mount_matches(path: &Path, mount_point: &Path) -> bool {
+    fn normalize(value: &Path) -> String {
+        let mut value = value
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            value = rest.to_string();
+        }
+        value
+    }
+
+    let path = normalize(path);
+    let mount = normalize(mount_point);
+    path == mount
+        || path
+            .strip_prefix(&mount)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+#[cfg(not(windows))]
+fn mount_matches(path: &Path, mount_point: &Path) -> bool {
+    path.starts_with(mount_point)
+}
+
+fn format_fallback_context(
+    path: &Path,
+    snapshot: Option<StorageSnapshot>,
+    required: Option<u64>,
+    cleaned: Option<usize>,
+    note: Option<&str>,
+) -> String {
+    let class = snapshot.map(|value| value.class.label()).unwrap_or("unknown");
+    let free = snapshot
+        .and_then(|value| value.available_space)
+        .map(format_bytes_compact)
+        .unwrap_or_else(|| "unknown".to_string());
+    let required = required
+        .map(format_bytes_compact)
+        .unwrap_or_else(|| "not-checked".to_string());
+    let cleaned = cleaned.unwrap_or(0);
+    let note = note.unwrap_or("fallback selected");
+    format!(
+        "path={}; storage_class={class}; free_space={free}; required_space={required}; stale_dirs_removed={cleaned}; {note}",
+        path.display()
+    )
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else if bytes as f64 >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.2} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub(crate) fn is_internal_tuning_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with(CALIBRATION_TEMP_PREFIX)
+    })
+}
+
+pub(crate) fn cleanup_abandoned_calibration_dirs(parent: &Path) -> io::Result<usize> {
+    let now = SystemTime::now();
+    let mut removed = 0_usize;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound) => {
+            return Ok(0)
+        }
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with(CALIBRATION_TEMP_PREFIX) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .unwrap_or_default();
+        if age < STALE_CALIBRATION_MIN_AGE {
+            continue;
+        }
+        if fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
 struct CalibrationDataset {
     root: PathBuf,
     result: DuplicateScanResult,
@@ -1506,7 +1837,7 @@ fn create_unique_calibration_dir(parent: &Path) -> io::Result<PathBuf> {
 
     for attempt in 0..32_u32 {
         let candidate = parent.join(format!(
-            ".krokiet-verifier-tuning-{pid}-{nanos}-{attempt}"
+            "{CALIBRATION_TEMP_PREFIX}{pid}-{nanos}-{attempt}"
         ));
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
@@ -2008,9 +2339,11 @@ mod tests {
             VerifierTuningPlan::Fallback {
                 storage_key,
                 workers,
+                reason,
             } => {
                 assert_eq!(storage_key, storage_key_for_path(dir.path()).expect("storage key"));
                 assert_eq!(workers, SAFE_FALLBACK_WORKERS);
+                assert_eq!(reason, VerifierTuningFallbackReason::NoWritableCalibrationDirectory);
             }
             other => panic!("expected fallback plan, got {other:?}"),
         }
@@ -2379,9 +2712,106 @@ mod tests {
         )
         .expect("resolve");
 
-        assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
-        assert!(matches!(resolution, VerifierTuningResolution::Fallback { .. }));
+        assert!((1..=4).contains(&resolution.workers()));
+        assert!(matches!(
+            resolution,
+            VerifierTuningResolution::Fallback {
+                reason: VerifierTuningFallbackReason::CalibrationExecutionFailed,
+                ..
+            }
+        ));
         assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn resolver_reports_invalid_calibration_separately_from_execution_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut invalid = test_profile(
+            storage_key,
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Invalid,
+        );
+        invalid.relative_mad = 0.20;
+        invalid.decision_relative_mad = 0.18;
+        invalid.global_relative_mad = 0.22;
+
+        let resolution = resolve_tuning_for_path_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_| true,
+            |_, _| Ok(test_report(invalid)),
+        )
+        .expect("resolve");
+
+        match resolution {
+            VerifierTuningResolution::Fallback { reason, detail, .. } => {
+                assert_eq!(reason, VerifierTuningFallbackReason::CalibrationInvalid);
+                assert!(detail.as_deref().is_some_and(|value| value.contains("decision_mad")));
+            }
+            other => panic!("expected invalid-calibration fallback, got {other:?}"),
+        }
+        assert!(!store_path.exists(), "invalid profile must not be persisted");
+    }
+
+    #[test]
+    fn resolver_accepts_file_path_and_calibrates_in_parent_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("candidate.bin");
+        fs::write(&candidate, b"candidate").expect("candidate");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let expected = test_profile(
+            storage_key,
+            dir.path().to_path_buf(),
+            2,
+            CalibrationStability::High,
+        );
+
+        let resolution = resolve_tuning_for_path_with(
+            &candidate,
+            &store_path,
+            CalibrationOptions::default(),
+            |_| true,
+            |directory, _| {
+                assert_eq!(
+                    fs::canonicalize(directory).expect("selected directory"),
+                    fs::canonicalize(dir.path()).expect("expected parent")
+                );
+                Ok(test_report(expected.clone()))
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(resolution.workers(), 2);
+        assert!(matches!(resolution, VerifierTuningResolution::Calibrated { .. }));
+    }
+
+    #[test]
+    fn ssd_heuristic_is_conservative_and_other_storage_stays_sequential() {
+        assert!((1..=4).contains(&fallback_workers_for_storage(StorageClass::Ssd)));
+        assert_eq!(fallback_workers_for_storage(StorageClass::Hdd), 1);
+        assert_eq!(fallback_workers_for_storage(StorageClass::Removable), 1);
+        assert_eq!(fallback_workers_for_storage(StorageClass::Unknown), 1);
+    }
+
+    #[test]
+    fn calibration_space_requirement_includes_dataset_and_safety_margin() {
+        let options = CalibrationOptions::default();
+        let required = required_calibration_free_space(options);
+        assert!(required >= CALIBRATION_SAFETY_MARGIN_BYTES);
+        assert!(required > options.file_size);
+    }
+
+    #[test]
+    fn internal_tuning_paths_are_recognized_without_matching_other_krokiet_paths() {
+        let internal = PathBuf::from("root").join(".krokiet-verifier-tuning-123-456-0").join("group.bin");
+        let unrelated = PathBuf::from("root").join(".krokiet-cache").join("group.bin");
+        assert!(is_internal_tuning_path(&internal));
+        assert!(!is_internal_tuning_path(&unrelated));
     }
 
     #[cfg(feature = "fast_duplicates")]
