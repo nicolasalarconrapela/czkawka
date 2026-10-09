@@ -767,6 +767,144 @@ mod tests {
         assert_eq!(execution.storage_tuning[0].workers, 1);
     }
 
+
+
+    #[test]
+    fn e2e_profile_reentry_persisted_profile_then_real_scan() {
+        println!();
+        println!("============================================================");
+        println!(" KROKIET - E2E PROFILE REENTRY -> REAL SCAN");
+        println!("============================================================");
+
+        let dir = tempdir().expect("tempdir");
+        write_pair(dir.path(), "same", 0x6A, 96 * 1024);
+        fs::write(dir.path().join("different-a.bin"), vec![0x11; 80 * 1024])
+            .expect("write different a");
+        fs::write(dir.path().join("different-b.bin"), vec![0x22; 80 * 1024])
+            .expect("write different b");
+
+        let store_path = dir.path().join("tuning.json");
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let options = DuplicateScanServiceOptions::fast(store_path.clone());
+        let context = ScanAttemptContext::new(9001);
+
+        println!("[1/6] Store inexistente");
+        assert!(!store_path.exists());
+        println!("      [OK]");
+
+        println!("[2/6] Primera entrada: inspeccion de perfil");
+        let first_status = inspect_request_profiles(&request, &options).expect("first profile inspection");
+        assert!(matches!(first_status, RequestProfileStatus::Missing(ref items) if items.len() == 1));
+        assert_eq!(
+            decide_profile_flow(context, &first_status, None),
+            ProfileFlowAction::AskUser
+        );
+        println!("      perfil ausente -> AskUser [OK]");
+
+        println!("[3/6] Usuario acepta calibrar: detener scan y preparar reentrada");
+        let action = decide_profile_flow(
+            context,
+            &first_status,
+            Some(MissingProfileDecision::Calibrate),
+        );
+        let ProfileFlowAction::CalibrateAndReenter { next_context } = action else {
+            panic!("calibration must stop the scan and request reentry");
+        };
+        assert_eq!(next_context.attempt_id, context.attempt_id);
+        assert_eq!(next_context.profile_reentries, 1);
+        println!("      attempt_id={} reentries={} [OK]", next_context.attempt_id, next_context.profile_reentries);
+
+        println!("[4/6] Simular calibrador externo: persistir perfil valido");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key,
+            dir.path().to_path_buf(),
+            2,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("persist simulated calibration profile");
+        assert!(store_path.exists());
+        println!("      perfil persistido [OK]");
+
+        println!("[5/6] Reentrada completa: volver a inspeccionar el perfil");
+        let second_status = inspect_request_profiles(&request, &options).expect("second profile inspection");
+        assert_eq!(second_status, RequestProfileStatus::Ready);
+        assert_eq!(
+            decide_profile_flow(next_context, &second_status, None),
+            ProfileFlowAction::StartScanWithProfile
+        );
+        println!("      mismo intento -> perfil Ready -> StartScanWithProfile [OK]");
+
+        println!("[6/6] Ejecutar pipeline real: fclones + ExactVerifier");
+        let execution = run_duplicate_scan(&request, &options).expect("real service scan after profile reentry");
+        assert_eq!(execution.verifier_workers, Some(2));
+        assert_eq!(execution.storage_tuning.len(), 1);
+        assert_eq!(execution.storage_tuning[0].source, TuningSource::ReusedProfile);
+        assert_eq!(execution.result.groups.len(), 1);
+        assert_eq!(execution.result.file_count(), 2);
+        assert!(execution.result.groups.iter().all(|group| group.verified));
+        println!("      workers=2, grupos=1, archivos=2, exact=[OK]");
+        println!("============================================================");
+        println!(" RESULTADO FINAL: CORRECTO");
+        println!("============================================================");
+    }
+
+    #[test]
+    fn e2e_profile_reentry_limit_exits_without_running_scan() {
+        println!();
+        println!("============================================================");
+        println!(" KROKIET - E2E PROFILE REENTRY LIMIT -> EXIT");
+        println!("============================================================");
+
+        let status = RequestProfileStatus::Missing(Vec::new());
+        let mut context = ScanAttemptContext::new(9002);
+        let mut scan_runs = 0_usize;
+        let mut calibration_requests = 0_usize;
+
+        for expected in 1..=MAX_PROFILE_REENTRIES {
+            println!("[{expected}/{}] Perfil ausente -> solicitar calibracion", MAX_PROFILE_REENTRIES);
+            let action = decide_profile_flow(
+                context,
+                &status,
+                Some(MissingProfileDecision::Calibrate),
+            );
+            let ProfileFlowAction::CalibrateAndReenter { next_context } = action else {
+                panic!("reentry {expected} should be allowed");
+            };
+            calibration_requests += 1;
+            assert_eq!(next_context.attempt_id, 9002);
+            assert_eq!(next_context.profile_reentries, expected);
+            context = next_context;
+            println!("      reentrada {expected} preparada [OK]");
+        }
+
+        println!("[4/4] Cuarta solicitud del mismo intento -> EXIT");
+        let final_action = decide_profile_flow(
+            context,
+            &status,
+            Some(MissingProfileDecision::Calibrate),
+        );
+        assert_eq!(
+            final_action,
+            ProfileFlowAction::Exit(ProfileFlowExitReason::ReentryLimitReached)
+        );
+
+        // This test intentionally never calls run_duplicate_scan: once EXIT is
+        // returned, neither detector nor verifier may run for this attempt.
+        if matches!(final_action, ProfileFlowAction::StartScanSafe | ProfileFlowAction::StartScanWithProfile) {
+            scan_runs += 1;
+        }
+
+        assert_eq!(calibration_requests, MAX_PROFILE_REENTRIES as usize);
+        assert_eq!(scan_runs, 0, "EXIT must not continue into detector/verifier");
+        println!("      calibraciones solicitadas={calibration_requests}");
+        println!("      scans ejecutados={scan_runs} [OK]");
+        println!("============================================================");
+        println!(" RESULTADO FINAL: EXIT CONTROLADO");
+        println!("============================================================");
+    }
+
     #[test]
     fn fast_service_result_matches_direct_fast_pipeline() {
         let dir = tempdir().expect("tempdir");
