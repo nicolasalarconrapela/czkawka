@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use super::czkawka::CzkawkaEngine;
 use super::fclones::FclonesEngine;
 use super::tuning::{
-    CalibrationOptions, CalibrationStability, SAFE_FALLBACK_WORKERS,
-    VerifierTuningFallbackReason, VerifierTuningResolution, is_internal_tuning_path,
-    resolve_tuning_for_path, storage_key_for_path,
+    CalibrationStability, SAFE_FALLBACK_WORKERS, VerifierScanResolution,
+    VerifierTuningFallbackReason, is_internal_tuning_path, resolve_scan_tuning_for_path,
+    storage_key_for_path,
 };
 use super::types::{
     DuplicateEngine, DuplicateEngineError, DuplicateScanRequest, DuplicateScanResult,
@@ -31,15 +31,12 @@ pub(crate) enum DuplicateServiceEngine {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuningSource {
     ReusedProfile,
-    Calibrated,
-    /// A valid calibration was used for this scan, but its profile could not be
-    /// persisted. A later scan may have to calibrate again.
-    CalibratedUnpersisted,
     Fallback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuningFallbackReason {
+    NoStoredProfile,
     NoWritableCalibrationDirectory,
     InsufficientFreeSpace,
     CalibrationInvalid,
@@ -52,6 +49,7 @@ pub(crate) enum TuningFallbackReason {
 impl From<VerifierTuningFallbackReason> for TuningFallbackReason {
     fn from(value: VerifierTuningFallbackReason) -> Self {
         match value {
+            VerifierTuningFallbackReason::NoStoredProfile => Self::NoStoredProfile,
             VerifierTuningFallbackReason::NoWritableCalibrationDirectory => {
                 Self::NoWritableCalibrationDirectory
             }
@@ -84,7 +82,6 @@ pub(crate) struct StorageTuningTrace {
 pub(crate) struct DuplicateScanServiceOptions {
     pub engine: DuplicateServiceEngine,
     pub tuning_store_path: Option<PathBuf>,
-    pub calibration_options: CalibrationOptions,
 }
 
 impl DuplicateScanServiceOptions {
@@ -92,7 +89,6 @@ impl DuplicateScanServiceOptions {
         Self {
             engine: DuplicateServiceEngine::Czkawka,
             tuning_store_path: None,
-            calibration_options: CalibrationOptions::default(),
         }
     }
 
@@ -100,7 +96,6 @@ impl DuplicateScanServiceOptions {
         Self {
             engine: DuplicateServiceEngine::Fast,
             tuning_store_path: Some(tuning_store_path),
-            calibration_options: CalibrationOptions::default(),
         }
     }
 }
@@ -110,7 +105,7 @@ pub(crate) struct DuplicateScanExecution {
     pub result: DuplicateScanResult,
     pub verifier_workers: Option<usize>,
     pub storage_tuning: Vec<StorageTuningTrace>,
-    pub tuning_elapsed: Duration,
+    pub profile_lookup_elapsed: Duration,
     pub verification_elapsed: Duration,
     pub total_elapsed: Duration,
 }
@@ -119,18 +114,18 @@ pub(crate) fn run_duplicate_scan(
     request: &DuplicateScanRequest,
     options: &DuplicateScanServiceOptions,
 ) -> Result<DuplicateScanExecution, DuplicateEngineError> {
-    run_duplicate_scan_with_tuning(request, options, |path, store_path, calibration_options| {
-        resolve_tuning_for_path(path, store_path, calibration_options)
+    run_duplicate_scan_with_profile_resolution(request, options, |path, store_path| {
+        resolve_scan_tuning_for_path(path, store_path)
     })
 }
 
-fn run_duplicate_scan_with_tuning<F>(
+fn run_duplicate_scan_with_profile_resolution<F>(
     request: &DuplicateScanRequest,
     options: &DuplicateScanServiceOptions,
     mut resolve: F,
 ) -> Result<DuplicateScanExecution, DuplicateEngineError>
 where
-    F: FnMut(&Path, &Path, CalibrationOptions) -> io::Result<VerifierTuningResolution>,
+    F: FnMut(&Path, &Path) -> io::Result<VerifierScanResolution>,
 {
     request.validate()?;
     let total_started = Instant::now();
@@ -142,7 +137,7 @@ where
                 result,
                 verifier_workers: None,
                 storage_tuning: Vec::new(),
-                tuning_elapsed: Duration::ZERO,
+                profile_lookup_elapsed: Duration::ZERO,
                 verification_elapsed: Duration::ZERO,
                 total_elapsed: total_started.elapsed(),
             })
@@ -161,7 +156,7 @@ where
                     result,
                     verifier_workers: None,
                     storage_tuning: Vec::new(),
-                    tuning_elapsed: Duration::ZERO,
+                    profile_lookup_elapsed: Duration::ZERO,
                     verification_elapsed: Duration::ZERO,
                     total_elapsed: total_started.elapsed(),
                 });
@@ -173,18 +168,14 @@ where
                 )
             })?;
 
-            let tuning_started = Instant::now();
+            let profile_lookup_started = Instant::now();
             let (storage_tuning, verifier_workers) =
                 match candidate_storage_representatives(&result) {
                     Ok(representatives) => {
                         let mut traces = Vec::with_capacity(representatives.len());
 
                         for (storage_key, representative) in representatives {
-                            let trace = match resolve(
-                                &representative,
-                                store_path,
-                                options.calibration_options,
-                            ) {
+                            let trace = match resolve(&representative, store_path) {
                                 Ok(resolution) => trace_from_resolution(resolution),
                                 Err(error) => fallback_trace(
                                     storage_key,
@@ -213,7 +204,7 @@ where
                         SAFE_FALLBACK_WORKERS,
                     ),
                 };
-            let tuning_elapsed = tuning_started.elapsed();
+            let profile_lookup_elapsed = profile_lookup_started.elapsed();
 
             let verification_started = Instant::now();
             verify_result_with_workers(&mut result, verifier_workers)?;
@@ -223,7 +214,7 @@ where
                 result,
                 verifier_workers: Some(verifier_workers),
                 storage_tuning,
-                tuning_elapsed,
+                profile_lookup_elapsed,
                 verification_elapsed,
                 total_elapsed: total_started.elapsed(),
             })
@@ -270,9 +261,9 @@ fn fallback_trace(
     }
 }
 
-fn trace_from_resolution(resolution: VerifierTuningResolution) -> StorageTuningTrace {
+fn trace_from_resolution(resolution: VerifierScanResolution) -> StorageTuningTrace {
     match resolution {
-        VerifierTuningResolution::ReusedProfile {
+        VerifierScanResolution::ReusedProfile {
             storage_key,
             workers,
             stability,
@@ -284,32 +275,7 @@ fn trace_from_resolution(resolution: VerifierTuningResolution) -> StorageTuningT
             fallback_reason: None,
             diagnostic_detail: None,
         },
-        VerifierTuningResolution::Calibrated {
-            storage_key,
-            workers,
-            stability,
-        } => StorageTuningTrace {
-            storage_key,
-            workers,
-            source: TuningSource::Calibrated,
-            stability: Some(stability),
-            fallback_reason: None,
-            diagnostic_detail: None,
-        },
-        VerifierTuningResolution::CalibratedUnpersisted {
-            storage_key,
-            workers,
-            stability,
-            detail,
-        } => StorageTuningTrace {
-            storage_key,
-            workers,
-            source: TuningSource::CalibratedUnpersisted,
-            stability: Some(stability),
-            fallback_reason: Some(TuningFallbackReason::ProfilePersistenceFailed),
-            diagnostic_detail: Some(detail),
-        },
-        VerifierTuningResolution::Fallback {
+        VerifierScanResolution::Fallback {
             storage_key,
             workers,
             reason,
@@ -351,8 +317,8 @@ mod tests {
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
         let key = storage_key_for_path(dir.path()).expect("storage key");
 
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
-            Ok(VerifierTuningResolution::ReusedProfile {
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
+            Ok(VerifierScanResolution::ReusedProfile {
                 storage_key: key.clone(),
                 workers: 4,
                 stability: CalibrationStability::High,
@@ -384,9 +350,9 @@ mod tests {
         let key = storage_key_for_path(dir.path()).expect("storage key");
         let mut resolutions = 0_usize;
 
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
             resolutions += 1;
-            Ok(VerifierTuningResolution::ReusedProfile {
+            Ok(VerifierScanResolution::ReusedProfile {
                 storage_key: key.clone(),
                 workers: 6,
                 stability: CalibrationStability::Medium,
@@ -409,8 +375,8 @@ mod tests {
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
         let key = storage_key_for_path(dir.path()).expect("storage key");
 
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
-            Ok(VerifierTuningResolution::Fallback {
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
+            Ok(VerifierScanResolution::Fallback {
                 storage_key: key.clone(),
                 workers: SAFE_FALLBACK_WORKERS,
                 reason: VerifierTuningFallbackReason::CalibrationExecutionFailed,
@@ -436,7 +402,7 @@ mod tests {
         let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
 
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
             panic!("tuning must not run when fclones found no candidate groups")
         })
         .expect("service scan");
@@ -444,7 +410,7 @@ mod tests {
         assert!(execution.result.groups.is_empty());
         assert_eq!(execution.verifier_workers, None);
         assert!(execution.storage_tuning.is_empty());
-        assert_eq!(execution.tuning_elapsed, Duration::ZERO);
+        assert_eq!(execution.profile_lookup_elapsed, Duration::ZERO);
         assert_eq!(execution.verification_elapsed, Duration::ZERO);
     }
 
@@ -457,7 +423,7 @@ mod tests {
 
         let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
             panic!("internal-only candidates must be removed before tuning")
         })
         .expect("service scan");
@@ -474,7 +440,7 @@ mod tests {
         let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
 
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
             Err(io::Error::other("synthetic tuning store failure"))
         })
         .expect("tuning failure must not abort duplicate verification");
@@ -488,29 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn unpersisted_calibration_keeps_measured_workers_for_current_scan() {
-        let dir = tempdir().expect("tempdir");
-        write_pair(dir.path(), "same", 0x7A, 48 * 1024);
-        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
-        let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
-        let key = storage_key_for_path(dir.path()).expect("storage key");
-
-        let execution = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
-            Ok(VerifierTuningResolution::CalibratedUnpersisted {
-                storage_key: key.clone(),
-                workers: 6,
-                stability: CalibrationStability::Medium,
-                detail: "disk full while saving profile".to_string(),
-            })
-        })
-        .expect("service scan");
-
-        assert_eq!(execution.verifier_workers, Some(6));
-        assert_eq!(execution.storage_tuning[0].source, TuningSource::CalibratedUnpersisted);
-        assert_eq!(execution.storage_tuning[0].fallback_reason, Some(TuningFallbackReason::ProfilePersistenceFailed));
-    }
-
-    #[test]
     fn fast_service_result_matches_direct_fast_pipeline() {
         let dir = tempdir().expect("tempdir");
         write_pair(dir.path(), "one", 0x12, 72 * 1024);
@@ -520,8 +463,8 @@ mod tests {
         let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
         let key = storage_key_for_path(dir.path()).expect("storage key");
 
-        let service = run_duplicate_scan_with_tuning(&request, &options, |_, _, _| {
-            Ok(VerifierTuningResolution::ReusedProfile {
+        let service = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
+            Ok(VerifierScanResolution::ReusedProfile {
                 storage_key: key.clone(),
                 workers: 2,
                 stability: CalibrationStability::High,

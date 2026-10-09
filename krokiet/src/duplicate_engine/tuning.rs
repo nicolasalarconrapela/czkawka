@@ -173,6 +173,9 @@ pub(crate) struct StorageSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerifierTuningFallbackReason {
+    /// Normal scans never auto-calibrate. This means no reusable profile existed
+    /// for the storage, so the scan continues with a conservative heuristic.
+    NoStoredProfile,
     NoWritableCalibrationDirectory,
     InsufficientFreeSpace,
     CalibrationInvalid,
@@ -258,6 +261,34 @@ impl VerifierTuningResolution {
             | Self::Calibrated { workers, .. }
             | Self::CalibratedUnpersisted { workers, .. }
             | Self::Fallback { workers, .. } => *workers,
+        }
+    }
+}
+
+/// Worker choice used by a normal duplicate scan.
+///
+/// This type intentionally has no `Calibrated` variant: a scan is allowed to
+/// reuse an already stored profile or fall back, but it never benchmarks storage,
+/// creates calibration files, or persists a new profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VerifierScanResolution {
+    ReusedProfile {
+        storage_key: String,
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    Fallback {
+        storage_key: String,
+        workers: usize,
+        reason: VerifierTuningFallbackReason,
+        detail: Option<String>,
+    },
+}
+
+impl VerifierScanResolution {
+    pub(crate) fn workers(&self) -> usize {
+        match self {
+            Self::ReusedProfile { workers, .. } | Self::Fallback { workers, .. } => *workers,
         }
     }
 }
@@ -595,6 +626,49 @@ impl VerifierTuningStore {
         }
         fs::rename(temporary, path)
     }
+}
+
+/// Resolves the worker count for a normal duplicate scan.
+///
+/// This function is deliberately read-only with respect to calibration:
+/// - it loads the persisted profile store;
+/// - it reuses a valid profile when present;
+/// - otherwise it chooses the storage-aware fallback.
+///
+/// It never probes for write access, creates a calibration dataset, benchmarks
+/// the verifier, cleans calibration directories, or writes the profile store.
+pub(crate) fn resolve_scan_tuning_for_path(
+    path: &Path,
+    store_path: &Path,
+) -> io::Result<VerifierScanResolution> {
+    let store = VerifierTuningStore::load(store_path)?;
+    let storage_key = storage_key_for_path(path)?;
+
+    if let Some(profile) = store.profile_for_storage_key(&storage_key) {
+        return Ok(VerifierScanResolution::ReusedProfile {
+            storage_key,
+            workers: profile.workers,
+            stability: profile.stability,
+        });
+    }
+
+    let snapshot = storage_snapshot_for_path(path);
+    let workers = snapshot
+        .map(|snapshot| fallback_workers_for_storage(snapshot.class))
+        .unwrap_or(SAFE_FALLBACK_WORKERS);
+
+    Ok(VerifierScanResolution::Fallback {
+        storage_key,
+        workers,
+        reason: VerifierTuningFallbackReason::NoStoredProfile,
+        detail: Some(format_fallback_context(
+            path,
+            snapshot,
+            None,
+            None,
+            Some("normal scan does not auto-calibrate; run krokiet-verifier-tune separately"),
+        )),
+    })
 }
 
 /// Decides what Krokiet should do for one path without ever requiring write
@@ -2812,6 +2886,57 @@ mod tests {
         let unrelated = PathBuf::from("root").join(".krokiet-cache").join("group.bin");
         assert!(is_internal_tuning_path(&internal));
         assert!(!is_internal_tuning_path(&unrelated));
+    }
+
+    #[test]
+    fn scan_resolution_reuses_profile_without_any_calibration_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("save");
+
+        let resolution =
+            resolve_scan_tuning_for_path(dir.path(), &store_path).expect("scan resolution");
+
+        assert_eq!(resolution.workers(), 6);
+        assert!(matches!(
+            resolution,
+            VerifierScanResolution::ReusedProfile {
+                storage_key: key,
+                workers: 6,
+                stability: CalibrationStability::High,
+            } if key == storage_key
+        ));
+    }
+
+    #[test]
+    fn scan_resolution_without_profile_falls_back_and_never_creates_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("missing-verifier-tuning.json");
+
+        let resolution =
+            resolve_scan_tuning_for_path(dir.path(), &store_path).expect("scan resolution");
+
+        assert!((1..=4).contains(&resolution.workers()));
+        assert!(matches!(
+            resolution,
+            VerifierScanResolution::Fallback {
+                reason: VerifierTuningFallbackReason::NoStoredProfile,
+                ..
+            }
+        ));
+        assert!(
+            !store_path.exists(),
+            "normal scan resolution must never create or persist a tuning store"
+        );
     }
 
     #[cfg(feature = "fast_duplicates")]

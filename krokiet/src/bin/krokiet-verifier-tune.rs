@@ -9,9 +9,14 @@
 #[cfg(not(test))]
 use std::env;
 #[cfg(not(test))]
+use std::ffi::OsString;
+#[cfg(not(test))]
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::ExitCode;
+
+#[cfg(not(test))]
+use czkawka_core::common::config_cache_path::{get_config_cache_path, set_config_cache_path};
 
 #[cfg(not(test))]
 #[path = "../duplicate_engine/types.rs"]
@@ -25,8 +30,9 @@ mod tuning;
 
 #[cfg(not(test))]
 use tuning::{
-    CalibrationOptions, CalibrationStability, SAFE_FALLBACK_WORKERS, calibrate_directory,
-    find_writable_calibration_directory, storage_key_for_path,
+    CalibrationOptions, CalibrationStability, SAFE_FALLBACK_WORKERS, calibrate_and_store,
+    cleanup_abandoned_calibration_dirs, find_writable_calibration_directory,
+    required_calibration_free_space, storage_key_for_path, storage_snapshot_for_path,
 };
 
 #[cfg(not(test))]
@@ -42,10 +48,8 @@ fn main() -> ExitCode {
 
 #[cfg(not(test))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
+    let parsed = parse_args(env::args_os().skip(1).collect())?;
+    let path = parsed.path.unwrap_or(env::current_dir()?);
 
     if !path.is_dir() {
         return Err(format!(
@@ -55,11 +59,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let _ = set_config_cache_path("Czkawka", "Krokiet");
+    let store_path = if let Some(path) = parsed.tuning_store_path {
+        path
+    } else {
+        let config = get_config_cache_path().ok_or(
+            "Krokiet no pudo obtener su directorio de cache/configuracion",
+        )?;
+        config.cache_folder.join("verifier-tuning.json")
+    };
+
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 2.9.2.3");
+    println!(" KROKIET - VERIFIER TUNING 3.2.0");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo            : calibracion local independiente");
+    println!("Perfil destino  : {}", store_path.display());
     println!();
 
     let canonical_requested = std::fs::canonicalize(&path)?;
@@ -67,14 +82,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Some(calibration_directory) = find_writable_calibration_directory(&canonical_requested)? else {
         println!("Ruta canonica   : {}", canonical_requested.display());
         println!("Storage key     : {storage_key}");
-        println!("Escritura       : no disponible para calibracion");
+        println!("Escritura       : no disponible para calibracion sintetica");
         println!("Calibracion     : OMITIDA");
         println!(
-            "Workers         : {} (fallback seguro)",
+            "Workers         : {} (fallback seguro hasta calibrar)",
             SAFE_FALLBACK_WORKERS
         );
         println!();
-        println!("La busqueda de duplicados puede continuar normalmente.");
+        println!("El analisis normal NO intentara calibrar por su cuenta.");
         println!("============================================================");
         return Ok(());
     };
@@ -89,7 +104,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    let report = calibrate_directory(&calibration_directory, CalibrationOptions::default())?;
+    let options = CalibrationOptions::default();
+    let _ = cleanup_abandoned_calibration_dirs(&calibration_directory);
+    let required = required_calibration_free_space(options);
+
+    if let Some(snapshot) = storage_snapshot_for_path(&calibration_directory)
+        && let Some(available) = snapshot.available_space
+        && available < required
+    {
+        println!("Ruta canonica   : {}", canonical_requested.display());
+        println!("Storage key     : {storage_key}");
+        println!("Calibracion     : OMITIDA");
+        println!("Motivo          : espacio insuficiente para dataset sintetico");
+        println!("Espacio libre   : {:.1} MiB", available as f64 / 1024.0 / 1024.0);
+        println!("Espacio minimo  : {:.1} MiB", required as f64 / 1024.0 / 1024.0);
+        println!();
+        println!("No se ha modificado el perfil guardado.");
+        println!("El analisis normal NO intentara calibrar por su cuenta.");
+        println!("============================================================");
+        return Ok(());
+    }
+
+    let report = calibrate_and_store(&calibration_directory, &store_path, options)?;
 
     if calibration_directory == canonical_requested {
         println!(
@@ -201,18 +237,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Estabilidad     : {}",
         report.profile.stability.label_es()
     );
+
     if report.profile.stability == CalibrationStability::Invalid {
-        if report.rescue_attempted {
-            println!("Perfil          : NO GUARDAR; sigue inestable tras rescate");
-        } else {
-            println!("Perfil          : NO GUARDAR");
-        }
-    } else if report.rescue_attempted {
-        println!("Perfil          : GUARDABLE (tras rescate)");
+        println!("Perfil          : NO GUARDADO");
     } else {
-        println!("Perfil          : GUARDABLE");
+        println!("Perfil          : GUARDADO");
+        println!("Archivo         : {}", store_path.display());
     }
+
     println!("============================================================");
 
     Ok(())
+}
+
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct ParsedArgs {
+    path: Option<PathBuf>,
+    tuning_store_path: Option<PathBuf>,
+}
+
+#[cfg(not(test))]
+fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Error>> {
+    let mut path = None;
+    let mut tuning_store_path = None;
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        let value = args[index].to_string_lossy();
+        match value.as_ref() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--tuning-store" => {
+                index += 1;
+                let raw = args
+                    .get(index)
+                    .ok_or("--tuning-store necesita una ruta de archivo")?;
+                tuning_store_path = Some(PathBuf::from(raw));
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("opcion desconocida: {option}").into());
+            }
+            _ => {
+                if path.is_some() {
+                    return Err("solo puedes indicar una ruta de almacenamiento".into());
+                }
+                path = Some(PathBuf::from(&args[index]));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ParsedArgs {
+        path,
+        tuning_store_path,
+    })
+}
+
+#[cfg(not(test))]
+fn print_usage() {
+    println!(
+        "Uso:\n\
+         \n\
+         krokiet-verifier-tune [opciones] [carpeta]\n\
+         \n\
+         Opciones:\n\
+           --tuning-store <ruta>   Fuerza el archivo de perfiles\n\
+           -h, --help              Muestra esta ayuda\n"
+    );
 }

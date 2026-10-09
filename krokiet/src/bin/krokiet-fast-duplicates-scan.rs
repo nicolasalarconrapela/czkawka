@@ -80,7 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.1.3");
+    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.2.0");
     println!("============================================================");
     println!(
         "Motor           : {}",
@@ -121,7 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Grupos          : {}", execution.result.groups.len());
     println!("Archivos        : {}", execution.result.file_count());
     println!("Tiempo detector : {:.3?}", execution.result.elapsed);
-    println!("Tiempo tuning   : {:.3?}", execution.tuning_elapsed);
+    println!("Tiempo perfil   : {:.3?}", execution.profile_lookup_elapsed);
     println!("Tiempo verifier : {:.3?}", execution.verification_elapsed);
     println!("Tiempo total    : {:.3?}", execution.total_elapsed);
 
@@ -132,13 +132,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if !execution.storage_tuning.is_empty() {
         println!("------------------------------------------------------------");
-        println!(" TUNING POR ALMACENAMIENTO");
+        println!(" PERFIL POR ALMACENAMIENTO");
         println!("------------------------------------------------------------");
         for trace in &execution.storage_tuning {
             print_tuning_trace(trace);
         }
     } else if options.engine == DuplicateServiceEngine::Fast && execution.result.groups.is_empty() {
-        println!("Tuning          : omitido (sin candidatos que verificar)");
+        println!("Perfil          : omitido (sin candidatos que verificar)");
     }
 
     let all_verified = execution.result.groups.iter().all(|group| group.verified);
@@ -166,13 +166,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn print_tuning_trace(trace: &StorageTuningTrace) {
     let source = match trace.source {
         TuningSource::ReusedProfile => "perfil guardado",
-        TuningSource::Calibrated => "calibracion nueva",
-        TuningSource::CalibratedUnpersisted => "calibracion valida (no persistida)",
-        TuningSource::Fallback => "fallback heuristico/seguro",
+        TuningSource::Fallback => "fallback seguro (scan sin auto-calibracion)",
     };
 
     println!("Storage key     : {}", trace.storage_key);
-    println!("Origen tuning   : {source}");
+    println!("Origen perfil   : {source}");
     println!("Workers         : {}", trace.workers);
     println!(
         "Estabilidad     : {}",
@@ -184,6 +182,9 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
 
     if let Some(reason) = trace.fallback_reason {
         let reason_text = match reason {
+            TuningFallbackReason::NoStoredProfile => {
+                "no existe perfil calibrado; el scan no calibra automaticamente"
+            }
             TuningFallbackReason::NoWritableCalibrationDirectory => {
                 "sin directorio escribible para calibrar"
             }
@@ -201,17 +202,10 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
             }
         };
         println!("Motivo fallback : {reason_text}");
-
-        if reason == TuningFallbackReason::InsufficientFreeSpace {
-            println!("------------------------------------------------------------");
-            println!(" CAMBIO 3.1.3 - BEFORE / AFTER");
-            println!("------------------------------------------------------------");
-            println!("ANTES           : intentaba crear el dataset aunque no cupiera");
-            println!("                  -> error del SO -> fallback de 1 worker");
-            println!("DESPUES         : comprueba espacio antes de crear el dataset");
-            println!("                  -> omite calibracion -> fallback por storage");
-            println!("Workers despues : {}", trace.workers);
+        if reason == TuningFallbackReason::NoStoredProfile {
+            println!("Accion          : ejecutar krokiet-verifier-tune fuera del analisis");
         }
+
     }
 
     if let Some(detail) = trace.diagnostic_detail.as_deref() {
