@@ -70,7 +70,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 3.2.0");
+    println!(" KROKIET - VERIFIER TUNING 3.3.0");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo            : calibracion local independiente");

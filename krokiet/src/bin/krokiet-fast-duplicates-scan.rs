@@ -5,9 +5,13 @@ use std::env;
 #[cfg(all(not(test), feature = "fast_duplicates"))]
 use std::ffi::OsString;
 #[cfg(all(not(test), feature = "fast_duplicates"))]
+use std::io::{self, Write};
+#[cfg(all(not(test), feature = "fast_duplicates"))]
 use std::path::PathBuf;
 #[cfg(all(not(test), feature = "fast_duplicates"))]
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
 use czkawka_core::common::config_cache_path::{get_config_cache_path, set_config_cache_path};
@@ -18,8 +22,11 @@ mod duplicate_engine;
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
 use duplicate_engine::{
-    DuplicateScanRequest, DuplicateScanServiceOptions, DuplicateServiceEngine,
-    StorageTuningTrace, TuningFallbackReason, TuningSource, run_duplicate_scan,
+    DuplicateScanExecution, DuplicateScanRequest, DuplicateScanServiceOptions,
+    DuplicateServiceEngine, MissingProfileDecision, MissingStorageProfile, ProfileFlowAction,
+    ProfileFlowExitReason, RequestProfileStatus, ScanAttemptContext, StorageTuningTrace,
+    TuningFallbackReason, TuningSource, decide_profile_flow, inspect_request_profiles,
+    run_duplicate_scan,
 };
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
@@ -66,7 +73,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let options = match parsed.engine {
         DuplicateServiceEngine::Czkawka => DuplicateScanServiceOptions::czkawka(),
         DuplicateServiceEngine::Fast => {
-            let tuning_store_path = if let Some(path) = parsed.tuning_store_path {
+            let tuning_store_path = if let Some(path) = parsed.tuning_store_path.clone() {
                 path
             } else {
                 let config = get_config_cache_path().ok_or(
@@ -80,7 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.2.0");
+    println!(" KROKIET - DUPLICATE SCAN SERVICE 3.3.0");
     println!("============================================================");
     println!(
         "Motor           : {}",
@@ -111,7 +118,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(" Ejecutando...");
     println!("------------------------------------------------------------");
 
-    let execution = run_duplicate_scan(&request, &options)?;
+    let execution = if options.engine == DuplicateServiceEngine::Fast {
+        let Some(execution) = run_fast_profile_flow(
+            &request,
+            &options,
+            parsed.missing_profile_mode,
+        )? else {
+            return Ok(());
+        };
+        execution
+    } else {
+        run_duplicate_scan(&request, &options)?
+    };
 
     println!();
     println!("============================================================");
@@ -160,6 +178,215 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
 
     Ok(())
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+fn run_fast_profile_flow(
+    request: &DuplicateScanRequest,
+    options: &DuplicateScanServiceOptions,
+    mode: MissingProfileMode,
+) -> Result<Option<DuplicateScanExecution>, Box<dyn std::error::Error>> {
+    let attempt_id = new_attempt_id();
+    let mut context = ScanAttemptContext::new(attempt_id);
+
+    loop {
+        let profile_status = match inspect_request_profiles(request, options) {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!(
+                    "AVISO: no se pudo comprobar el perfil antes del scan: {error}.\n\
+                     Se continua con el fallback universal de 1 worker; no se inicia calibracion."
+                );
+                return Ok(Some(run_duplicate_scan(request, options)?));
+            }
+        };
+
+        match decide_profile_flow(context, &profile_status, None) {
+            ProfileFlowAction::StartScanWithProfile => {
+                if context.profile_reentries > 0 {
+                    println!(
+                        "Perfil encontrado tras {} reentrada(s). Reanudando el flujo de analisis.",
+                        context.profile_reentries
+                    );
+                }
+                return Ok(Some(run_duplicate_scan(request, options)?));
+            }
+            ProfileFlowAction::AskUser => {
+                let decision = choose_missing_profile_action(mode, &profile_status)?;
+                match decide_profile_flow(context, &profile_status, Some(decision)) {
+                    ProfileFlowAction::StartScanSafe => {
+                        println!(
+                            "Continuando en modo seguro: 1 worker. No se ejecutara calibracion."
+                        );
+                        return Ok(Some(run_duplicate_scan(request, options)?));
+                    }
+                    ProfileFlowAction::CalibrateAndReenter { next_context } => {
+                        let RequestProfileStatus::Missing(missing) = &profile_status else {
+                            unreachable!("calibration is only requested for missing profiles");
+                        };
+
+                        println!(
+                            "Deteniendo el flujo de analisis. Calibracion externa para {} almacenamiento(s).",
+                            missing.len()
+                        );
+                        if let Err(error) = run_independent_calibrator(missing, options) {
+                            eprintln!("La calibracion independiente fallo: {error}");
+                            print_flow_exit(context, ProfileFlowExitReason::CalibrationFailed);
+                            return Ok(None);
+                        }
+
+                        context = next_context;
+                        println!(
+                            "Calibracion finalizada. Reentrada {}/{} del mismo intento {}.",
+                            context.profile_reentries,
+                            duplicate_engine::MAX_PROFILE_REENTRIES,
+                            context.attempt_id
+                        );
+                        continue;
+                    }
+                    ProfileFlowAction::Exit(reason) => {
+                        print_flow_exit(context, reason);
+                        return Ok(None);
+                    }
+                    ProfileFlowAction::AskUser | ProfileFlowAction::StartScanWithProfile => {
+                        unreachable!("decision must resolve the missing-profile prompt");
+                    }
+                }
+            }
+            ProfileFlowAction::Exit(reason) => {
+                print_flow_exit(context, reason);
+                return Ok(None);
+            }
+            ProfileFlowAction::CalibrateAndReenter { .. }
+            | ProfileFlowAction::StartScanSafe => {
+                unreachable!("no user decision was supplied yet");
+            }
+        }
+    }
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+fn choose_missing_profile_action(
+    mode: MissingProfileMode,
+    status: &RequestProfileStatus,
+) -> Result<MissingProfileDecision, Box<dyn std::error::Error>> {
+    let RequestProfileStatus::Missing(missing) = status else {
+        return Ok(MissingProfileDecision::ContinueSafe);
+    };
+
+    println!();
+    println!("============================================================");
+    println!(" PERFIL DE VERIFICACION NO DISPONIBLE");
+    println!("============================================================");
+    for item in missing {
+        println!("Storage key     : {}", item.storage_key);
+        println!("Ruta referencia : {}", item.representative_path.display());
+    }
+    println!();
+    println!("La calibracion NO forma parte del scan.");
+    println!("Si eliges calibrar, el flujo de analisis se detiene, se ejecuta");
+    println!("krokiet-verifier-tune y despues se vuelve a entrar por la comprobacion de perfil.");
+
+    match mode {
+        MissingProfileMode::Calibrate => Ok(MissingProfileDecision::Calibrate),
+        MissingProfileMode::Safe => Ok(MissingProfileDecision::ContinueSafe),
+        MissingProfileMode::Exit => Ok(MissingProfileDecision::Exit),
+        MissingProfileMode::Ask => {
+            print!("\n¿Calibrar ahora? [s] si / [n] modo seguro (1 worker) / [x] salir: ");
+            io::stdout().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "s" | "si" | "sí" | "y" | "yes" => Ok(MissingProfileDecision::Calibrate),
+                "x" | "exit" | "salir" | "q" => Ok(MissingProfileDecision::Exit),
+                _ => Ok(MissingProfileDecision::ContinueSafe),
+            }
+        }
+    }
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+fn run_independent_calibrator(
+    missing: &[MissingStorageProfile],
+    options: &DuplicateScanServiceOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store_path = options
+        .tuning_store_path
+        .as_deref()
+        .ok_or("fast duplicate service requires a verifier tuning store path")?;
+    let tuner = verifier_tuner_executable()?;
+
+    for item in missing {
+        println!();
+        println!("------------------------------------------------------------");
+        println!(" CALIBRADOR EXTERNO");
+        println!("------------------------------------------------------------");
+        println!("Ejecutable      : {}", tuner.display());
+        println!("Storage key     : {}", item.storage_key);
+        println!("Ruta            : {}", item.representative_path.display());
+
+        let status = Command::new(&tuner)
+            .arg("--tuning-store")
+            .arg(store_path)
+            .arg(&item.representative_path)
+            .status()?;
+
+        if !status.success() {
+            return Err(format!(
+                "krokiet-verifier-tune termino con codigo {:?} para {}",
+                status.code(),
+                item.representative_path.display()
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+fn verifier_tuner_executable() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let current = env::current_exe()?;
+    let file_name = if cfg!(windows) {
+        "krokiet-verifier-tune.exe"
+    } else {
+        "krokiet-verifier-tune"
+    };
+    let tuner = current.with_file_name(file_name);
+    if !tuner.is_file() {
+        return Err(format!(
+            "no se encontro el calibrador junto al scan: {}",
+            tuner.display()
+        )
+        .into());
+    }
+    Ok(tuner)
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+fn new_attempt_id() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (nanos as u64) ^ ((std::process::id() as u64) << 32)
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
+fn print_flow_exit(context: ScanAttemptContext, reason: ProfileFlowExitReason) {
+    let reason = match reason {
+        ProfileFlowExitReason::UserCancelled => "cancelado por el usuario",
+        ProfileFlowExitReason::ReentryLimitReached => {
+            "limite de 3 reentradas alcanzado sin obtener un perfil valido"
+        }
+        ProfileFlowExitReason::CalibrationFailed => "fallo de calibracion",
+    };
+    println!();
+    println!("EXIT            : {reason}");
+    println!("Intento         : {}", context.attempt_id);
+    println!("Reentradas      : {}", context.profile_reentries);
+    println!("Scan ejecutado  : no");
+    println!("============================================================");
 }
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
@@ -215,6 +442,15 @@ fn print_tuning_trace(trace: &StorageTuningTrace) {
 }
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingProfileMode {
+    Ask,
+    Calibrate,
+    Safe,
+    Exit,
+}
+
+#[cfg(all(not(test), feature = "fast_duplicates"))]
 #[derive(Debug)]
 struct ParsedArgs {
     engine: DuplicateServiceEngine,
@@ -223,6 +459,7 @@ struct ParsedArgs {
     min_size: u64,
     max_size: Option<u64>,
     tuning_store_path: Option<PathBuf>,
+    missing_profile_mode: MissingProfileMode,
 }
 
 #[cfg(all(not(test), feature = "fast_duplicates"))]
@@ -238,6 +475,7 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Err
     let mut min_size = 1_u64;
     let mut max_size = None;
     let mut tuning_store_path = None;
+    let mut missing_profile_mode = MissingProfileMode::Ask;
 
     let mut index = 0_usize;
     while index < args.len() {
@@ -251,6 +489,9 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Err
             "--fast" => engine = DuplicateServiceEngine::Fast,
             "--czkawka" => engine = DuplicateServiceEngine::Czkawka,
             "--no-recursive" => recursive = false,
+            "--calibrate-missing" => missing_profile_mode = MissingProfileMode::Calibrate,
+            "--safe-fallback" => missing_profile_mode = MissingProfileMode::Safe,
+            "--exit-on-missing" => missing_profile_mode = MissingProfileMode::Exit,
             "--min-size" => {
                 index += 1;
                 let raw = args.get(index).ok_or("--min-size necesita un numero de bytes")?;
@@ -304,6 +545,7 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Err
         min_size,
         max_size,
         tuning_store_path,
+        missing_profile_mode,
     })
 }
 
@@ -321,6 +563,9 @@ fn print_usage() {
            --min-size <bytes>      Tamano minimo (por defecto: 1)\n\
            --max-size <bytes>      Tamano maximo\n\
            --tuning-store <ruta>   Fuerza el archivo de perfiles de tuning\n\
+           --calibrate-missing     Calibra fuera del scan y reentra al flujo\n\
+           --safe-fallback         Continua directamente con 1 worker\n\
+           --exit-on-missing       Sale si no existe un perfil valido\n\
            -h, --help              Muestra esta ayuda\n"
     );
 }

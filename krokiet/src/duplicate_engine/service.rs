@@ -14,8 +14,8 @@ use super::czkawka::CzkawkaEngine;
 use super::fclones::FclonesEngine;
 use super::tuning::{
     CalibrationStability, SAFE_FALLBACK_WORKERS, VerifierScanResolution,
-    VerifierTuningFallbackReason, is_internal_tuning_path, resolve_scan_tuning_for_path,
-    storage_key_for_path,
+    VerifierTuningFallbackReason, VerifierTuningStore, is_internal_tuning_path,
+    resolve_scan_tuning_for_path, storage_key_for_path,
 };
 use super::types::{
     DuplicateEngine, DuplicateEngineError, DuplicateScanRequest, DuplicateScanResult,
@@ -82,6 +82,128 @@ pub(crate) struct StorageTuningTrace {
 pub(crate) struct DuplicateScanServiceOptions {
     pub engine: DuplicateServiceEngine,
     pub tuning_store_path: Option<PathBuf>,
+}
+
+pub(crate) const MAX_PROFILE_REENTRIES: u8 = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MissingStorageProfile {
+    pub storage_key: String,
+    pub representative_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RequestProfileStatus {
+    Ready,
+    Missing(Vec<MissingStorageProfile>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScanAttemptContext {
+    pub attempt_id: u64,
+    pub profile_reentries: u8,
+}
+
+impl ScanAttemptContext {
+    pub(crate) fn new(attempt_id: u64) -> Self {
+        Self {
+            attempt_id,
+            profile_reentries: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MissingProfileDecision {
+    Calibrate,
+    ContinueSafe,
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileFlowExitReason {
+    UserCancelled,
+    ReentryLimitReached,
+    CalibrationFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileFlowAction {
+    StartScanWithProfile,
+    AskUser,
+    CalibrateAndReenter { next_context: ScanAttemptContext },
+    StartScanSafe,
+    Exit(ProfileFlowExitReason),
+}
+
+pub(crate) fn decide_profile_flow(
+    context: ScanAttemptContext,
+    profile_status: &RequestProfileStatus,
+    decision: Option<MissingProfileDecision>,
+) -> ProfileFlowAction {
+    if matches!(profile_status, RequestProfileStatus::Ready) {
+        return ProfileFlowAction::StartScanWithProfile;
+    }
+
+    if context.profile_reentries >= MAX_PROFILE_REENTRIES {
+        return ProfileFlowAction::Exit(ProfileFlowExitReason::ReentryLimitReached);
+    }
+
+    match decision {
+        None => ProfileFlowAction::AskUser,
+        Some(MissingProfileDecision::ContinueSafe) => ProfileFlowAction::StartScanSafe,
+        Some(MissingProfileDecision::Exit) => {
+            ProfileFlowAction::Exit(ProfileFlowExitReason::UserCancelled)
+        }
+        Some(MissingProfileDecision::Calibrate) => ProfileFlowAction::CalibrateAndReenter {
+            next_context: ScanAttemptContext {
+                attempt_id: context.attempt_id,
+                profile_reentries: context.profile_reentries.saturating_add(1),
+            },
+        },
+    }
+}
+
+pub(crate) fn inspect_request_profiles(
+    request: &DuplicateScanRequest,
+    options: &DuplicateScanServiceOptions,
+) -> Result<RequestProfileStatus, DuplicateEngineError> {
+    request.validate()?;
+
+    if options.engine == DuplicateServiceEngine::Czkawka {
+        return Ok(RequestProfileStatus::Ready);
+    }
+
+    let store_path = options.tuning_store_path.as_deref().ok_or_else(|| {
+        DuplicateEngineError::Configuration(
+            "fast duplicate service requires a verifier tuning store path".to_string(),
+        )
+    })?;
+    let store = VerifierTuningStore::load(store_path)?;
+    let mut missing = BTreeMap::<String, PathBuf>::new();
+
+    for path in &request.paths {
+        let storage_key = storage_key_for_path(path)?;
+        if store.profile_for_storage_key(&storage_key).is_none() {
+            missing
+                .entry(storage_key)
+                .or_insert_with(|| path.clone());
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(RequestProfileStatus::Ready)
+    } else {
+        Ok(RequestProfileStatus::Missing(
+            missing
+                .into_iter()
+                .map(|(storage_key, representative_path)| MissingStorageProfile {
+                    storage_key,
+                    representative_path,
+                })
+                .collect(),
+        ))
+    }
 }
 
 impl DuplicateScanServiceOptions {
@@ -277,12 +399,12 @@ fn trace_from_resolution(resolution: VerifierScanResolution) -> StorageTuningTra
         },
         VerifierScanResolution::Fallback {
             storage_key,
-            workers,
+            workers: _,
             reason,
             detail,
         } => StorageTuningTrace {
             storage_key,
-            workers,
+            workers: SAFE_FALLBACK_WORKERS,
             source: TuningSource::Fallback,
             stability: None,
             fallback_reason: Some(reason.into()),
@@ -299,11 +421,35 @@ mod tests {
 
     use super::*;
     use crate::duplicate_engine::compare_results;
+    use crate::duplicate_engine::tuning::VerifierTuningProfile;
 
     fn write_pair(directory: &Path, stem: &str, value: u8, size: usize) {
         let bytes = vec![value; size];
         fs::write(directory.join(format!("{stem}-a.bin")), &bytes).expect("write a");
         fs::write(directory.join(format!("{stem}-b.bin")), &bytes).expect("write b");
+    }
+
+    fn test_profile(
+        storage_key: String,
+        calibrated_path: PathBuf,
+        workers: usize,
+        stability: CalibrationStability,
+    ) -> VerifierTuningProfile {
+        VerifierTuningProfile {
+            storage_key,
+            calibrated_path,
+            workers,
+            logical_cpus: 8,
+            median_mib_per_second: 1000.0,
+            selected_samples: 5,
+            selected_verification_runs: 5,
+            relative_mad: 0.01,
+            decision_relative_mad: 0.01,
+            global_relative_mad: 0.01,
+            selected_slowdown_vs_fastest: 0.0,
+            stability,
+            calibrated_at_unix_seconds: 1,
+        }
     }
 
     #[test]
@@ -451,6 +597,174 @@ mod tests {
         assert_eq!(execution.storage_tuning[0].fallback_reason, Some(TuningFallbackReason::TuningUnavailable));
         assert_eq!(execution.storage_tuning[0].diagnostic_detail.as_deref(), Some("synthetic tuning store failure"));
         assert!(execution.result.groups.iter().all(|group| group.verified));
+    }
+
+    #[test]
+    fn profile_flow_with_valid_profile_starts_scan_without_prompt() {
+        let context = ScanAttemptContext::new(42);
+        assert_eq!(
+            decide_profile_flow(context, &RequestProfileStatus::Ready, None),
+            ProfileFlowAction::StartScanWithProfile
+        );
+    }
+
+    #[test]
+    fn missing_profile_requires_user_decision_before_scan() {
+        let context = ScanAttemptContext::new(42);
+        let status = RequestProfileStatus::Missing(Vec::new());
+        assert_eq!(
+            decide_profile_flow(context, &status, None),
+            ProfileFlowAction::AskUser
+        );
+    }
+
+    #[test]
+    fn user_can_continue_with_universal_safe_fallback() {
+        let context = ScanAttemptContext::new(42);
+        let status = RequestProfileStatus::Missing(Vec::new());
+        assert_eq!(
+            decide_profile_flow(
+                context,
+                &status,
+                Some(MissingProfileDecision::ContinueSafe),
+            ),
+            ProfileFlowAction::StartScanSafe
+        );
+        assert_eq!(SAFE_FALLBACK_WORKERS, 1);
+    }
+
+    #[test]
+    fn calibration_stops_scan_and_reenters_same_attempt() {
+        let context = ScanAttemptContext::new(99);
+        let status = RequestProfileStatus::Missing(Vec::new());
+        let action = decide_profile_flow(
+            context,
+            &status,
+            Some(MissingProfileDecision::Calibrate),
+        );
+
+        assert_eq!(
+            action,
+            ProfileFlowAction::CalibrateAndReenter {
+                next_context: ScanAttemptContext {
+                    attempt_id: 99,
+                    profile_reentries: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn profile_reentry_limit_exits_instead_of_looping() {
+        let status = RequestProfileStatus::Missing(Vec::new());
+        let context = ScanAttemptContext {
+            attempt_id: 123,
+            profile_reentries: MAX_PROFILE_REENTRIES,
+        };
+
+        assert_eq!(
+            decide_profile_flow(
+                context,
+                &status,
+                Some(MissingProfileDecision::Calibrate),
+            ),
+            ProfileFlowAction::Exit(ProfileFlowExitReason::ReentryLimitReached)
+        );
+    }
+
+    #[test]
+    fn three_calibration_reentries_are_allowed_but_fourth_is_blocked() {
+        let status = RequestProfileStatus::Missing(Vec::new());
+        let mut context = ScanAttemptContext::new(555);
+
+        for expected in 1..=MAX_PROFILE_REENTRIES {
+            let action = decide_profile_flow(
+                context,
+                &status,
+                Some(MissingProfileDecision::Calibrate),
+            );
+            let ProfileFlowAction::CalibrateAndReenter { next_context } = action else {
+                panic!("reentry {expected} should still be allowed");
+            };
+            assert_eq!(next_context.attempt_id, 555);
+            assert_eq!(next_context.profile_reentries, expected);
+            context = next_context;
+        }
+
+        assert_eq!(
+            decide_profile_flow(
+                context,
+                &status,
+                Some(MissingProfileDecision::Calibrate),
+            ),
+            ProfileFlowAction::Exit(ProfileFlowExitReason::ReentryLimitReached)
+        );
+    }
+
+    #[test]
+    fn user_cancel_exits_without_safe_scan() {
+        let context = ScanAttemptContext::new(7);
+        let status = RequestProfileStatus::Missing(Vec::new());
+        assert_eq!(
+            decide_profile_flow(context, &status, Some(MissingProfileDecision::Exit)),
+            ProfileFlowAction::Exit(ProfileFlowExitReason::UserCancelled)
+        );
+    }
+
+    #[test]
+    fn request_profile_inspection_reports_missing_without_creating_store() {
+        let dir = tempdir().expect("tempdir");
+        let store_path = dir.path().join("missing-tuning.json");
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let options = DuplicateScanServiceOptions::fast(store_path.clone());
+
+        let status = inspect_request_profiles(&request, &options).expect("profile inspection");
+        assert!(matches!(status, RequestProfileStatus::Missing(ref items) if items.len() == 1));
+        assert!(!store_path.exists(), "profile inspection must stay read-only");
+    }
+
+    #[test]
+    fn request_profile_inspection_reuses_stored_profile() {
+        let dir = tempdir().expect("tempdir");
+        let store_path = dir.path().join("tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key,
+            dir.path().to_path_buf(),
+            2,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("save profile");
+
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let options = DuplicateScanServiceOptions::fast(store_path);
+        assert_eq!(
+            inspect_request_profiles(&request, &options).expect("profile inspection"),
+            RequestProfileStatus::Ready
+        );
+    }
+
+    #[test]
+    fn fallback_resolution_can_never_raise_production_workers_above_one() {
+        let dir = tempdir().expect("tempdir");
+        write_pair(dir.path(), "same", 0x2A, 40 * 1024);
+        let request = DuplicateScanRequest::for_paths([dir.path().to_path_buf()]);
+        let options = DuplicateScanServiceOptions::fast(dir.path().join("tuning.json"));
+        let key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let execution = run_duplicate_scan_with_profile_resolution(&request, &options, |_, _| {
+            Ok(VerifierScanResolution::Fallback {
+                storage_key: key.clone(),
+                workers: 8,
+                reason: VerifierTuningFallbackReason::NoStoredProfile,
+                detail: None,
+            })
+        })
+        .expect("safe fallback scan");
+
+        assert_eq!(execution.verifier_workers, Some(1));
+        assert_eq!(execution.storage_tuning[0].workers, 1);
     }
 
     #[test]

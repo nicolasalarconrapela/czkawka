@@ -42,7 +42,7 @@ fn main() {
     system.refresh_disks_list();
 
     println!("============================================================");
-    println!(" KROKIET - STORAGE PROBE 3.1.3");
+    println!(" KROKIET - STORAGE PROBE 3.3.0");
     println!("============================================================");
     println!("CPU logicos     : {logical_cpus}");
     println!("Discos sysinfo  : {}", system.disks().len());
@@ -92,10 +92,8 @@ fn main() {
         println!("fclones 0.35.0  : random={fclones_random}, sequential={fclones_sequential}");
         println!("Fallback prop.  : {proposed_workers} worker(s) para verifier exacto");
 
-        if class == KrokietStorageClass::Ssd {
-            println!("Nota            : este valor es conservador; un perfil calibrado");
-            println!("                  seguira teniendo prioridad sobre el fallback.");
-        }
+        println!("Nota            : 1 worker es el fallback universal; cualquier valor");
+        println!("                  superior debe venir de un perfil calibrado.");
     }
 
     println!();
@@ -157,13 +155,10 @@ fn classify_storage(kind: DiskKind, removable: bool) -> KrokietStorageClass {
     }
 }
 
-fn proposed_exact_verifier_fallback(class: KrokietStorageClass, logical_cpus: usize) -> usize {
-    match class {
-        // Deliberately much more conservative than fclones' hash pipeline.
-        // This is only a fallback for our sequential full-file byte verifier.
-        KrokietStorageClass::Ssd => logical_cpus.clamp(1, 4),
-        KrokietStorageClass::Hdd | KrokietStorageClass::Removable | KrokietStorageClass::Unknown => 1,
-    }
+fn proposed_exact_verifier_fallback(_class: KrokietStorageClass, _logical_cpus: usize) -> usize {
+    // Production fallback is universal. Values above one are accepted only from
+    // a persisted calibration profile.
+    1
 }
 
 fn fclones_035_default_parallelism(kind: DiskKind, logical_cpus: usize) -> (usize, usize) {

@@ -174,7 +174,7 @@ pub(crate) struct StorageSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerifierTuningFallbackReason {
     /// Normal scans never auto-calibrate. This means no reusable profile existed
-    /// for the storage, so the scan continues with a conservative heuristic.
+    /// for the storage, so the scan can only continue with the universal safe fallback.
     NoStoredProfile,
     NoWritableCalibrationDirectory,
     InsufficientFreeSpace,
@@ -633,7 +633,7 @@ impl VerifierTuningStore {
 /// This function is deliberately read-only with respect to calibration:
 /// - it loads the persisted profile store;
 /// - it reuses a valid profile when present;
-/// - otherwise it chooses the storage-aware fallback.
+/// - otherwise it chooses the universal one-worker fallback.
 ///
 /// It never probes for write access, creates a calibration dataset, benchmarks
 /// the verifier, cleans calibration directories, or writes the profile store.
@@ -653,9 +653,7 @@ pub(crate) fn resolve_scan_tuning_for_path(
     }
 
     let snapshot = storage_snapshot_for_path(path);
-    let workers = snapshot
-        .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-        .unwrap_or(SAFE_FALLBACK_WORKERS);
+    let workers = SAFE_FALLBACK_WORKERS;
 
     Ok(VerifierScanResolution::Fallback {
         storage_key,
@@ -875,9 +873,7 @@ where
             ..
         } => {
             let snapshot = storage_snapshot_for_path(path);
-            let workers = snapshot
-                .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-                .unwrap_or(SAFE_FALLBACK_WORKERS);
+            let workers = SAFE_FALLBACK_WORKERS;
             let detail = Some(format_fallback_context(path, snapshot, None, None, None));
             Ok(VerifierTuningResolution::Fallback {
                 storage_key,
@@ -901,7 +897,7 @@ where
                 && let Some(available) = snapshot.available_space
                 && available < required
             {
-                let workers = fallback_workers_for_storage(snapshot.class);
+                let workers = SAFE_FALLBACK_WORKERS;
                 let detail = Some(format_fallback_context(
                     &directory,
                     Some(snapshot),
@@ -920,9 +916,7 @@ where
             let report = match calibrate(&directory, options) {
                 Ok(report) => report,
                 Err(error) => {
-                    let workers = snapshot
-                        .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-                        .unwrap_or(SAFE_FALLBACK_WORKERS);
+                    let workers = SAFE_FALLBACK_WORKERS;
                     return Ok(VerifierTuningResolution::Fallback {
                         storage_key,
                         workers,
@@ -936,9 +930,7 @@ where
             };
 
             if report.profile.stability == CalibrationStability::Invalid {
-                let workers = snapshot
-                    .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-                    .unwrap_or(SAFE_FALLBACK_WORKERS);
+                let workers = SAFE_FALLBACK_WORKERS;
                 return Ok(VerifierTuningResolution::Fallback {
                     storage_key,
                     workers,
@@ -1682,17 +1674,10 @@ pub(crate) fn required_calibration_free_space(options: CalibrationOptions) -> u6
     dataset_bytes.saturating_add(CALIBRATION_SAFETY_MARGIN_BYTES)
 }
 
-pub(crate) fn fallback_workers_for_storage(class: StorageClass) -> usize {
-    let logical_cpus = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .max(1);
-    match class {
-        StorageClass::Ssd => logical_cpus.clamp(1, 4),
-        StorageClass::Hdd | StorageClass::Removable | StorageClass::Unknown => {
-            SAFE_FALLBACK_WORKERS
-        }
-    }
+pub(crate) fn fallback_workers_for_storage(_class: StorageClass) -> usize {
+    // Production fallback is deliberately storage-agnostic. Any value above one
+    // must come from a persisted calibration profile, never from a heuristic.
+    SAFE_FALLBACK_WORKERS
 }
 
 pub(crate) fn storage_snapshot_for_path(path: &Path) -> Option<StorageSnapshot> {
@@ -2786,7 +2771,7 @@ mod tests {
         )
         .expect("resolve");
 
-        assert!((1..=4).contains(&resolution.workers()));
+        assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
         assert!(matches!(
             resolution,
             VerifierTuningResolution::Fallback {
@@ -2865,8 +2850,8 @@ mod tests {
     }
 
     #[test]
-    fn ssd_heuristic_is_conservative_and_other_storage_stays_sequential() {
-        assert!((1..=4).contains(&fallback_workers_for_storage(StorageClass::Ssd)));
+    fn production_fallback_is_one_worker_for_every_storage_class() {
+        assert_eq!(fallback_workers_for_storage(StorageClass::Ssd), SAFE_FALLBACK_WORKERS);
         assert_eq!(fallback_workers_for_storage(StorageClass::Hdd), 1);
         assert_eq!(fallback_workers_for_storage(StorageClass::Removable), 1);
         assert_eq!(fallback_workers_for_storage(StorageClass::Unknown), 1);
@@ -2925,7 +2910,7 @@ mod tests {
         let resolution =
             resolve_scan_tuning_for_path(dir.path(), &store_path).expect("scan resolution");
 
-        assert!((1..=4).contains(&resolution.workers()));
+        assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
         assert!(matches!(
             resolution,
             VerifierScanResolution::Fallback {

@@ -31,8 +31,11 @@ pub(crate) use fclones::FclonesEngine;
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
 pub(crate) use service::{
-    DuplicateScanExecution, DuplicateScanServiceOptions, DuplicateServiceEngine, StorageTuningTrace,
-    TuningFallbackReason, TuningSource, run_duplicate_scan,
+    DuplicateScanExecution, DuplicateScanServiceOptions, DuplicateServiceEngine,
+    MAX_PROFILE_REENTRIES, MissingProfileDecision, MissingStorageProfile, ProfileFlowAction,
+    ProfileFlowExitReason, RequestProfileStatus, ScanAttemptContext, StorageTuningTrace,
+    TuningFallbackReason, TuningSource, decide_profile_flow, inspect_request_profiles,
+    run_duplicate_scan,
 };
 pub(crate) use types::{DuplicateEngine, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 #[cfg(feature = "fast_duplicates")]
