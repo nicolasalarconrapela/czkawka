@@ -39,11 +39,37 @@ const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
 const CALIBRATION_TEMP_PREFIX: &str = ".krokiet-verifier-tuning-";
 const CALIBRATION_SAFETY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
 const STALE_CALIBRATION_MIN_AGE: Duration = Duration::from_secs(60);
+const READONLY_MIN_FILE_SIZE: u64 = 1024 * 1024;
+const READONLY_MAX_FILE_MULTIPLIER: u64 = 16;
+const READONLY_MAX_DISCOVERED_FILES: usize = 16_384;
 
 /// Conservative verifier concurrency used when a storage has no usable profile
 /// and no writable place where Krokiet can calibrate it. Correctness is unchanged;
 /// only performance can be lower until a real profile becomes available.
 pub(crate) const SAFE_FALLBACK_WORKERS: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CalibrationMode {
+    Synthetic,
+    ReadOnly,
+    Auto,
+}
+
+impl CalibrationMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::ReadOnly => "readonly",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CalibrationRun {
+    pub mode: CalibrationMode,
+    pub report: CalibrationReport,
+}
 
 /// Controls the one-off calibration workload.
 #[derive(Clone, Copy, Debug)]
@@ -802,6 +828,82 @@ pub(crate) fn calibrate_and_store(
     calibrate_and_store_with(directory, store_path, options, calibrate_directory)
 }
 
+/// Performs the same verifier calibration without creating or modifying files on
+/// the calibrated storage. Existing regular files are opened read-only and each
+/// selected path is represented twice inside a calibration group so the normal
+/// ExactVerifier code path is exercised without requiring real duplicate pairs.
+pub(crate) fn calibrate_and_store_readonly(
+    directory: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+) -> io::Result<CalibrationReport> {
+    calibrate_and_store_with(directory, store_path, options, calibrate_directory_readonly)
+}
+
+/// Standalone calibration entry point shared by the CLI and future GUI. `Auto`
+/// prefers the synthetic dataset when the target storage is writable and has
+/// enough free space; otherwise it falls back to a strictly read-only dataset.
+/// Normal duplicate scans never call this function.
+pub(crate) fn calibrate_and_store_mode(
+    directory: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+    mode: CalibrationMode,
+) -> io::Result<CalibrationRun> {
+    validate_options(options)?;
+    let canonical = fs::canonicalize(directory)?;
+    if !fs::metadata(&canonical)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("calibration path is not a directory: {}", canonical.display()),
+        ));
+    }
+
+    match mode {
+        CalibrationMode::ReadOnly => {
+            let report = calibrate_and_store_readonly(&canonical, store_path, options)?;
+            Ok(CalibrationRun { mode: CalibrationMode::ReadOnly, report })
+        }
+        CalibrationMode::Synthetic => {
+            let synthetic = synthetic_calibration_directory(&canonical, options)?
+                .ok_or_else(|| io::Error::other(
+                    "synthetic calibration unavailable: no writable same-storage directory or insufficient free space",
+                ))?;
+            let report = calibrate_and_store(&synthetic, store_path, options)?;
+            Ok(CalibrationRun { mode: CalibrationMode::Synthetic, report })
+        }
+        CalibrationMode::Auto => {
+            if let Some(synthetic) = synthetic_calibration_directory(&canonical, options)? {
+                let report = calibrate_and_store(&synthetic, store_path, options)?;
+                Ok(CalibrationRun { mode: CalibrationMode::Synthetic, report })
+            } else {
+                let report = calibrate_and_store_readonly(&canonical, store_path, options)?;
+                Ok(CalibrationRun { mode: CalibrationMode::ReadOnly, report })
+            }
+        }
+    }
+}
+
+fn synthetic_calibration_directory(
+    requested: &Path,
+    options: CalibrationOptions,
+) -> io::Result<Option<PathBuf>> {
+    let Some(directory) = find_writable_calibration_directory(requested)? else {
+        return Ok(None);
+    };
+
+    let _ = cleanup_abandoned_calibration_dirs(&directory);
+    let required = required_calibration_free_space(options);
+    if let Some(snapshot) = storage_snapshot_for_path(&directory)
+        && let Some(available) = snapshot.available_space
+        && available < required
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(directory))
+}
+
 fn calibrate_and_store_with<F>(
     directory: &Path,
     store_path: &Path,
@@ -989,14 +1091,15 @@ pub(crate) fn calibrate_directory(
     calibrate_directory_with_executor_factory(directory, options, ExactVerifierExecutor::new)
 }
 
-fn calibrate_directory_with_executor_factory<F>(
+pub(crate) fn calibrate_directory_readonly(
     directory: &Path,
     options: CalibrationOptions,
-    mut make_executor: F,
-) -> io::Result<CalibrationReport>
-where
-    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
-{
+) -> io::Result<CalibrationReport> {
+    validate_options(options)?;
+    calibrate_directory_readonly_with_executor_factory(directory, options, ExactVerifierExecutor::new)
+}
+
+fn canonical_calibration_directory(directory: &Path) -> io::Result<PathBuf> {
     let calibrated_path = fs::canonicalize(directory).map_err(|error| {
         io::Error::new(error.kind(), format!("stage=canonicalize-calibration-directory: {error}"))
     })?;
@@ -1012,17 +1115,86 @@ where
             ),
         ));
     }
+    Ok(calibrated_path)
+}
 
+fn calibration_shape(options: CalibrationOptions) -> (usize, Vec<usize>) {
     let logical_cpus = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1);
     let candidates = candidate_worker_counts(logical_cpus, options.max_workers);
+    (logical_cpus, candidates)
+}
+
+fn calibrate_directory_with_executor_factory<F>(
+    directory: &Path,
+    options: CalibrationOptions,
+    make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
+    let calibrated_path = canonical_calibration_directory(directory)?;
+    let (logical_cpus, candidates) = calibration_shape(options);
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
     let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
+    let dataset = CalibrationDataset::create_synthetic(
+        &calibrated_path,
+        group_count,
+        options.file_size,
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("stage=create-calibration-dataset: {error}")))?;
 
-    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)
-        .map_err(|error| io::Error::new(error.kind(), format!("stage=create-calibration-dataset: {error}")))?;
+    run_calibration_with_dataset(
+        &calibrated_path,
+        logical_cpus,
+        candidates,
+        options,
+        dataset,
+        make_executor,
+    )
+}
 
+fn calibrate_directory_readonly_with_executor_factory<F>(
+    directory: &Path,
+    options: CalibrationOptions,
+    make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
+    let calibrated_path = canonical_calibration_directory(directory)?;
+    let (logical_cpus, candidates) = calibration_shape(options);
+    let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
+    let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
+    let dataset = CalibrationDataset::from_existing_files(
+        &calibrated_path,
+        group_count,
+        options.file_size,
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("stage=create-readonly-calibration-dataset: {error}")))?;
+
+    run_calibration_with_dataset(
+        &calibrated_path,
+        logical_cpus,
+        candidates,
+        options,
+        dataset,
+        make_executor,
+    )
+}
+
+fn run_calibration_with_dataset<F>(
+    calibrated_path: &Path,
+    logical_cpus: usize,
+    candidates: Vec<usize>,
+    options: CalibrationOptions,
+    dataset: CalibrationDataset,
+    mut make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
     let mut executors = HashMap::with_capacity(candidates.len());
     for &workers in &candidates {
         let executor = make_executor(workers).map_err(|error| {
@@ -1041,11 +1213,11 @@ where
         .verify_result(&mut warm)
         .map_err(|error| io::Error::new(error.kind(), format!("stage=warmup-exact-verifier: {error}")))?;
 
-    let storage_key = storage_key_for_path(&calibrated_path).map_err(|error| {
+    let storage_key = storage_key_for_path(calibrated_path).map_err(|error| {
         io::Error::new(error.kind(), format!("stage=identify-calibration-storage: {error}"))
     })?;
     let initial_report = run_calibration_pass(
-        &calibrated_path,
+        calibrated_path,
         &storage_key,
         logical_cpus,
         &candidates,
@@ -1064,7 +1236,7 @@ where
     rescue_options.pair_rounds = rescue_pair_rounds(options.pair_rounds);
 
     let mut rescue_report = run_calibration_pass(
-        &calibrated_path,
+        calibrated_path,
         &storage_key,
         logical_cpus,
         &candidates,
@@ -1829,23 +2001,23 @@ pub(crate) fn cleanup_abandoned_calibration_dirs(parent: &Path) -> io::Result<us
 }
 
 struct CalibrationDataset {
-    root: PathBuf,
+    cleanup_root: Option<PathBuf>,
     result: DuplicateScanResult,
     group_count: usize,
     bytes_per_run: u64,
 }
 
 impl CalibrationDataset {
-    fn create(parent: &Path, group_count: usize, file_size: u64) -> io::Result<Self> {
+    fn create_synthetic(parent: &Path, group_count: usize, file_size: u64) -> io::Result<Self> {
         let root = create_unique_calibration_dir(parent)?;
-        let creation_result = Self::populate(root.clone(), group_count, file_size);
+        let creation_result = Self::populate_synthetic(root.clone(), group_count, file_size);
         if creation_result.is_err() {
             let _ = fs::remove_dir_all(&root);
         }
         creation_result
     }
 
-    fn populate(root: PathBuf, group_count: usize, file_size: u64) -> io::Result<Self> {
+    fn populate_synthetic(root: PathBuf, group_count: usize, file_size: u64) -> io::Result<Self> {
         let mut groups = Vec::with_capacity(group_count);
 
         for group_index in 0..group_count {
@@ -1869,9 +2041,60 @@ impl CalibrationDataset {
             .saturating_mul(2);
 
         Ok(Self {
-            root,
+            cleanup_root: Some(root),
             result: DuplicateScanResult {
-                engine: "tuning",
+                engine: "tuning-synthetic",
+                groups,
+                elapsed: Duration::ZERO,
+            },
+            group_count,
+            bytes_per_run,
+        })
+    }
+
+    fn from_existing_files(root: &Path, group_count: usize, target_file_size: u64) -> io::Result<Self> {
+        let target_storage = storage_key_for_path(root)?;
+        let max_file_size = target_file_size
+            .saturating_mul(READONLY_MAX_FILE_MULTIPLIER)
+            .max(READONLY_MIN_FILE_SIZE);
+        let mut candidates = collect_readonly_files(root, &target_storage, max_file_size)?;
+
+        candidates.sort_by_key(|(_, size)| {
+            if *size >= target_file_size {
+                size.saturating_sub(target_file_size)
+            } else {
+                target_file_size.saturating_sub(*size).saturating_add(target_file_size)
+            }
+        });
+
+        if candidates.len() < group_count {
+            return Err(io::Error::other(format!(
+                "readonly calibration needs at least {group_count} unique regular files between {} and {} bytes on the same storage; found {}",
+                READONLY_MIN_FILE_SIZE,
+                max_file_size,
+                candidates.len(),
+            )));
+        }
+
+        candidates.truncate(group_count);
+        let mut groups = Vec::with_capacity(group_count);
+        let mut bytes_per_run = 0_u64;
+
+        for (path, size) in candidates {
+            // Using the same existing path twice is intentional. The exact verifier
+            // opens two independent read handles and performs its normal byte loop,
+            // while the calibration remains strictly read-only and does not require
+            // the user's storage to contain real duplicate pairs.
+            let left = DuplicateFile::from_path(path.clone())?;
+            let right = DuplicateFile::from_path(path)?;
+            groups.push(DuplicateGroup::new(vec![left, right]));
+            bytes_per_run = bytes_per_run.saturating_add(size.saturating_mul(2));
+        }
+
+        Ok(Self {
+            cleanup_root: None,
+            result: DuplicateScanResult {
+                engine: "tuning-readonly",
                 groups,
                 elapsed: Duration::ZERO,
             },
@@ -1883,8 +2106,69 @@ impl CalibrationDataset {
 
 impl Drop for CalibrationDataset {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if let Some(root) = self.cleanup_root.as_ref() {
+            let _ = fs::remove_dir_all(root);
+        }
     }
+}
+
+fn collect_readonly_files(
+    root: &Path,
+    target_storage: &str,
+    max_file_size: u64,
+) -> io::Result<Vec<(PathBuf, u64)>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
+
+        for entry in entries.flatten() {
+            if files.len() >= READONLY_MAX_DISCOVERED_FILES {
+                return Ok(files);
+            }
+
+            let path = entry.path();
+            if is_internal_tuning_path(&path) {
+                continue;
+            }
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let size = metadata.len();
+            if size < READONLY_MIN_FILE_SIZE || size > max_file_size {
+                continue;
+            }
+            let Ok(storage_key) = storage_key_for_path(&path) else {
+                continue;
+            };
+            if storage_key != target_storage {
+                continue;
+            }
+            files.push((path, size));
+        }
+    }
+
+    Ok(files)
 }
 
 fn create_unique_calibration_dir(parent: &Path) -> io::Result<PathBuf> {
@@ -2560,10 +2844,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
 
         {
-            let dataset = CalibrationDataset::create(dir.path(), 2, 64 * 1024)
+            let dataset = CalibrationDataset::create_synthetic(dir.path(), 2, 64 * 1024)
                 .expect("create calibration dataset");
-            assert!(dataset.root.exists());
-            assert!(dataset.root.starts_with(dir.path()));
+            let root = dataset
+                .cleanup_root
+                .as_ref()
+                .expect("synthetic calibration dataset must own a cleanup root");
+            assert!(root.exists());
+            assert!(root.starts_with(dir.path()));
         }
 
         let leftovers = fs::read_dir(dir.path())
@@ -2921,6 +3209,120 @@ mod tests {
         assert!(
             !store_path.exists(),
             "normal scan resolution must never create or persist a tuning store"
+        );
+    }
+
+    #[test]
+    fn readonly_dataset_uses_existing_files_without_modifying_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first.bin");
+        let second = dir.path().join("second.bin");
+        let first_bytes = vec![0x31; READONLY_MIN_FILE_SIZE as usize];
+        let second_bytes = vec![0x52; READONLY_MIN_FILE_SIZE as usize + 4096];
+        fs::write(&first, &first_bytes).expect("write first");
+        fs::write(&second, &second_bytes).expect("write second");
+
+        let before = fs::read_dir(dir.path()).expect("read before").count();
+        {
+            let dataset = CalibrationDataset::from_existing_files(
+                dir.path(),
+                2,
+                READONLY_MIN_FILE_SIZE,
+            )
+            .expect("readonly dataset");
+            assert_eq!(dataset.group_count, 2);
+            assert_eq!(dataset.result.groups.len(), 2);
+            assert!(dataset.cleanup_root.is_none());
+            assert!(dataset.result.groups.iter().all(|group| {
+                group.files.len() == 2 && group.files[0].path == group.files[1].path
+            }));
+        }
+
+        let after = fs::read_dir(dir.path()).expect("read after").count();
+        assert_eq!(before, after, "readonly calibration must not create files");
+        assert_eq!(fs::read(&first).expect("read first"), first_bytes);
+        assert_eq!(fs::read(&second).expect("read second"), second_bytes);
+    }
+
+    #[test]
+    fn readonly_dataset_rejects_insufficient_existing_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("only.bin"),
+            vec![0x7A; READONLY_MIN_FILE_SIZE as usize],
+        )
+        .expect("write only");
+
+        let error = match CalibrationDataset::from_existing_files(
+            dir.path(),
+            2,
+            READONLY_MIN_FILE_SIZE,
+        ) {
+            Ok(_) => panic!("two unique files are required"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("at least 2 unique regular files"));
+    }
+
+    #[test]
+    fn calibration_mode_labels_are_stable() {
+        assert_eq!(CalibrationMode::Synthetic.as_str(), "synthetic");
+        assert_eq!(CalibrationMode::ReadOnly.as_str(), "readonly");
+        assert_eq!(CalibrationMode::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn readonly_calibration_runs_verifier_and_persists_profile_without_target_writes() {
+        let target = tempfile::tempdir().expect("target tempdir");
+        let config = tempfile::tempdir().expect("config tempdir");
+        for index in 0..MIN_GROUPS {
+            fs::write(
+                target.path().join(format!("readonly-{index:02}.bin")),
+                vec![index as u8; READONLY_MIN_FILE_SIZE as usize],
+            )
+            .expect("write readonly source");
+        }
+
+        let mut before = fs::read_dir(target.path())
+            .expect("read before")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        before.sort();
+
+        let options = CalibrationOptions {
+            file_size: READONLY_MIN_FILE_SIZE,
+            rounds: 1,
+            recheck_rounds: 0,
+            pair_rounds: 0,
+            target_sample_time: Duration::from_millis(1),
+            max_workers: 1,
+            tie_margin: 0.05,
+            recheck_margin: 0.10,
+        };
+        let store_path = config.path().join("readonly-tuning.json");
+        let run = calibrate_and_store_mode(
+            target.path(),
+            &store_path,
+            options,
+            CalibrationMode::ReadOnly,
+        )
+        .expect("readonly calibration");
+
+        assert_eq!(run.mode, CalibrationMode::ReadOnly);
+        assert_eq!(run.report.profile.workers, 1);
+        assert_eq!(run.report.groups, MIN_GROUPS);
+        assert!(store_path.exists());
+
+        let mut after = fs::read_dir(target.path())
+            .expect("read after")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        after.sort();
+        assert_eq!(before, after, "readonly calibration created or removed target files");
+        assert!(
+            fs::read_dir(target.path())
+                .expect("read target")
+                .all(|entry| !is_internal_tuning_path(&entry.expect("entry").path()))
         );
     }
 

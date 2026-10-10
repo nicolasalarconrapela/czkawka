@@ -41,12 +41,14 @@ pub(crate) use types::{DuplicateEngine, DuplicateFile, DuplicateGroup, Duplicate
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
 pub(crate) use tuning::{
-    CalibrationOptions, CalibrationReport, CalibrationStability, TuningMeasurement,
-    VerifierScanResolution, VerifierTuningFallbackReason, VerifierTuningPlan,
-    VerifierTuningProfile, VerifierTuningResolution, VerifierTuningStore,
-    SAFE_FALLBACK_WORKERS, calibrate_and_store, calibrate_directory,
-    find_writable_calibration_directory, resolve_scan_tuning_for_path,
-    resolve_tuning_for_path, storage_key_for_path, tuning_plan_for_path,
+    CalibrationMode, CalibrationOptions, CalibrationReport, CalibrationRun,
+    CalibrationStability, TuningMeasurement, VerifierScanResolution,
+    VerifierTuningFallbackReason, VerifierTuningPlan, VerifierTuningProfile,
+    VerifierTuningResolution, VerifierTuningStore, SAFE_FALLBACK_WORKERS,
+    calibrate_and_store, calibrate_and_store_mode, calibrate_and_store_readonly,
+    calibrate_directory, calibrate_directory_readonly, find_writable_calibration_directory,
+    resolve_scan_tuning_for_path, resolve_tuning_for_path, storage_key_for_path,
+    tuning_plan_for_path,
 };
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]

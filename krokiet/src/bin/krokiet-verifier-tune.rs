@@ -30,9 +30,8 @@ mod tuning;
 
 #[cfg(not(test))]
 use tuning::{
-    CalibrationOptions, CalibrationStability, SAFE_FALLBACK_WORKERS, calibrate_and_store,
-    cleanup_abandoned_calibration_dirs, find_writable_calibration_directory,
-    required_calibration_free_space, storage_key_for_path, storage_snapshot_for_path,
+    CalibrationMode, CalibrationOptions, CalibrationStability, calibrate_and_store_mode,
+    storage_key_for_path,
 };
 
 #[cfg(not(test))]
@@ -70,69 +69,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 3.3.0");
+    println!(" KROKIET - VERIFIER TUNING 3.4.0");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
-    println!("Modo            : calibracion local independiente");
+    println!("Modo solicitado : {}", parsed.mode.as_str());
+    println!("Arquitectura    : calibracion independiente del scan");
     println!("Perfil destino  : {}", store_path.display());
     println!();
 
     let canonical_requested = std::fs::canonicalize(&path)?;
     let storage_key = storage_key_for_path(&canonical_requested)?;
-    let Some(calibration_directory) = find_writable_calibration_directory(&canonical_requested)? else {
-        println!("Ruta canonica   : {}", canonical_requested.display());
-        println!("Storage key     : {storage_key}");
-        println!("Escritura       : no disponible para calibracion sintetica");
-        println!("Calibracion     : OMITIDA");
-        println!(
-            "Workers         : {} (fallback seguro hasta calibrar)",
-            SAFE_FALLBACK_WORKERS
-        );
-        println!();
-        println!("El analisis normal NO intentara calibrar por su cuenta.");
-        println!("============================================================");
-        return Ok(());
-    };
-
-    if calibration_directory != canonical_requested {
-        println!("Ruta canonica   : {}", canonical_requested.display());
-        println!("Storage key     : {storage_key}");
-        println!(
-            "Carpeta prueba  : {}",
-            calibration_directory.display()
-        );
-        println!();
-    }
+    println!("Ruta canonica   : {}", canonical_requested.display());
+    println!("Storage key     : {storage_key}");
+    println!();
 
     let options = CalibrationOptions::default();
-    let _ = cleanup_abandoned_calibration_dirs(&calibration_directory);
-    let required = required_calibration_free_space(options);
+    let run = calibrate_and_store_mode(
+        &canonical_requested,
+        &store_path,
+        options,
+        parsed.mode,
+    )?;
+    let report = run.report;
 
-    if let Some(snapshot) = storage_snapshot_for_path(&calibration_directory)
-        && let Some(available) = snapshot.available_space
-        && available < required
-    {
-        println!("Ruta canonica   : {}", canonical_requested.display());
-        println!("Storage key     : {storage_key}");
-        println!("Calibracion     : OMITIDA");
-        println!("Motivo          : espacio insuficiente para dataset sintetico");
-        println!("Espacio libre   : {:.1} MiB", available as f64 / 1024.0 / 1024.0);
-        println!("Espacio minimo  : {:.1} MiB", required as f64 / 1024.0 / 1024.0);
-        println!();
-        println!("No se ha modificado el perfil guardado.");
-        println!("El analisis normal NO intentara calibrar por su cuenta.");
-        println!("============================================================");
-        return Ok(());
-    }
-
-    let report = calibrate_and_store(&calibration_directory, &store_path, options)?;
-
-    if calibration_directory == canonical_requested {
-        println!(
-            "Ruta canonica   : {}",
-            canonical_requested.display()
-        );
-        println!("Storage key     : {}", report.profile.storage_key);
+    println!("Modo utilizado  : {}", run.mode.as_str());
+    match run.mode {
+        CalibrationMode::Synthetic => {
+            println!("Dataset         : sintetico temporal");
+            println!("Escritura target: si (solo dataset temporal de calibracion)");
+        }
+        CalibrationMode::ReadOnly => {
+            println!("Dataset         : archivos existentes");
+            println!("Escritura target: NO");
+            println!("Nota            : cada archivo seleccionado se abre con dos handles de lectura");
+        }
+        CalibrationMode::Auto => unreachable!("auto always resolves to a concrete mode"),
     }
     println!("CPU logicos     : {}", report.profile.logical_cpus);
     println!("Grupos          : {}", report.groups);
@@ -256,12 +227,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct ParsedArgs {
     path: Option<PathBuf>,
     tuning_store_path: Option<PathBuf>,
+    mode: CalibrationMode,
 }
 
 #[cfg(not(test))]
 fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Error>> {
     let mut path = None;
     let mut tuning_store_path = None;
+    let mut mode = CalibrationMode::Auto;
     let mut index = 0_usize;
 
     while index < args.len() {
@@ -277,6 +250,21 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Err
                     .get(index)
                     .ok_or("--tuning-store necesita una ruta de archivo")?;
                 tuning_store_path = Some(PathBuf::from(raw));
+            }
+            "--mode" => {
+                index += 1;
+                let raw = args.get(index).ok_or("--mode necesita synthetic, readonly o auto")?;
+                mode = match raw.to_string_lossy().as_ref() {
+                    "synthetic" => CalibrationMode::Synthetic,
+                    "readonly" => CalibrationMode::ReadOnly,
+                    "auto" => CalibrationMode::Auto,
+                    other => {
+                        return Err(format!(
+                            "modo desconocido: {other}; usa synthetic, readonly o auto"
+                        )
+                        .into());
+                    }
+                };
             }
             option if option.starts_with('-') => {
                 return Err(format!("opcion desconocida: {option}").into());
@@ -294,6 +282,7 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Err
     Ok(ParsedArgs {
         path,
         tuning_store_path,
+        mode,
     })
 }
 
@@ -305,6 +294,7 @@ fn print_usage() {
          krokiet-verifier-tune [opciones] [carpeta]\n\
          \n\
          Opciones:\n\
+           --mode <modo>           synthetic | readonly | auto (por defecto: auto)\n\
            --tuning-store <ruta>   Fuerza el archivo de perfiles\n\
            -h, --help              Muestra esta ayuda\n"
     );
