@@ -360,6 +360,9 @@ pub(crate) struct CalibrationReport {
     pub pairwise: Vec<PairwiseMeasurement>,
     pub groups: usize,
     pub bytes_per_run: u64,
+    /// Deterministic identifier of the selected read-only files. Synthetic
+    /// datasets do not expose one because their temporary paths are unique.
+    pub dataset_fingerprint: Option<u64>,
     pub initial_rounds: usize,
     pub recheck_rounds: usize,
     pub pair_rounds: usize,
@@ -843,7 +846,8 @@ pub(crate) fn calibrate_and_store_readonly(
 /// Standalone calibration entry point shared by the CLI and future GUI. `Auto`
 /// prefers the synthetic dataset when the target storage is writable and has
 /// enough free space; otherwise it falls back to a strictly read-only dataset.
-/// Normal duplicate scans never call this function.
+/// Invalid reports are returned for diagnostics but are never persisted. Normal
+/// duplicate scans never call this function.
 pub(crate) fn calibrate_and_store_mode(
     directory: &Path,
     store_path: &Path,
@@ -861,7 +865,12 @@ pub(crate) fn calibrate_and_store_mode(
 
     match mode {
         CalibrationMode::ReadOnly => {
-            let report = calibrate_and_store_readonly(&canonical, store_path, options)?;
+            let report = calibrate_and_maybe_store_with(
+                &canonical,
+                store_path,
+                options,
+                calibrate_directory_readonly,
+            )?;
             Ok(CalibrationRun { mode: CalibrationMode::ReadOnly, report })
         }
         CalibrationMode::Synthetic => {
@@ -869,15 +878,30 @@ pub(crate) fn calibrate_and_store_mode(
                 .ok_or_else(|| io::Error::other(
                     "synthetic calibration unavailable: no writable same-storage directory or insufficient free space",
                 ))?;
-            let report = calibrate_and_store(&synthetic, store_path, options)?;
+            let report = calibrate_and_maybe_store_with(
+                &synthetic,
+                store_path,
+                options,
+                calibrate_directory,
+            )?;
             Ok(CalibrationRun { mode: CalibrationMode::Synthetic, report })
         }
         CalibrationMode::Auto => {
             if let Some(synthetic) = synthetic_calibration_directory(&canonical, options)? {
-                let report = calibrate_and_store(&synthetic, store_path, options)?;
+                let report = calibrate_and_maybe_store_with(
+                    &synthetic,
+                    store_path,
+                    options,
+                    calibrate_directory,
+                )?;
                 Ok(CalibrationRun { mode: CalibrationMode::Synthetic, report })
             } else {
-                let report = calibrate_and_store_readonly(&canonical, store_path, options)?;
+                let report = calibrate_and_maybe_store_with(
+                    &canonical,
+                    store_path,
+                    options,
+                    calibrate_directory_readonly,
+                )?;
                 Ok(CalibrationRun { mode: CalibrationMode::ReadOnly, report })
             }
         }
@@ -918,6 +942,31 @@ where
         return Err(io::Error::other(
             "verifier calibration is too unstable; profile was not stored",
         ));
+    }
+
+    let mut store = VerifierTuningStore::load(store_path)?;
+    if store.upsert_calibrated_if_preferred(report.profile.clone()) {
+        store.save(store_path)?;
+    }
+    Ok(report)
+}
+
+/// Diagnostic persistence path used by the standalone calibrator. Invalid
+/// reports are returned to the caller so every measurement can be printed, but
+/// they are never persisted. Production callers can keep using the strict
+/// `calibrate_and_store_with` path when an invalid calibration must be an error.
+fn calibrate_and_maybe_store_with<F>(
+    directory: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+    calibrate: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnOnce(&Path, CalibrationOptions) -> io::Result<CalibrationReport>,
+{
+    let report = calibrate(directory, options)?;
+    if report.profile.stability == CalibrationStability::Invalid {
+        return Ok(report);
     }
 
     let mut store = VerifierTuningStore::load(store_path)?;
@@ -1360,6 +1409,7 @@ fn run_calibration_pass(
         pairwise,
         groups: dataset.group_count,
         bytes_per_run: dataset.bytes_per_run,
+        dataset_fingerprint: dataset.dataset_fingerprint,
         initial_rounds: options.rounds,
         recheck_rounds: options.recheck_rounds,
         pair_rounds: options.pair_rounds,
@@ -2005,6 +2055,7 @@ struct CalibrationDataset {
     result: DuplicateScanResult,
     group_count: usize,
     bytes_per_run: u64,
+    dataset_fingerprint: Option<u64>,
 }
 
 impl CalibrationDataset {
@@ -2049,6 +2100,7 @@ impl CalibrationDataset {
             },
             group_count,
             bytes_per_run,
+            dataset_fingerprint: None,
         })
     }
 
@@ -2059,12 +2111,10 @@ impl CalibrationDataset {
             .max(READONLY_MIN_FILE_SIZE);
         let mut candidates = collect_readonly_files(root, &target_storage, max_file_size)?;
 
-        candidates.sort_by_key(|(_, size)| {
-            if *size >= target_file_size {
-                size.saturating_sub(target_file_size)
-            } else {
-                target_file_size.saturating_sub(*size).saturating_add(target_file_size)
-            }
+        candidates.sort_by(|(left_path, left_size), (right_path, right_size)| {
+            readonly_size_distance(*left_size, target_file_size)
+                .cmp(&readonly_size_distance(*right_size, target_file_size))
+                .then_with(|| left_path.cmp(right_path))
         });
 
         if candidates.len() < group_count {
@@ -2077,6 +2127,7 @@ impl CalibrationDataset {
         }
 
         candidates.truncate(group_count);
+        let dataset_fingerprint = Some(readonly_dataset_fingerprint(&candidates));
         let mut groups = Vec::with_capacity(group_count);
         let mut bytes_per_run = 0_u64;
 
@@ -2100,6 +2151,7 @@ impl CalibrationDataset {
             },
             group_count,
             bytes_per_run,
+            dataset_fingerprint,
         })
     }
 }
@@ -2110,6 +2162,41 @@ impl Drop for CalibrationDataset {
             let _ = fs::remove_dir_all(root);
         }
     }
+}
+
+fn readonly_size_distance(size: u64, target_file_size: u64) -> u64 {
+    if size >= target_file_size {
+        size.saturating_sub(target_file_size)
+    } else {
+        target_file_size
+            .saturating_sub(size)
+            .saturating_add(target_file_size)
+    }
+}
+
+fn readonly_dataset_fingerprint(files: &[(PathBuf, u64)]) -> u64 {
+    // FNV-1a is intentionally simple here: this is a diagnostic identity, not a
+    // cryptographic integrity check. It remains stable for the same selected
+    // paths and sizes across repeated runs of the same dataset.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for (path, size) in files {
+        for byte in path.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+        for byte in size.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xfe;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn collect_readonly_files(
@@ -2126,8 +2213,10 @@ fn collect_readonly_files(
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
             Err(error) => return Err(error),
         };
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
 
-        for entry in entries.flatten() {
+        for entry in entries {
             if files.len() >= READONLY_MAX_DISCOVERED_FILES {
                 return Ok(files);
             }
@@ -2419,6 +2508,7 @@ mod tests {
             pairwise: Vec::new(),
             groups: 16,
             bytes_per_run: 128 * 1024 * 1024,
+            dataset_fingerprint: None,
             initial_rounds: 5,
             recheck_rounds: 4,
             pair_rounds: 5,
@@ -2803,6 +2893,47 @@ mod tests {
             .profile_for_storage_key(&storage_key)
             .expect("good profile must remain");
         assert_eq!(saved.workers, 6);
+        assert_eq!(saved.stability, CalibrationStability::High);
+    }
+
+    #[test]
+    fn diagnostic_invalid_calibration_returns_report_without_overwriting_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            4,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("save good profile");
+
+        let invalid_profile = test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Invalid,
+        );
+
+        let report = calibrate_and_maybe_store_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_, _| Ok(test_report(invalid_profile)),
+        )
+        .expect("diagnostic path must return the invalid report");
+
+        assert_eq!(report.profile.stability, CalibrationStability::Invalid);
+        assert_eq!(report.profile.workers, 8);
+
+        let loaded = VerifierTuningStore::load(&store_path).expect("reload good profile");
+        let saved = loaded
+            .profile_for_storage_key(&storage_key)
+            .expect("good profile must remain");
+        assert_eq!(saved.workers, 4);
         assert_eq!(saved.stability, CalibrationStability::High);
     }
 
@@ -3242,6 +3373,40 @@ mod tests {
         assert_eq!(before, after, "readonly calibration must not create files");
         assert_eq!(fs::read(&first).expect("read first"), first_bytes);
         assert_eq!(fs::read(&second).expect("read second"), second_bytes);
+    }
+
+    #[test]
+    fn readonly_dataset_tie_break_and_fingerprint_are_deterministic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("a.bin");
+        let second = dir.path().join("z.bin");
+        fs::write(&second, vec![0x52; READONLY_MIN_FILE_SIZE as usize]).expect("write second");
+        fs::write(&first, vec![0x31; READONLY_MIN_FILE_SIZE as usize]).expect("write first");
+
+        let first_dataset = CalibrationDataset::from_existing_files(
+            dir.path(),
+            1,
+            READONLY_MIN_FILE_SIZE,
+        )
+        .expect("first readonly dataset");
+        let first_fingerprint = first_dataset
+            .dataset_fingerprint
+            .expect("readonly fingerprint");
+        assert_eq!(first_dataset.result.groups[0].files[0].path, first);
+        drop(first_dataset);
+
+        let second_dataset = CalibrationDataset::from_existing_files(
+            dir.path(),
+            1,
+            READONLY_MIN_FILE_SIZE,
+        )
+        .expect("second readonly dataset");
+        assert_eq!(
+            second_dataset.dataset_fingerprint,
+            Some(first_fingerprint),
+            "same readonly selection must keep the same fingerprint"
+        );
+        assert_eq!(second_dataset.result.groups[0].files[0].path, first);
     }
 
     #[test]

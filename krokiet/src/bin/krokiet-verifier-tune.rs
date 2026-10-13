@@ -69,7 +69,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 3.4.0");
+    println!(" KROKIET - VERIFIER TUNING 3.4.1");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo solicitado : {}", parsed.mode.as_str());
@@ -102,6 +102,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Dataset         : archivos existentes");
             println!("Escritura target: NO");
             println!("Nota            : cada archivo seleccionado se abre con dos handles de lectura");
+            println!(
+                "Datos unicos    : {:.1} MiB",
+                report.bytes_per_run as f64 / 2.0 / 1024.0 / 1024.0
+            );
+            if let Some(fingerprint) = report.dataset_fingerprint {
+                println!("Dataset ID      : fnv1a64-{fingerprint:016x}");
+            }
         }
         CalibrationMode::Auto => unreachable!("auto always resolves to a concrete mode"),
     }
@@ -209,14 +216,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.profile.stability.label_es()
     );
 
-    if report.profile.stability == CalibrationStability::Invalid {
+    let invalid = report.profile.stability == CalibrationStability::Invalid;
+    if invalid {
         println!("Perfil          : NO GUARDADO");
+        println!(
+            "Motivo          : MAD seleccionado o MAD decision supera el limite de {:.0}%",
+            12.0
+        );
     } else {
         println!("Perfil          : GUARDADO");
         println!("Archivo         : {}", store_path.display());
     }
 
     println!("============================================================");
+
+    if invalid {
+        return Err("verifier calibration is too unstable; profile was not stored".into());
+    }
 
     Ok(())
 }
