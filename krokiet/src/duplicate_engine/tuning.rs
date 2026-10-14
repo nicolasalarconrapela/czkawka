@@ -18,10 +18,11 @@ use sysinfo::{DiskExt, DiskKind, System, SystemExt};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Persistence schema version 6. The 2.9.3 behaviour keeps the same on-disk
-// format and adds safe profile replacement/reuse rules, so no format bump is
-// needed.
-const TUNING_FORMAT_VERSION: u64 = 6;
+// Persistence schema version 7. Version 3.4.4 changes the confidence semantics:
+// system-wide noise now caps an otherwise-high calibration at Medium. Old v6
+// profiles may therefore be over-confident, so they are intentionally ignored
+// and recalibrated under the new policy.
+const TUNING_FORMAT_VERSION: u64 = 7;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
 const DEFAULT_RECHECK_ROUNDS: usize = 4;
@@ -39,11 +40,54 @@ const INVALID_STABILITY_RELATIVE_MAD: f64 = 0.12;
 const CALIBRATION_TEMP_PREFIX: &str = ".krokiet-verifier-tuning-";
 const CALIBRATION_SAFETY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
 const STALE_CALIBRATION_MIN_AGE: Duration = Duration::from_secs(60);
+const READONLY_MIN_FILE_SIZE: u64 = 1024 * 1024;
+const READONLY_MAX_FILE_MULTIPLIER: u64 = 16;
+const READONLY_MAX_DISCOVERED_FILES: usize = 16_384;
 
 /// Conservative verifier concurrency used when a storage has no usable profile
 /// and no writable place where Krokiet can calibrate it. Correctness is unchanged;
 /// only performance can be lower until a real profile becomes available.
 pub(crate) const SAFE_FALLBACK_WORKERS: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CalibrationMode {
+    Synthetic,
+    ReadOnly,
+    Auto,
+}
+
+impl CalibrationMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::ReadOnly => "readonly",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CalibrationPersistence {
+    /// The new profile was written because there was no usable profile yet or
+    /// because the new calibration had enough confidence to replace it.
+    Stored,
+    /// The calibration itself was valid, but an existing profile with equal or
+    /// better confidence remains authoritative.
+    RetainedExisting {
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    /// The calibration report is useful for diagnostics but is too unstable to
+    /// be persisted.
+    InvalidNotStored,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CalibrationRun {
+    pub mode: CalibrationMode,
+    pub report: CalibrationReport,
+    pub persistence: CalibrationPersistence,
+}
 
 /// Controls the one-off calibration workload.
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +149,13 @@ pub(crate) struct PairwiseMeasurement {
     pub median_ratio: f64,
     /// Number of pairs where the challenger was at least `tie_margin` faster.
     pub decisive_challenger_wins: usize,
+    /// Aggregate slowdown of the challenger versus the fastest measured candidate.
+    /// A value above `tie_margin` means pairwise confirmation may diagnose the
+    /// candidate but cannot promote it.
+    pub challenger_slowdown_vs_fastest: f64,
+    /// True when pairwise evidence would have promoted the challenger, but the
+    /// aggregate measurements place it outside the allowed tie margin.
+    pub promotion_blocked_by_aggregate: bool,
     pub promoted: bool,
 }
 
@@ -173,6 +224,9 @@ pub(crate) struct StorageSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerifierTuningFallbackReason {
+    /// Normal scans never auto-calibrate. This means no reusable profile existed
+    /// for the storage, so the scan can only continue with the universal safe fallback.
+    NoStoredProfile,
     NoWritableCalibrationDirectory,
     InsufficientFreeSpace,
     CalibrationInvalid,
@@ -262,6 +316,34 @@ impl VerifierTuningResolution {
     }
 }
 
+/// Worker choice used by a normal duplicate scan.
+///
+/// This type intentionally has no `Calibrated` variant: a scan is allowed to
+/// reuse an already stored profile or fall back, but it never benchmarks storage,
+/// creates calibration files, or persists a new profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VerifierScanResolution {
+    ReusedProfile {
+        storage_key: String,
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    Fallback {
+        storage_key: String,
+        workers: usize,
+        reason: VerifierTuningFallbackReason,
+        detail: Option<String>,
+    },
+}
+
+impl VerifierScanResolution {
+    pub(crate) fn workers(&self) -> usize {
+        match self {
+            Self::ReusedProfile { workers, .. } | Self::Fallback { workers, .. } => *workers,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VerifierTuningProfile {
     /// Stable storage identifier for the calibrated directory.
@@ -303,6 +385,9 @@ pub(crate) struct CalibrationReport {
     pub pairwise: Vec<PairwiseMeasurement>,
     pub groups: usize,
     pub bytes_per_run: u64,
+    /// Deterministic identifier of the selected read-only files. Synthetic
+    /// datasets do not expose one because their temporary paths are unique.
+    pub dataset_fingerprint: Option<u64>,
     pub initial_rounds: usize,
     pub recheck_rounds: usize,
     pub pair_rounds: usize,
@@ -318,6 +403,16 @@ pub(crate) struct CalibrationReport {
     pub aggregate_selected_workers: usize,
     pub rechecked_workers: Vec<usize>,
     pub paired_workers: Vec<usize>,
+    /// True when the fresh paired confirmation selected a different worker count
+    /// from the aggregate measurements.
+    pub pairwise_overrode_aggregate: bool,
+    /// True when pairwise evidence tried to promote a challenger that was more
+    /// than `tie_margin` slower than the fastest aggregate candidate. This makes
+    /// the pass invalid and triggers the normal rescue measurement.
+    pub pairwise_blocked_promotion: bool,
+    /// Present on rescue results when the initial pass was invalid because of a
+    /// blocked pairwise promotion.
+    pub initial_pairwise_blocked_promotion: bool,
 }
 
 /// Small persistent store. Krokiet can keep this alongside its normal settings.
@@ -597,6 +692,47 @@ impl VerifierTuningStore {
     }
 }
 
+/// Resolves the worker count for a normal duplicate scan.
+///
+/// This function is deliberately read-only with respect to calibration:
+/// - it loads the persisted profile store;
+/// - it reuses a valid profile when present;
+/// - otherwise it chooses the universal one-worker fallback.
+///
+/// It never probes for write access, creates a calibration dataset, benchmarks
+/// the verifier, cleans calibration directories, or writes the profile store.
+pub(crate) fn resolve_scan_tuning_for_path(
+    path: &Path,
+    store_path: &Path,
+) -> io::Result<VerifierScanResolution> {
+    let store = VerifierTuningStore::load(store_path)?;
+    let storage_key = storage_key_for_path(path)?;
+
+    if let Some(profile) = store.profile_for_storage_key(&storage_key) {
+        return Ok(VerifierScanResolution::ReusedProfile {
+            storage_key,
+            workers: profile.workers,
+            stability: profile.stability,
+        });
+    }
+
+    let snapshot = storage_snapshot_for_path(path);
+    let workers = SAFE_FALLBACK_WORKERS;
+
+    Ok(VerifierScanResolution::Fallback {
+        storage_key,
+        workers,
+        reason: VerifierTuningFallbackReason::NoStoredProfile,
+        detail: Some(format_fallback_context(
+            path,
+            snapshot,
+            None,
+            None,
+            Some("normal scan does not auto-calibrate; run krokiet-verifier-tune separately"),
+        )),
+    })
+}
+
 /// Decides what Krokiet should do for one path without ever requiring write
 /// access just to continue a scan. Existing profiles win first; otherwise a
 /// writable location on the same storage is selected for calibration. If none
@@ -730,6 +866,119 @@ pub(crate) fn calibrate_and_store(
     calibrate_and_store_with(directory, store_path, options, calibrate_directory)
 }
 
+/// Performs the same verifier calibration without creating or modifying files on
+/// the calibrated storage. Existing regular files are opened read-only and each
+/// selected path is represented twice inside a calibration group so the normal
+/// ExactVerifier code path is exercised without requiring real duplicate pairs.
+pub(crate) fn calibrate_and_store_readonly(
+    directory: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+) -> io::Result<CalibrationReport> {
+    calibrate_and_store_with(directory, store_path, options, calibrate_directory_readonly)
+}
+
+/// Standalone calibration entry point shared by the CLI and future GUI. `Auto`
+/// prefers the synthetic dataset when the target storage is writable and has
+/// enough free space; otherwise it falls back to a strictly read-only dataset.
+/// Invalid reports are returned for diagnostics but are never persisted. Normal
+/// duplicate scans never call this function.
+pub(crate) fn calibrate_and_store_mode(
+    directory: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+    mode: CalibrationMode,
+) -> io::Result<CalibrationRun> {
+    validate_options(options)?;
+    let canonical = fs::canonicalize(directory)?;
+    if !fs::metadata(&canonical)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("calibration path is not a directory: {}", canonical.display()),
+        ));
+    }
+
+    match mode {
+        CalibrationMode::ReadOnly => {
+            let (report, persistence) = calibrate_and_maybe_store_with(
+                &canonical,
+                store_path,
+                options,
+                calibrate_directory_readonly,
+            )?;
+            Ok(CalibrationRun {
+                mode: CalibrationMode::ReadOnly,
+                report,
+                persistence,
+            })
+        }
+        CalibrationMode::Synthetic => {
+            let synthetic = synthetic_calibration_directory(&canonical, options)?
+                .ok_or_else(|| io::Error::other(
+                    "synthetic calibration unavailable: no writable same-storage directory or insufficient free space",
+                ))?;
+            let (report, persistence) = calibrate_and_maybe_store_with(
+                &synthetic,
+                store_path,
+                options,
+                calibrate_directory,
+            )?;
+            Ok(CalibrationRun {
+                mode: CalibrationMode::Synthetic,
+                report,
+                persistence,
+            })
+        }
+        CalibrationMode::Auto => {
+            if let Some(synthetic) = synthetic_calibration_directory(&canonical, options)? {
+                let (report, persistence) = calibrate_and_maybe_store_with(
+                    &synthetic,
+                    store_path,
+                    options,
+                    calibrate_directory,
+                )?;
+                Ok(CalibrationRun {
+                    mode: CalibrationMode::Synthetic,
+                    report,
+                    persistence,
+                })
+            } else {
+                let (report, persistence) = calibrate_and_maybe_store_with(
+                    &canonical,
+                    store_path,
+                    options,
+                    calibrate_directory_readonly,
+                )?;
+                Ok(CalibrationRun {
+                    mode: CalibrationMode::ReadOnly,
+                    report,
+                    persistence,
+                })
+            }
+        }
+    }
+}
+
+fn synthetic_calibration_directory(
+    requested: &Path,
+    options: CalibrationOptions,
+) -> io::Result<Option<PathBuf>> {
+    let Some(directory) = find_writable_calibration_directory(requested)? else {
+        return Ok(None);
+    };
+
+    let _ = cleanup_abandoned_calibration_dirs(&directory);
+    let required = required_calibration_free_space(options);
+    if let Some(snapshot) = storage_snapshot_for_path(&directory)
+        && let Some(available) = snapshot.available_space
+        && available < required
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(directory))
+}
+
 fn calibrate_and_store_with<F>(
     directory: &Path,
     store_path: &Path,
@@ -751,6 +1000,44 @@ where
         store.save(store_path)?;
     }
     Ok(report)
+}
+
+/// Diagnostic persistence path used by the standalone calibrator. Invalid
+/// reports are returned to the caller so every measurement can be printed, but
+/// they are never persisted. Production callers can keep using the strict
+/// `calibrate_and_store_with` path when an invalid calibration must be an error.
+fn calibrate_and_maybe_store_with<F>(
+    directory: &Path,
+    store_path: &Path,
+    options: CalibrationOptions,
+    calibrate: F,
+) -> io::Result<(CalibrationReport, CalibrationPersistence)>
+where
+    F: FnOnce(&Path, CalibrationOptions) -> io::Result<CalibrationReport>,
+{
+    let report = calibrate(directory, options)?;
+    if report.profile.stability == CalibrationStability::Invalid {
+        return Ok((report, CalibrationPersistence::InvalidNotStored));
+    }
+
+    let mut store = VerifierTuningStore::load(store_path)?;
+    if store.upsert_calibrated_if_preferred(report.profile.clone()) {
+        store.save(store_path)?;
+        return Ok((report, CalibrationPersistence::Stored));
+    }
+
+    let retained = store
+        .profile_for_storage_key(&report.profile.storage_key)
+        .expect("a rejected replacement must leave an existing profile")
+        .clone();
+
+    Ok((
+        report,
+        CalibrationPersistence::RetainedExisting {
+            workers: retained.workers,
+            stability: retained.stability,
+        },
+    ))
 }
 
 /// Resolves the verifier worker count for one storage and persists a useful
@@ -801,9 +1088,7 @@ where
             ..
         } => {
             let snapshot = storage_snapshot_for_path(path);
-            let workers = snapshot
-                .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-                .unwrap_or(SAFE_FALLBACK_WORKERS);
+            let workers = SAFE_FALLBACK_WORKERS;
             let detail = Some(format_fallback_context(path, snapshot, None, None, None));
             Ok(VerifierTuningResolution::Fallback {
                 storage_key,
@@ -827,7 +1112,7 @@ where
                 && let Some(available) = snapshot.available_space
                 && available < required
             {
-                let workers = fallback_workers_for_storage(snapshot.class);
+                let workers = SAFE_FALLBACK_WORKERS;
                 let detail = Some(format_fallback_context(
                     &directory,
                     Some(snapshot),
@@ -846,9 +1131,7 @@ where
             let report = match calibrate(&directory, options) {
                 Ok(report) => report,
                 Err(error) => {
-                    let workers = snapshot
-                        .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-                        .unwrap_or(SAFE_FALLBACK_WORKERS);
+                    let workers = SAFE_FALLBACK_WORKERS;
                     return Ok(VerifierTuningResolution::Fallback {
                         storage_key,
                         workers,
@@ -862,9 +1145,7 @@ where
             };
 
             if report.profile.stability == CalibrationStability::Invalid {
-                let workers = snapshot
-                    .map(|snapshot| fallback_workers_for_storage(snapshot.class))
-                    .unwrap_or(SAFE_FALLBACK_WORKERS);
+                let workers = SAFE_FALLBACK_WORKERS;
                 return Ok(VerifierTuningResolution::Fallback {
                     storage_key,
                     workers,
@@ -923,14 +1204,15 @@ pub(crate) fn calibrate_directory(
     calibrate_directory_with_executor_factory(directory, options, ExactVerifierExecutor::new)
 }
 
-fn calibrate_directory_with_executor_factory<F>(
+pub(crate) fn calibrate_directory_readonly(
     directory: &Path,
     options: CalibrationOptions,
-    mut make_executor: F,
-) -> io::Result<CalibrationReport>
-where
-    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
-{
+) -> io::Result<CalibrationReport> {
+    validate_options(options)?;
+    calibrate_directory_readonly_with_executor_factory(directory, options, ExactVerifierExecutor::new)
+}
+
+fn canonical_calibration_directory(directory: &Path) -> io::Result<PathBuf> {
     let calibrated_path = fs::canonicalize(directory).map_err(|error| {
         io::Error::new(error.kind(), format!("stage=canonicalize-calibration-directory: {error}"))
     })?;
@@ -946,17 +1228,86 @@ where
             ),
         ));
     }
+    Ok(calibrated_path)
+}
 
+fn calibration_shape(options: CalibrationOptions) -> (usize, Vec<usize>) {
     let logical_cpus = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1);
     let candidates = candidate_worker_counts(logical_cpus, options.max_workers);
+    (logical_cpus, candidates)
+}
+
+fn calibrate_directory_with_executor_factory<F>(
+    directory: &Path,
+    options: CalibrationOptions,
+    make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
+    let calibrated_path = canonical_calibration_directory(directory)?;
+    let (logical_cpus, candidates) = calibration_shape(options);
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
     let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
+    let dataset = CalibrationDataset::create_synthetic(
+        &calibrated_path,
+        group_count,
+        options.file_size,
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("stage=create-calibration-dataset: {error}")))?;
 
-    let dataset = CalibrationDataset::create(&calibrated_path, group_count, options.file_size)
-        .map_err(|error| io::Error::new(error.kind(), format!("stage=create-calibration-dataset: {error}")))?;
+    run_calibration_with_dataset(
+        &calibrated_path,
+        logical_cpus,
+        candidates,
+        options,
+        dataset,
+        make_executor,
+    )
+}
 
+fn calibrate_directory_readonly_with_executor_factory<F>(
+    directory: &Path,
+    options: CalibrationOptions,
+    make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
+    let calibrated_path = canonical_calibration_directory(directory)?;
+    let (logical_cpus, candidates) = calibration_shape(options);
+    let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
+    let group_count = MIN_GROUPS.max(largest_candidate.saturating_mul(2));
+    let dataset = CalibrationDataset::from_existing_files(
+        &calibrated_path,
+        group_count,
+        options.file_size,
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("stage=create-readonly-calibration-dataset: {error}")))?;
+
+    run_calibration_with_dataset(
+        &calibrated_path,
+        logical_cpus,
+        candidates,
+        options,
+        dataset,
+        make_executor,
+    )
+}
+
+fn run_calibration_with_dataset<F>(
+    calibrated_path: &Path,
+    logical_cpus: usize,
+    candidates: Vec<usize>,
+    options: CalibrationOptions,
+    dataset: CalibrationDataset,
+    mut make_executor: F,
+) -> io::Result<CalibrationReport>
+where
+    F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
+{
     let mut executors = HashMap::with_capacity(candidates.len());
     for &workers in &candidates {
         let executor = make_executor(workers).map_err(|error| {
@@ -975,11 +1326,11 @@ where
         .verify_result(&mut warm)
         .map_err(|error| io::Error::new(error.kind(), format!("stage=warmup-exact-verifier: {error}")))?;
 
-    let storage_key = storage_key_for_path(&calibrated_path).map_err(|error| {
+    let storage_key = storage_key_for_path(calibrated_path).map_err(|error| {
         io::Error::new(error.kind(), format!("stage=identify-calibration-storage: {error}"))
     })?;
     let initial_report = run_calibration_pass(
-        &calibrated_path,
+        calibrated_path,
         &storage_key,
         logical_cpus,
         &candidates,
@@ -998,7 +1349,7 @@ where
     rescue_options.pair_rounds = rescue_pair_rounds(options.pair_rounds);
 
     let mut rescue_report = run_calibration_pass(
-        &calibrated_path,
+        calibrated_path,
         &storage_key,
         logical_cpus,
         &candidates,
@@ -1010,6 +1361,7 @@ where
     rescue_report.rescue_attempted = true;
     rescue_report.initial_target_sample_time = options.target_sample_time;
     rescue_report.initial_stability = Some(initial_report.profile.stability);
+    rescue_report.initial_pairwise_blocked_promotion = initial_report.pairwise_blocked_promotion;
 
     Ok(rescue_report)
 }
@@ -1070,7 +1422,9 @@ fn run_calibration_pass(
         (aggregate_selected_workers, Vec::new())
     } else {
         paired_confirmation(
+            aggregate_selected_workers,
             &paired_workers,
+            &measurements,
             options.pair_rounds,
             options.target_sample_time,
             options.tie_margin,
@@ -1087,20 +1441,30 @@ fn run_calibration_pass(
     let selected_slowdown_vs_fastest = slowdown_ratio(selected.median, fastest.median);
     let decision_relative_mad = decision_relative_mad(&measurements, &paired_workers, workers);
     let global_relative_mad = global_relative_mad(&measurements);
+    let pairwise_blocked_promotion = pairwise
+        .iter()
+        .any(|comparison| comparison.promotion_blocked_by_aggregate);
     let stability = classify_stability(
         initial_selected_workers,
         aggregate_selected_workers,
         workers,
         selected.relative_mad,
         decision_relative_mad,
+        global_relative_mad,
         &pairwise,
         options.tie_margin,
+        pairwise_blocked_promotion,
     );
 
     let calibrated_at_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let pairwise_overrode_aggregate = pairwise_overrode_aggregate(
+        aggregate_selected_workers,
+        workers,
+        &pairwise,
+    );
 
     Ok(CalibrationReport {
         profile: VerifierTuningProfile {
@@ -1122,6 +1486,7 @@ fn run_calibration_pass(
         pairwise,
         groups: dataset.group_count,
         bytes_per_run: dataset.bytes_per_run,
+        dataset_fingerprint: dataset.dataset_fingerprint,
         initial_rounds: options.rounds,
         recheck_rounds: options.recheck_rounds,
         pair_rounds: options.pair_rounds,
@@ -1132,8 +1497,19 @@ fn run_calibration_pass(
         initial_selected_workers,
         aggregate_selected_workers,
         rechecked_workers,
+        pairwise_overrode_aggregate,
+        pairwise_blocked_promotion,
+        initial_pairwise_blocked_promotion: false,
         paired_workers,
     })
+}
+
+fn pairwise_overrode_aggregate(
+    aggregate_selected_workers: usize,
+    final_selected_workers: usize,
+    pairwise: &[PairwiseMeasurement],
+) -> bool {
+    !pairwise.is_empty() && aggregate_selected_workers != final_selected_workers
 }
 
 fn rescue_target_sample_time(initial: Duration) -> Duration {
@@ -1300,7 +1676,9 @@ fn close_candidates(measurements: &[TuningMeasurement], margin: f64) -> Vec<usiz
 }
 
 fn paired_confirmation(
+    aggregate_selected_workers: usize,
     candidates: &[usize],
+    aggregate_measurements: &[TuningMeasurement],
     pair_rounds: usize,
     target_sample_time: Duration,
     tie_margin: f64,
@@ -1311,17 +1689,29 @@ fn paired_confirmation(
     ordered.sort_unstable();
     ordered.dedup();
 
-    let Some(&first) = ordered.first() else {
+    if ordered.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "paired confirmation requires at least one candidate",
         ));
-    };
+    }
+    if !ordered.contains(&aggregate_selected_workers) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paired confirmation candidates must contain the aggregate selection",
+        ));
+    }
 
-    let mut incumbent = first;
+    // Pairwise confirmation starts from the aggregate decision rather than the
+    // smallest recheck candidate. This prevents an out-of-margin candidate from
+    // becoming the implicit winner merely because it happened to sort first.
+    let mut incumbent = aggregate_selected_workers;
     let mut comparisons = Vec::with_capacity(ordered.len().saturating_sub(1));
 
-    for challenger in ordered.into_iter().skip(1) {
+    for challenger in ordered
+        .into_iter()
+        .filter(|workers| *workers != aggregate_selected_workers)
+    {
         let mut ratios = Vec::with_capacity(pair_rounds);
 
         for pair_index in 0..pair_rounds {
@@ -1373,9 +1763,18 @@ fn paired_confirmation(
             .iter()
             .filter(|ratio| **ratio < decisive_threshold)
             .count();
-        let required_wins = pair_rounds / 2 + 1;
-        let promoted = median_ratio < decisive_threshold
-            && decisive_challenger_wins >= required_wins;
+        let challenger_slowdown_vs_fastest = aggregate_measurements
+            .iter()
+            .find(|measurement| measurement.workers == challenger)
+            .map(|measurement| slowdown_ratio(measurement.median, fastest_measurement(aggregate_measurements).median))
+            .unwrap_or(f64::INFINITY);
+        let (promoted, promotion_blocked_by_aggregate) = pairwise_promotion_decision(
+            median_ratio,
+            decisive_challenger_wins,
+            pair_rounds,
+            challenger_slowdown_vs_fastest,
+            tie_margin,
+        );
 
         comparisons.push(PairwiseMeasurement {
             incumbent_workers: incumbent,
@@ -1383,6 +1782,8 @@ fn paired_confirmation(
             pairs: pair_rounds,
             median_ratio,
             decisive_challenger_wins,
+            challenger_slowdown_vs_fastest,
+            promotion_blocked_by_aggregate,
             promoted,
         });
 
@@ -1394,15 +1795,42 @@ fn paired_confirmation(
     Ok((incumbent, comparisons))
 }
 
+
+fn pairwise_promotion_decision(
+    median_ratio: f64,
+    decisive_challenger_wins: usize,
+    pair_rounds: usize,
+    challenger_slowdown_vs_fastest: f64,
+    tie_margin: f64,
+) -> (bool, bool) {
+    let decisive_threshold = 1.0 - tie_margin;
+    let required_wins = pair_rounds / 2 + 1;
+    let pairwise_would_promote = median_ratio < decisive_threshold
+        && decisive_challenger_wins >= required_wins;
+    let inside_aggregate_margin = challenger_slowdown_vs_fastest <= tie_margin + f64::EPSILON;
+    let promotion_blocked_by_aggregate = pairwise_would_promote && !inside_aggregate_margin;
+    let promoted = pairwise_would_promote && inside_aggregate_margin;
+    (promoted, promotion_blocked_by_aggregate)
+}
+
 fn classify_stability(
     initial_selected_workers: usize,
     aggregate_selected_workers: usize,
     final_selected_workers: usize,
     selected_relative_mad: f64,
     decision_relative_mad: f64,
+    global_relative_mad: f64,
     pairwise: &[PairwiseMeasurement],
     tie_margin: f64,
+    pairwise_blocked_promotion: bool,
 ) -> CalibrationStability {
+    // A pairwise result that wants to promote a candidate outside the aggregate
+    // tie margin means the environment changed materially during the pass. Treat
+    // the pass as invalid so the caller performs the longer rescue measurement.
+    if pairwise_blocked_promotion {
+        return CalibrationStability::Invalid;
+    }
+
     // Only the selected candidate and the candidates that actually participated
     // in the final decision can invalidate a profile. Slow/noisy candidates that
     // were already eliminated remain useful diagnostics, but are not a reason to
@@ -1420,7 +1848,7 @@ fn classify_stability(
         (comparison.median_ratio - boundary).abs() <= 0.015
     });
 
-    if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
+    let decision_stability = if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
         || decision_relative_mad > LOW_STABILITY_RELATIVE_MAD
     {
         CalibrationStability::Low
@@ -1433,6 +1861,18 @@ fn classify_stability(
         CalibrationStability::Medium
     } else {
         CalibrationStability::High
+    };
+
+    // The selected/finalist MADs remain authoritative for validity, but a
+    // system-wide noisy pass must not manufacture a High-confidence profile
+    // from one locally quiet candidate. Cap High at Medium when the median MAD
+    // across all candidates exceeds the invalid-MAD diagnostic threshold.
+    if decision_stability == CalibrationStability::High
+        && global_relative_mad > INVALID_STABILITY_RELATIVE_MAD
+    {
+        CalibrationStability::Medium
+    } else {
+        decision_stability
     }
 }
 
@@ -1608,17 +2048,10 @@ pub(crate) fn required_calibration_free_space(options: CalibrationOptions) -> u6
     dataset_bytes.saturating_add(CALIBRATION_SAFETY_MARGIN_BYTES)
 }
 
-pub(crate) fn fallback_workers_for_storage(class: StorageClass) -> usize {
-    let logical_cpus = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .max(1);
-    match class {
-        StorageClass::Ssd => logical_cpus.clamp(1, 4),
-        StorageClass::Hdd | StorageClass::Removable | StorageClass::Unknown => {
-            SAFE_FALLBACK_WORKERS
-        }
-    }
+pub(crate) fn fallback_workers_for_storage(_class: StorageClass) -> usize {
+    // Production fallback is deliberately storage-agnostic. Any value above one
+    // must come from a persisted calibration profile, never from a heuristic.
+    SAFE_FALLBACK_WORKERS
 }
 
 pub(crate) fn storage_snapshot_for_path(path: &Path) -> Option<StorageSnapshot> {
@@ -1770,23 +2203,24 @@ pub(crate) fn cleanup_abandoned_calibration_dirs(parent: &Path) -> io::Result<us
 }
 
 struct CalibrationDataset {
-    root: PathBuf,
+    cleanup_root: Option<PathBuf>,
     result: DuplicateScanResult,
     group_count: usize,
     bytes_per_run: u64,
+    dataset_fingerprint: Option<u64>,
 }
 
 impl CalibrationDataset {
-    fn create(parent: &Path, group_count: usize, file_size: u64) -> io::Result<Self> {
+    fn create_synthetic(parent: &Path, group_count: usize, file_size: u64) -> io::Result<Self> {
         let root = create_unique_calibration_dir(parent)?;
-        let creation_result = Self::populate(root.clone(), group_count, file_size);
+        let creation_result = Self::populate_synthetic(root.clone(), group_count, file_size);
         if creation_result.is_err() {
             let _ = fs::remove_dir_all(&root);
         }
         creation_result
     }
 
-    fn populate(root: PathBuf, group_count: usize, file_size: u64) -> io::Result<Self> {
+    fn populate_synthetic(root: PathBuf, group_count: usize, file_size: u64) -> io::Result<Self> {
         let mut groups = Vec::with_capacity(group_count);
 
         for group_index in 0..group_count {
@@ -1810,22 +2244,172 @@ impl CalibrationDataset {
             .saturating_mul(2);
 
         Ok(Self {
-            root,
+            cleanup_root: Some(root),
             result: DuplicateScanResult {
-                engine: "tuning",
+                engine: "tuning-synthetic",
                 groups,
                 elapsed: Duration::ZERO,
             },
             group_count,
             bytes_per_run,
+            dataset_fingerprint: None,
+        })
+    }
+
+    fn from_existing_files(root: &Path, group_count: usize, target_file_size: u64) -> io::Result<Self> {
+        let target_storage = storage_key_for_path(root)?;
+        let max_file_size = target_file_size
+            .saturating_mul(READONLY_MAX_FILE_MULTIPLIER)
+            .max(READONLY_MIN_FILE_SIZE);
+        let mut candidates = collect_readonly_files(root, &target_storage, max_file_size)?;
+
+        candidates.sort_by(|(left_path, left_size), (right_path, right_size)| {
+            readonly_size_distance(*left_size, target_file_size)
+                .cmp(&readonly_size_distance(*right_size, target_file_size))
+                .then_with(|| left_path.cmp(right_path))
+        });
+
+        if candidates.len() < group_count {
+            return Err(io::Error::other(format!(
+                "readonly calibration needs at least {group_count} unique regular files between {} and {} bytes on the same storage; found {}",
+                READONLY_MIN_FILE_SIZE,
+                max_file_size,
+                candidates.len(),
+            )));
+        }
+
+        candidates.truncate(group_count);
+        let dataset_fingerprint = Some(readonly_dataset_fingerprint(&candidates));
+        let mut groups = Vec::with_capacity(group_count);
+        let mut bytes_per_run = 0_u64;
+
+        for (path, size) in candidates {
+            // Using the same existing path twice is intentional. The exact verifier
+            // opens two independent read handles and performs its normal byte loop,
+            // while the calibration remains strictly read-only and does not require
+            // the user's storage to contain real duplicate pairs.
+            let left = DuplicateFile::from_path(path.clone())?;
+            let right = DuplicateFile::from_path(path)?;
+            groups.push(DuplicateGroup::new(vec![left, right]));
+            bytes_per_run = bytes_per_run.saturating_add(size.saturating_mul(2));
+        }
+
+        Ok(Self {
+            cleanup_root: None,
+            result: DuplicateScanResult {
+                engine: "tuning-readonly",
+                groups,
+                elapsed: Duration::ZERO,
+            },
+            group_count,
+            bytes_per_run,
+            dataset_fingerprint,
         })
     }
 }
 
 impl Drop for CalibrationDataset {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if let Some(root) = self.cleanup_root.as_ref() {
+            let _ = fs::remove_dir_all(root);
+        }
     }
+}
+
+fn readonly_size_distance(size: u64, target_file_size: u64) -> u64 {
+    if size >= target_file_size {
+        size.saturating_sub(target_file_size)
+    } else {
+        target_file_size
+            .saturating_sub(size)
+            .saturating_add(target_file_size)
+    }
+}
+
+fn readonly_dataset_fingerprint(files: &[(PathBuf, u64)]) -> u64 {
+    // FNV-1a is intentionally simple here: this is a diagnostic identity, not a
+    // cryptographic integrity check. It remains stable for the same selected
+    // paths and sizes across repeated runs of the same dataset.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for (path, size) in files {
+        for byte in path.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+        for byte in size.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xfe;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn collect_readonly_files(
+    root: &Path,
+    target_storage: &str,
+    max_file_size: u64,
+) -> io::Result<Vec<(PathBuf, u64)>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            if files.len() >= READONLY_MAX_DISCOVERED_FILES {
+                return Ok(files);
+            }
+
+            let path = entry.path();
+            if is_internal_tuning_path(&path) {
+                continue;
+            }
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let size = metadata.len();
+            if size < READONLY_MIN_FILE_SIZE || size > max_file_size {
+                continue;
+            }
+            let Ok(storage_key) = storage_key_for_path(&path) else {
+                continue;
+            };
+            if storage_key != target_storage {
+                continue;
+            }
+            files.push((path, size));
+        }
+    }
+
+    Ok(files)
 }
 
 fn create_unique_calibration_dir(parent: &Path) -> io::Result<PathBuf> {
@@ -2076,6 +2660,7 @@ mod tests {
             pairwise: Vec::new(),
             groups: 16,
             bytes_per_run: 128 * 1024 * 1024,
+            dataset_fingerprint: None,
             initial_rounds: 5,
             recheck_rounds: 4,
             pair_rounds: 5,
@@ -2087,6 +2672,9 @@ mod tests {
             aggregate_selected_workers: 6,
             rechecked_workers: vec![4, 6, 8],
             paired_workers: vec![4, 6, 8],
+            pairwise_overrode_aggregate: false,
+            pairwise_blocked_promotion: false,
+            initial_pairwise_blocked_promotion: false,
         }
     }
 
@@ -2154,6 +2742,18 @@ mod tests {
     }
 
     #[test]
+    fn high_global_noise_caps_high_confidence_at_medium() {
+        assert_eq!(
+            classify_stability(4, 4, 4, 0.02, 0.03, 0.24, &[], 0.05, false),
+            CalibrationStability::Medium
+        );
+        assert_eq!(
+            classify_stability(4, 4, 4, 0.02, 0.03, 0.05, &[], 0.05, false),
+            CalibrationStability::High
+        );
+    }
+
+    #[test]
     fn noisy_eliminated_candidates_do_not_invalidate_a_stable_decision() {
         let measurements = vec![
             measurement(1, 100, 0.25),
@@ -2168,7 +2768,7 @@ mod tests {
         assert!(global_relative_mad(&measurements) > 0.12);
         assert!(decision_mad < 0.05);
         assert_ne!(
-            classify_stability(6, 4, 4, 0.039, decision_mad, &[], 0.05),
+            classify_stability(6, 4, 4, 0.039, decision_mad, global_relative_mad(&measurements), &[], 0.05, false),
             CalibrationStability::Invalid
         );
     }
@@ -2176,7 +2776,7 @@ mod tests {
     #[test]
     fn unstable_decision_set_is_still_invalid() {
         assert_eq!(
-            classify_stability(4, 4, 8, 0.03, 0.19, &[], 0.05),
+            classify_stability(4, 4, 8, 0.03, 0.19, 0.05, &[], 0.05, false),
             CalibrationStability::Invalid
         );
     }
@@ -2217,6 +2817,38 @@ mod tests {
                 .expect("match"),
             Some(3)
         );
+    }
+
+    #[test]
+    fn format_v6_profiles_are_ignored_after_confidence_policy_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("verifier-tuning.json");
+        let legacy = json!({
+            "version": 6,
+            "profiles": [{
+                "storage_key": "legacy-storage",
+                "calibrated_path": dir.path().to_string_lossy(),
+                "workers": 6,
+                "logical_cpus": 8,
+                "median_mib_per_second": 2483.9,
+                "selected_samples": 9,
+                "selected_verification_runs": 187,
+                "relative_mad": 0.0378,
+                "decision_relative_mad": 0.0378,
+                "global_relative_mad": 0.2439,
+                "selected_slowdown_vs_fastest": 0.0,
+                "stability": "high",
+                "calibrated_at_unix_seconds": 42
+            }]
+        });
+        fs::write(
+            &settings,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy profile"),
+        )
+        .expect("write legacy profile");
+
+        let loaded = VerifierTuningStore::load(&settings).expect("load legacy store");
+        assert!(loaded.profiles().is_empty());
     }
 
     #[test]
@@ -2464,6 +3096,144 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_invalid_calibration_returns_report_without_overwriting_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            4,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("save good profile");
+
+        let invalid_profile = test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Invalid,
+        );
+
+        let (report, persistence) = calibrate_and_maybe_store_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_, _| Ok(test_report(invalid_profile)),
+        )
+        .expect("diagnostic path must return the invalid report");
+
+        assert_eq!(persistence, CalibrationPersistence::InvalidNotStored);
+        assert_eq!(report.profile.stability, CalibrationStability::Invalid);
+        assert_eq!(report.profile.workers, 8);
+
+        let loaded = VerifierTuningStore::load(&store_path).expect("reload good profile");
+        let saved = loaded
+            .profile_for_storage_key(&storage_key)
+            .expect("good profile must remain");
+        assert_eq!(saved.workers, 4);
+        assert_eq!(saved.stability, CalibrationStability::High);
+    }
+
+    #[test]
+    fn diagnostic_persistence_reports_retained_existing_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            4,
+            CalibrationStability::Low,
+        ));
+        store.save(&store_path).expect("save existing low profile");
+
+        let replacement = test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Low,
+        );
+
+        let (report, persistence) = calibrate_and_maybe_store_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_, _| Ok(test_report(replacement)),
+        )
+        .expect("diagnostic persistence");
+
+        assert_eq!(report.profile.workers, 8);
+        assert_eq!(
+            persistence,
+            CalibrationPersistence::RetainedExisting {
+                workers: 4,
+                stability: CalibrationStability::Low,
+            }
+        );
+
+        let loaded = VerifierTuningStore::load(&store_path).expect("reload profile");
+        let saved = loaded
+            .profile_for_storage_key(&storage_key)
+            .expect("existing profile must remain");
+        assert_eq!(saved.workers, 4);
+        assert_eq!(saved.stability, CalibrationStability::Low);
+    }
+
+    #[test]
+    fn pairwise_override_is_reported_only_when_final_selection_changes() {
+        let comparison = PairwiseMeasurement {
+            incumbent_workers: 4,
+            challenger_workers: 8,
+            pairs: 5,
+            median_ratio: 0.80,
+            decisive_challenger_wins: 4,
+            challenger_slowdown_vs_fastest: 0.02,
+            promotion_blocked_by_aggregate: false,
+            promoted: true,
+        };
+
+        assert!(pairwise_overrode_aggregate(4, 8, &[comparison.clone()]));
+        assert!(!pairwise_overrode_aggregate(4, 4, &[comparison]));
+        assert!(!pairwise_overrode_aggregate(4, 8, &[]));
+    }
+
+    #[test]
+    fn pairwise_promotion_outside_aggregate_tie_margin_is_blocked() {
+        let (promoted, blocked) = pairwise_promotion_decision(
+            0.947,
+            3,
+            5,
+            0.0837,
+            0.05,
+        );
+        assert!(!promoted);
+        assert!(blocked);
+
+        let (promoted, blocked) = pairwise_promotion_decision(
+            0.936,
+            3,
+            5,
+            0.031,
+            0.05,
+        );
+        assert!(promoted);
+        assert!(!blocked);
+    }
+
+    #[test]
+    fn blocked_pairwise_promotion_invalidates_pass_for_rescue() {
+        assert_eq!(
+            classify_stability(2, 2, 4, 0.01, 0.02, 0.05, &[], 0.05, true),
+            CalibrationStability::Invalid
+        );
+    }
+
+    #[test]
     fn same_volume_with_different_path_reuses_profile() {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = dir.path().join("first");
@@ -2501,10 +3271,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
 
         {
-            let dataset = CalibrationDataset::create(dir.path(), 2, 64 * 1024)
+            let dataset = CalibrationDataset::create_synthetic(dir.path(), 2, 64 * 1024)
                 .expect("create calibration dataset");
-            assert!(dataset.root.exists());
-            assert!(dataset.root.starts_with(dir.path()));
+            let root = dataset
+                .cleanup_root
+                .as_ref()
+                .expect("synthetic calibration dataset must own a cleanup root");
+            assert!(root.exists());
+            assert!(root.starts_with(dir.path()));
         }
 
         let leftovers = fs::read_dir(dir.path())
@@ -2712,7 +3486,7 @@ mod tests {
         )
         .expect("resolve");
 
-        assert!((1..=4).contains(&resolution.workers()));
+        assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
         assert!(matches!(
             resolution,
             VerifierTuningResolution::Fallback {
@@ -2791,8 +3565,8 @@ mod tests {
     }
 
     #[test]
-    fn ssd_heuristic_is_conservative_and_other_storage_stays_sequential() {
-        assert!((1..=4).contains(&fallback_workers_for_storage(StorageClass::Ssd)));
+    fn production_fallback_is_one_worker_for_every_storage_class() {
+        assert_eq!(fallback_workers_for_storage(StorageClass::Ssd), SAFE_FALLBACK_WORKERS);
         assert_eq!(fallback_workers_for_storage(StorageClass::Hdd), 1);
         assert_eq!(fallback_workers_for_storage(StorageClass::Removable), 1);
         assert_eq!(fallback_workers_for_storage(StorageClass::Unknown), 1);
@@ -2812,6 +3586,205 @@ mod tests {
         let unrelated = PathBuf::from("root").join(".krokiet-cache").join("group.bin");
         assert!(is_internal_tuning_path(&internal));
         assert!(!is_internal_tuning_path(&unrelated));
+    }
+
+    #[test]
+    fn scan_resolution_reuses_profile_without_any_calibration_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            6,
+            CalibrationStability::High,
+        ));
+        store.save(&store_path).expect("save");
+
+        let resolution =
+            resolve_scan_tuning_for_path(dir.path(), &store_path).expect("scan resolution");
+
+        assert_eq!(resolution.workers(), 6);
+        assert!(matches!(
+            resolution,
+            VerifierScanResolution::ReusedProfile {
+                storage_key: key,
+                workers: 6,
+                stability: CalibrationStability::High,
+            } if key == storage_key
+        ));
+    }
+
+    #[test]
+    fn scan_resolution_without_profile_falls_back_and_never_creates_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("missing-verifier-tuning.json");
+
+        let resolution =
+            resolve_scan_tuning_for_path(dir.path(), &store_path).expect("scan resolution");
+
+        assert_eq!(resolution.workers(), SAFE_FALLBACK_WORKERS);
+        assert!(matches!(
+            resolution,
+            VerifierScanResolution::Fallback {
+                reason: VerifierTuningFallbackReason::NoStoredProfile,
+                ..
+            }
+        ));
+        assert!(
+            !store_path.exists(),
+            "normal scan resolution must never create or persist a tuning store"
+        );
+    }
+
+    #[test]
+    fn readonly_dataset_uses_existing_files_without_modifying_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first.bin");
+        let second = dir.path().join("second.bin");
+        let first_bytes = vec![0x31; READONLY_MIN_FILE_SIZE as usize];
+        let second_bytes = vec![0x52; READONLY_MIN_FILE_SIZE as usize + 4096];
+        fs::write(&first, &first_bytes).expect("write first");
+        fs::write(&second, &second_bytes).expect("write second");
+
+        let before = fs::read_dir(dir.path()).expect("read before").count();
+        {
+            let dataset = CalibrationDataset::from_existing_files(
+                dir.path(),
+                2,
+                READONLY_MIN_FILE_SIZE,
+            )
+            .expect("readonly dataset");
+            assert_eq!(dataset.group_count, 2);
+            assert_eq!(dataset.result.groups.len(), 2);
+            assert!(dataset.cleanup_root.is_none());
+            assert!(dataset.result.groups.iter().all(|group| {
+                group.files.len() == 2 && group.files[0].path == group.files[1].path
+            }));
+        }
+
+        let after = fs::read_dir(dir.path()).expect("read after").count();
+        assert_eq!(before, after, "readonly calibration must not create files");
+        assert_eq!(fs::read(&first).expect("read first"), first_bytes);
+        assert_eq!(fs::read(&second).expect("read second"), second_bytes);
+    }
+
+    #[test]
+    fn readonly_dataset_tie_break_and_fingerprint_are_deterministic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("a.bin");
+        let second = dir.path().join("z.bin");
+        fs::write(&second, vec![0x52; READONLY_MIN_FILE_SIZE as usize]).expect("write second");
+        fs::write(&first, vec![0x31; READONLY_MIN_FILE_SIZE as usize]).expect("write first");
+
+        let first_dataset = CalibrationDataset::from_existing_files(
+            dir.path(),
+            1,
+            READONLY_MIN_FILE_SIZE,
+        )
+        .expect("first readonly dataset");
+        let first_fingerprint = first_dataset
+            .dataset_fingerprint
+            .expect("readonly fingerprint");
+        assert_eq!(first_dataset.result.groups[0].files[0].path, first);
+        drop(first_dataset);
+
+        let second_dataset = CalibrationDataset::from_existing_files(
+            dir.path(),
+            1,
+            READONLY_MIN_FILE_SIZE,
+        )
+        .expect("second readonly dataset");
+        assert_eq!(
+            second_dataset.dataset_fingerprint,
+            Some(first_fingerprint),
+            "same readonly selection must keep the same fingerprint"
+        );
+        assert_eq!(second_dataset.result.groups[0].files[0].path, first);
+    }
+
+    #[test]
+    fn readonly_dataset_rejects_insufficient_existing_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("only.bin"),
+            vec![0x7A; READONLY_MIN_FILE_SIZE as usize],
+        )
+        .expect("write only");
+
+        let error = match CalibrationDataset::from_existing_files(
+            dir.path(),
+            2,
+            READONLY_MIN_FILE_SIZE,
+        ) {
+            Ok(_) => panic!("two unique files are required"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("at least 2 unique regular files"));
+    }
+
+    #[test]
+    fn calibration_mode_labels_are_stable() {
+        assert_eq!(CalibrationMode::Synthetic.as_str(), "synthetic");
+        assert_eq!(CalibrationMode::ReadOnly.as_str(), "readonly");
+        assert_eq!(CalibrationMode::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn readonly_calibration_runs_verifier_and_persists_profile_without_target_writes() {
+        let target = tempfile::tempdir().expect("target tempdir");
+        let config = tempfile::tempdir().expect("config tempdir");
+        for index in 0..MIN_GROUPS {
+            fs::write(
+                target.path().join(format!("readonly-{index:02}.bin")),
+                vec![index as u8; READONLY_MIN_FILE_SIZE as usize],
+            )
+            .expect("write readonly source");
+        }
+
+        let mut before = fs::read_dir(target.path())
+            .expect("read before")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        before.sort();
+
+        let options = CalibrationOptions {
+            file_size: READONLY_MIN_FILE_SIZE,
+            rounds: 1,
+            recheck_rounds: 0,
+            pair_rounds: 0,
+            target_sample_time: Duration::from_millis(1),
+            max_workers: 1,
+            tie_margin: 0.05,
+            recheck_margin: 0.10,
+        };
+        let store_path = config.path().join("readonly-tuning.json");
+        let run = calibrate_and_store_mode(
+            target.path(),
+            &store_path,
+            options,
+            CalibrationMode::ReadOnly,
+        )
+        .expect("readonly calibration");
+
+        assert_eq!(run.mode, CalibrationMode::ReadOnly);
+        assert_eq!(run.report.profile.workers, 1);
+        assert_eq!(run.report.groups, MIN_GROUPS);
+        assert!(store_path.exists());
+
+        let mut after = fs::read_dir(target.path())
+            .expect("read after")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        after.sort();
+        assert_eq!(before, after, "readonly calibration created or removed target files");
+        assert!(
+            fs::read_dir(target.path())
+                .expect("read target")
+                .all(|entry| !is_internal_tuning_path(&entry.expect("entry").path()))
+        );
     }
 
     #[cfg(feature = "fast_duplicates")]
