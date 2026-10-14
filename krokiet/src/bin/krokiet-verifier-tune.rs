@@ -30,8 +30,8 @@ mod tuning;
 
 #[cfg(not(test))]
 use tuning::{
-    CalibrationMode, CalibrationOptions, CalibrationStability, calibrate_and_store_mode,
-    storage_key_for_path,
+    CalibrationMode, CalibrationOptions, CalibrationPersistence, CalibrationStability,
+    calibrate_and_store_mode, storage_key_for_path,
 };
 
 #[cfg(not(test))]
@@ -69,7 +69,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 3.4.1");
+    println!(" KROKIET - VERIFIER TUNING 3.4.2");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo solicitado : {}", parsed.mode.as_str());
@@ -90,6 +90,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         options,
         parsed.mode,
     )?;
+    let persistence = run.persistence.clone();
     let report = run.report;
 
     println!("Modo utilizado  : {}", run.mode.as_str());
@@ -191,6 +192,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.aggregate_selected_workers
     );
     println!("Seleccion       : {} worker(s)", report.profile.workers);
+    if report.pairwise_overrode_aggregate {
+        println!(
+            "Aviso decision  : la confirmacion pareada cambio {} -> {} worker(s)",
+            report.aggregate_selected_workers, report.profile.workers
+        );
+        println!(
+            "Diagnostico     : comparar ejecuciones antes de promover este resultado"
+        );
+    }
     println!(
         "Rendimiento     : {:.1} MiB/s",
         report.profile.median_mib_per_second
@@ -217,15 +227,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let invalid = report.profile.stability == CalibrationStability::Invalid;
-    if invalid {
-        println!("Perfil          : NO GUARDADO");
-        println!(
-            "Motivo          : MAD seleccionado o MAD decision supera el limite de {:.0}%",
-            12.0
-        );
-    } else {
-        println!("Perfil          : GUARDADO");
-        println!("Archivo         : {}", store_path.display());
+    match persistence {
+        CalibrationPersistence::InvalidNotStored => {
+            println!("Perfil          : NO GUARDADO");
+            println!(
+                "Motivo          : MAD seleccionado o MAD decision supera el limite de {:.0}%",
+                12.0
+            );
+        }
+        CalibrationPersistence::Stored => {
+            println!("Perfil          : GUARDADO");
+            println!("Perfil activo   : {} worker(s)", report.profile.workers);
+            println!("Archivo         : {}", store_path.display());
+        }
+        CalibrationPersistence::RetainedExisting { workers, stability } => {
+            println!("Perfil          : ANTERIOR CONSERVADO");
+            println!(
+                "Perfil medido   : {} worker(s), estabilidad {}",
+                report.profile.workers,
+                report.profile.stability.label_es()
+            );
+            println!(
+                "Perfil activo   : {} worker(s), estabilidad {}",
+                workers,
+                stability.label_es()
+            );
+            println!(
+                "Motivo          : la nueva calibracion no mejora la confianza del perfil existente"
+            );
+            println!("Archivo         : {}", store_path.display());
+        }
     }
 
     println!("============================================================");

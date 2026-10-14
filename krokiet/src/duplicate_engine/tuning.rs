@@ -65,10 +65,27 @@ impl CalibrationMode {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CalibrationPersistence {
+    /// The new profile was written because there was no usable profile yet or
+    /// because the new calibration had enough confidence to replace it.
+    Stored,
+    /// The calibration itself was valid, but an existing profile with equal or
+    /// better confidence remains authoritative.
+    RetainedExisting {
+        workers: usize,
+        stability: CalibrationStability,
+    },
+    /// The calibration report is useful for diagnostics but is too unstable to
+    /// be persisted.
+    InvalidNotStored,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CalibrationRun {
     pub mode: CalibrationMode,
     pub report: CalibrationReport,
+    pub persistence: CalibrationPersistence,
 }
 
 /// Controls the one-off calibration workload.
@@ -378,6 +395,10 @@ pub(crate) struct CalibrationReport {
     pub aggregate_selected_workers: usize,
     pub rechecked_workers: Vec<usize>,
     pub paired_workers: Vec<usize>,
+    /// True when the fresh paired confirmation selected a different worker count
+    /// from the aggregate measurements. This is diagnostic only in 3.4.2: it
+    /// does not change the worker choice or stability thresholds.
+    pub pairwise_overrode_aggregate: bool,
 }
 
 /// Small persistent store. Krokiet can keep this alongside its normal settings.
@@ -865,44 +886,60 @@ pub(crate) fn calibrate_and_store_mode(
 
     match mode {
         CalibrationMode::ReadOnly => {
-            let report = calibrate_and_maybe_store_with(
+            let (report, persistence) = calibrate_and_maybe_store_with(
                 &canonical,
                 store_path,
                 options,
                 calibrate_directory_readonly,
             )?;
-            Ok(CalibrationRun { mode: CalibrationMode::ReadOnly, report })
+            Ok(CalibrationRun {
+                mode: CalibrationMode::ReadOnly,
+                report,
+                persistence,
+            })
         }
         CalibrationMode::Synthetic => {
             let synthetic = synthetic_calibration_directory(&canonical, options)?
                 .ok_or_else(|| io::Error::other(
                     "synthetic calibration unavailable: no writable same-storage directory or insufficient free space",
                 ))?;
-            let report = calibrate_and_maybe_store_with(
+            let (report, persistence) = calibrate_and_maybe_store_with(
                 &synthetic,
                 store_path,
                 options,
                 calibrate_directory,
             )?;
-            Ok(CalibrationRun { mode: CalibrationMode::Synthetic, report })
+            Ok(CalibrationRun {
+                mode: CalibrationMode::Synthetic,
+                report,
+                persistence,
+            })
         }
         CalibrationMode::Auto => {
             if let Some(synthetic) = synthetic_calibration_directory(&canonical, options)? {
-                let report = calibrate_and_maybe_store_with(
+                let (report, persistence) = calibrate_and_maybe_store_with(
                     &synthetic,
                     store_path,
                     options,
                     calibrate_directory,
                 )?;
-                Ok(CalibrationRun { mode: CalibrationMode::Synthetic, report })
+                Ok(CalibrationRun {
+                    mode: CalibrationMode::Synthetic,
+                    report,
+                    persistence,
+                })
             } else {
-                let report = calibrate_and_maybe_store_with(
+                let (report, persistence) = calibrate_and_maybe_store_with(
                     &canonical,
                     store_path,
                     options,
                     calibrate_directory_readonly,
                 )?;
-                Ok(CalibrationRun { mode: CalibrationMode::ReadOnly, report })
+                Ok(CalibrationRun {
+                    mode: CalibrationMode::ReadOnly,
+                    report,
+                    persistence,
+                })
             }
         }
     }
@@ -960,20 +997,33 @@ fn calibrate_and_maybe_store_with<F>(
     store_path: &Path,
     options: CalibrationOptions,
     calibrate: F,
-) -> io::Result<CalibrationReport>
+) -> io::Result<(CalibrationReport, CalibrationPersistence)>
 where
     F: FnOnce(&Path, CalibrationOptions) -> io::Result<CalibrationReport>,
 {
     let report = calibrate(directory, options)?;
     if report.profile.stability == CalibrationStability::Invalid {
-        return Ok(report);
+        return Ok((report, CalibrationPersistence::InvalidNotStored));
     }
 
     let mut store = VerifierTuningStore::load(store_path)?;
     if store.upsert_calibrated_if_preferred(report.profile.clone()) {
         store.save(store_path)?;
+        return Ok((report, CalibrationPersistence::Stored));
     }
-    Ok(report)
+
+    let retained = store
+        .profile_for_storage_key(&report.profile.storage_key)
+        .expect("a rejected replacement must leave an existing profile")
+        .clone();
+
+    Ok((
+        report,
+        CalibrationPersistence::RetainedExisting {
+            workers: retained.workers,
+            stability: retained.stability,
+        },
+    ))
 }
 
 /// Resolves the verifier worker count for one storage and persists a useful
@@ -1388,6 +1438,11 @@ fn run_calibration_pass(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let pairwise_overrode_aggregate = pairwise_overrode_aggregate(
+        aggregate_selected_workers,
+        workers,
+        &pairwise,
+    );
 
     Ok(CalibrationReport {
         profile: VerifierTuningProfile {
@@ -1420,8 +1475,17 @@ fn run_calibration_pass(
         initial_selected_workers,
         aggregate_selected_workers,
         rechecked_workers,
+        pairwise_overrode_aggregate,
         paired_workers,
     })
+}
+
+fn pairwise_overrode_aggregate(
+    aggregate_selected_workers: usize,
+    final_selected_workers: usize,
+    pairwise: &[PairwiseMeasurement],
+) -> bool {
+    !pairwise.is_empty() && aggregate_selected_workers != final_selected_workers
 }
 
 fn rescue_target_sample_time(initial: Duration) -> Duration {
@@ -2520,6 +2584,7 @@ mod tests {
             aggregate_selected_workers: 6,
             rechecked_workers: vec![4, 6, 8],
             paired_workers: vec![4, 6, 8],
+            pairwise_overrode_aggregate: false,
         }
     }
 
@@ -2918,7 +2983,7 @@ mod tests {
             CalibrationStability::Invalid,
         );
 
-        let report = calibrate_and_maybe_store_with(
+        let (report, persistence) = calibrate_and_maybe_store_with(
             dir.path(),
             &store_path,
             CalibrationOptions::default(),
@@ -2926,6 +2991,7 @@ mod tests {
         )
         .expect("diagnostic path must return the invalid report");
 
+        assert_eq!(persistence, CalibrationPersistence::InvalidNotStored);
         assert_eq!(report.profile.stability, CalibrationStability::Invalid);
         assert_eq!(report.profile.workers, 8);
 
@@ -2935,6 +3001,69 @@ mod tests {
             .expect("good profile must remain");
         assert_eq!(saved.workers, 4);
         assert_eq!(saved.stability, CalibrationStability::High);
+    }
+
+    #[test]
+    fn diagnostic_persistence_reports_retained_existing_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("verifier-tuning.json");
+        let storage_key = storage_key_for_path(dir.path()).expect("storage key");
+
+        let mut store = VerifierTuningStore::default();
+        store.upsert(test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            4,
+            CalibrationStability::Low,
+        ));
+        store.save(&store_path).expect("save existing low profile");
+
+        let replacement = test_profile(
+            storage_key.clone(),
+            dir.path().to_path_buf(),
+            8,
+            CalibrationStability::Low,
+        );
+
+        let (report, persistence) = calibrate_and_maybe_store_with(
+            dir.path(),
+            &store_path,
+            CalibrationOptions::default(),
+            |_, _| Ok(test_report(replacement)),
+        )
+        .expect("diagnostic persistence");
+
+        assert_eq!(report.profile.workers, 8);
+        assert_eq!(
+            persistence,
+            CalibrationPersistence::RetainedExisting {
+                workers: 4,
+                stability: CalibrationStability::Low,
+            }
+        );
+
+        let loaded = VerifierTuningStore::load(&store_path).expect("reload profile");
+        let saved = loaded
+            .profile_for_storage_key(&storage_key)
+            .expect("existing profile must remain");
+        assert_eq!(saved.workers, 4);
+        assert_eq!(saved.stability, CalibrationStability::Low);
+    }
+
+    #[test]
+    fn pairwise_override_is_reported_only_when_final_selection_changes() {
+        let comparison = PairwiseMeasurement {
+            incumbent_workers: 4,
+            challenger_workers: 8,
+            pairs: 5,
+            median_ratio: 0.80,
+            decisive_challenger_wins: 4,
+            promoted: true,
+        };
+
+        assert!(pairwise_overrode_aggregate(4, 8, &[comparison.clone()]));
+        assert!(!pairwise_overrode_aggregate(4, 4, &[comparison]));
+        assert!(!pairwise_overrode_aggregate(4, 8, &[]));
     }
 
     #[test]
