@@ -18,10 +18,11 @@ use sysinfo::{DiskExt, DiskKind, System, SystemExt};
 use super::types::{DuplicateFile, DuplicateGroup, DuplicateScanResult};
 use super::verify::ExactVerifierExecutor;
 
-// Persistence schema version 6. The 2.9.3 behaviour keeps the same on-disk
-// format and adds safe profile replacement/reuse rules, so no format bump is
-// needed.
-const TUNING_FORMAT_VERSION: u64 = 6;
+// Persistence schema version 7. Version 3.4.4 changes the confidence semantics:
+// system-wide noise now caps an otherwise-high calibration at Medium. Old v6
+// profiles may therefore be over-confident, so they are intentionally ignored
+// and recalibrated under the new policy.
+const TUNING_FORMAT_VERSION: u64 = 7;
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_ROUNDS: usize = 5;
 const DEFAULT_RECHECK_ROUNDS: usize = 4;
@@ -148,6 +149,13 @@ pub(crate) struct PairwiseMeasurement {
     pub median_ratio: f64,
     /// Number of pairs where the challenger was at least `tie_margin` faster.
     pub decisive_challenger_wins: usize,
+    /// Aggregate slowdown of the challenger versus the fastest measured candidate.
+    /// A value above `tie_margin` means pairwise confirmation may diagnose the
+    /// candidate but cannot promote it.
+    pub challenger_slowdown_vs_fastest: f64,
+    /// True when pairwise evidence would have promoted the challenger, but the
+    /// aggregate measurements place it outside the allowed tie margin.
+    pub promotion_blocked_by_aggregate: bool,
     pub promoted: bool,
 }
 
@@ -396,9 +404,15 @@ pub(crate) struct CalibrationReport {
     pub rechecked_workers: Vec<usize>,
     pub paired_workers: Vec<usize>,
     /// True when the fresh paired confirmation selected a different worker count
-    /// from the aggregate measurements. This is diagnostic only in 3.4.2: it
-    /// does not change the worker choice or stability thresholds.
+    /// from the aggregate measurements.
     pub pairwise_overrode_aggregate: bool,
+    /// True when pairwise evidence tried to promote a challenger that was more
+    /// than `tie_margin` slower than the fastest aggregate candidate. This makes
+    /// the pass invalid and triggers the normal rescue measurement.
+    pub pairwise_blocked_promotion: bool,
+    /// Present on rescue results when the initial pass was invalid because of a
+    /// blocked pairwise promotion.
+    pub initial_pairwise_blocked_promotion: bool,
 }
 
 /// Small persistent store. Krokiet can keep this alongside its normal settings.
@@ -1347,6 +1361,7 @@ where
     rescue_report.rescue_attempted = true;
     rescue_report.initial_target_sample_time = options.target_sample_time;
     rescue_report.initial_stability = Some(initial_report.profile.stability);
+    rescue_report.initial_pairwise_blocked_promotion = initial_report.pairwise_blocked_promotion;
 
     Ok(rescue_report)
 }
@@ -1407,7 +1422,9 @@ fn run_calibration_pass(
         (aggregate_selected_workers, Vec::new())
     } else {
         paired_confirmation(
+            aggregate_selected_workers,
             &paired_workers,
+            &measurements,
             options.pair_rounds,
             options.target_sample_time,
             options.tie_margin,
@@ -1424,14 +1441,19 @@ fn run_calibration_pass(
     let selected_slowdown_vs_fastest = slowdown_ratio(selected.median, fastest.median);
     let decision_relative_mad = decision_relative_mad(&measurements, &paired_workers, workers);
     let global_relative_mad = global_relative_mad(&measurements);
+    let pairwise_blocked_promotion = pairwise
+        .iter()
+        .any(|comparison| comparison.promotion_blocked_by_aggregate);
     let stability = classify_stability(
         initial_selected_workers,
         aggregate_selected_workers,
         workers,
         selected.relative_mad,
         decision_relative_mad,
+        global_relative_mad,
         &pairwise,
         options.tie_margin,
+        pairwise_blocked_promotion,
     );
 
     let calibrated_at_unix_seconds = SystemTime::now()
@@ -1476,6 +1498,8 @@ fn run_calibration_pass(
         aggregate_selected_workers,
         rechecked_workers,
         pairwise_overrode_aggregate,
+        pairwise_blocked_promotion,
+        initial_pairwise_blocked_promotion: false,
         paired_workers,
     })
 }
@@ -1652,7 +1676,9 @@ fn close_candidates(measurements: &[TuningMeasurement], margin: f64) -> Vec<usiz
 }
 
 fn paired_confirmation(
+    aggregate_selected_workers: usize,
     candidates: &[usize],
+    aggregate_measurements: &[TuningMeasurement],
     pair_rounds: usize,
     target_sample_time: Duration,
     tie_margin: f64,
@@ -1663,17 +1689,29 @@ fn paired_confirmation(
     ordered.sort_unstable();
     ordered.dedup();
 
-    let Some(&first) = ordered.first() else {
+    if ordered.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "paired confirmation requires at least one candidate",
         ));
-    };
+    }
+    if !ordered.contains(&aggregate_selected_workers) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paired confirmation candidates must contain the aggregate selection",
+        ));
+    }
 
-    let mut incumbent = first;
+    // Pairwise confirmation starts from the aggregate decision rather than the
+    // smallest recheck candidate. This prevents an out-of-margin candidate from
+    // becoming the implicit winner merely because it happened to sort first.
+    let mut incumbent = aggregate_selected_workers;
     let mut comparisons = Vec::with_capacity(ordered.len().saturating_sub(1));
 
-    for challenger in ordered.into_iter().skip(1) {
+    for challenger in ordered
+        .into_iter()
+        .filter(|workers| *workers != aggregate_selected_workers)
+    {
         let mut ratios = Vec::with_capacity(pair_rounds);
 
         for pair_index in 0..pair_rounds {
@@ -1725,9 +1763,18 @@ fn paired_confirmation(
             .iter()
             .filter(|ratio| **ratio < decisive_threshold)
             .count();
-        let required_wins = pair_rounds / 2 + 1;
-        let promoted = median_ratio < decisive_threshold
-            && decisive_challenger_wins >= required_wins;
+        let challenger_slowdown_vs_fastest = aggregate_measurements
+            .iter()
+            .find(|measurement| measurement.workers == challenger)
+            .map(|measurement| slowdown_ratio(measurement.median, fastest_measurement(aggregate_measurements).median))
+            .unwrap_or(f64::INFINITY);
+        let (promoted, promotion_blocked_by_aggregate) = pairwise_promotion_decision(
+            median_ratio,
+            decisive_challenger_wins,
+            pair_rounds,
+            challenger_slowdown_vs_fastest,
+            tie_margin,
+        );
 
         comparisons.push(PairwiseMeasurement {
             incumbent_workers: incumbent,
@@ -1735,6 +1782,8 @@ fn paired_confirmation(
             pairs: pair_rounds,
             median_ratio,
             decisive_challenger_wins,
+            challenger_slowdown_vs_fastest,
+            promotion_blocked_by_aggregate,
             promoted,
         });
 
@@ -1746,15 +1795,42 @@ fn paired_confirmation(
     Ok((incumbent, comparisons))
 }
 
+
+fn pairwise_promotion_decision(
+    median_ratio: f64,
+    decisive_challenger_wins: usize,
+    pair_rounds: usize,
+    challenger_slowdown_vs_fastest: f64,
+    tie_margin: f64,
+) -> (bool, bool) {
+    let decisive_threshold = 1.0 - tie_margin;
+    let required_wins = pair_rounds / 2 + 1;
+    let pairwise_would_promote = median_ratio < decisive_threshold
+        && decisive_challenger_wins >= required_wins;
+    let inside_aggregate_margin = challenger_slowdown_vs_fastest <= tie_margin + f64::EPSILON;
+    let promotion_blocked_by_aggregate = pairwise_would_promote && !inside_aggregate_margin;
+    let promoted = pairwise_would_promote && inside_aggregate_margin;
+    (promoted, promotion_blocked_by_aggregate)
+}
+
 fn classify_stability(
     initial_selected_workers: usize,
     aggregate_selected_workers: usize,
     final_selected_workers: usize,
     selected_relative_mad: f64,
     decision_relative_mad: f64,
+    global_relative_mad: f64,
     pairwise: &[PairwiseMeasurement],
     tie_margin: f64,
+    pairwise_blocked_promotion: bool,
 ) -> CalibrationStability {
+    // A pairwise result that wants to promote a candidate outside the aggregate
+    // tie margin means the environment changed materially during the pass. Treat
+    // the pass as invalid so the caller performs the longer rescue measurement.
+    if pairwise_blocked_promotion {
+        return CalibrationStability::Invalid;
+    }
+
     // Only the selected candidate and the candidates that actually participated
     // in the final decision can invalidate a profile. Slow/noisy candidates that
     // were already eliminated remain useful diagnostics, but are not a reason to
@@ -1772,7 +1848,7 @@ fn classify_stability(
         (comparison.median_ratio - boundary).abs() <= 0.015
     });
 
-    if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
+    let decision_stability = if selected_relative_mad > LOW_STABILITY_RELATIVE_MAD
         || decision_relative_mad > LOW_STABILITY_RELATIVE_MAD
     {
         CalibrationStability::Low
@@ -1785,6 +1861,18 @@ fn classify_stability(
         CalibrationStability::Medium
     } else {
         CalibrationStability::High
+    };
+
+    // The selected/finalist MADs remain authoritative for validity, but a
+    // system-wide noisy pass must not manufacture a High-confidence profile
+    // from one locally quiet candidate. Cap High at Medium when the median MAD
+    // across all candidates exceeds the invalid-MAD diagnostic threshold.
+    if decision_stability == CalibrationStability::High
+        && global_relative_mad > INVALID_STABILITY_RELATIVE_MAD
+    {
+        CalibrationStability::Medium
+    } else {
+        decision_stability
     }
 }
 
@@ -2585,6 +2673,8 @@ mod tests {
             rechecked_workers: vec![4, 6, 8],
             paired_workers: vec![4, 6, 8],
             pairwise_overrode_aggregate: false,
+            pairwise_blocked_promotion: false,
+            initial_pairwise_blocked_promotion: false,
         }
     }
 
@@ -2652,6 +2742,18 @@ mod tests {
     }
 
     #[test]
+    fn high_global_noise_caps_high_confidence_at_medium() {
+        assert_eq!(
+            classify_stability(4, 4, 4, 0.02, 0.03, 0.24, &[], 0.05, false),
+            CalibrationStability::Medium
+        );
+        assert_eq!(
+            classify_stability(4, 4, 4, 0.02, 0.03, 0.05, &[], 0.05, false),
+            CalibrationStability::High
+        );
+    }
+
+    #[test]
     fn noisy_eliminated_candidates_do_not_invalidate_a_stable_decision() {
         let measurements = vec![
             measurement(1, 100, 0.25),
@@ -2666,7 +2768,7 @@ mod tests {
         assert!(global_relative_mad(&measurements) > 0.12);
         assert!(decision_mad < 0.05);
         assert_ne!(
-            classify_stability(6, 4, 4, 0.039, decision_mad, &[], 0.05),
+            classify_stability(6, 4, 4, 0.039, decision_mad, global_relative_mad(&measurements), &[], 0.05, false),
             CalibrationStability::Invalid
         );
     }
@@ -2674,7 +2776,7 @@ mod tests {
     #[test]
     fn unstable_decision_set_is_still_invalid() {
         assert_eq!(
-            classify_stability(4, 4, 8, 0.03, 0.19, &[], 0.05),
+            classify_stability(4, 4, 8, 0.03, 0.19, 0.05, &[], 0.05, false),
             CalibrationStability::Invalid
         );
     }
@@ -2715,6 +2817,38 @@ mod tests {
                 .expect("match"),
             Some(3)
         );
+    }
+
+    #[test]
+    fn format_v6_profiles_are_ignored_after_confidence_policy_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("verifier-tuning.json");
+        let legacy = json!({
+            "version": 6,
+            "profiles": [{
+                "storage_key": "legacy-storage",
+                "calibrated_path": dir.path().to_string_lossy(),
+                "workers": 6,
+                "logical_cpus": 8,
+                "median_mib_per_second": 2483.9,
+                "selected_samples": 9,
+                "selected_verification_runs": 187,
+                "relative_mad": 0.0378,
+                "decision_relative_mad": 0.0378,
+                "global_relative_mad": 0.2439,
+                "selected_slowdown_vs_fastest": 0.0,
+                "stability": "high",
+                "calibrated_at_unix_seconds": 42
+            }]
+        });
+        fs::write(
+            &settings,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy profile"),
+        )
+        .expect("write legacy profile");
+
+        let loaded = VerifierTuningStore::load(&settings).expect("load legacy store");
+        assert!(loaded.profiles().is_empty());
     }
 
     #[test]
@@ -3058,12 +3192,45 @@ mod tests {
             pairs: 5,
             median_ratio: 0.80,
             decisive_challenger_wins: 4,
+            challenger_slowdown_vs_fastest: 0.02,
+            promotion_blocked_by_aggregate: false,
             promoted: true,
         };
 
         assert!(pairwise_overrode_aggregate(4, 8, &[comparison.clone()]));
         assert!(!pairwise_overrode_aggregate(4, 4, &[comparison]));
         assert!(!pairwise_overrode_aggregate(4, 8, &[]));
+    }
+
+    #[test]
+    fn pairwise_promotion_outside_aggregate_tie_margin_is_blocked() {
+        let (promoted, blocked) = pairwise_promotion_decision(
+            0.947,
+            3,
+            5,
+            0.0837,
+            0.05,
+        );
+        assert!(!promoted);
+        assert!(blocked);
+
+        let (promoted, blocked) = pairwise_promotion_decision(
+            0.936,
+            3,
+            5,
+            0.031,
+            0.05,
+        );
+        assert!(promoted);
+        assert!(!blocked);
+    }
+
+    #[test]
+    fn blocked_pairwise_promotion_invalidates_pass_for_rescue() {
+        assert_eq!(
+            classify_stability(2, 2, 4, 0.01, 0.02, 0.05, &[], 0.05, true),
+            CalibrationStability::Invalid
+        );
     }
 
     #[test]

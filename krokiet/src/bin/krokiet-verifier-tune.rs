@@ -69,7 +69,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("============================================================");
-    println!(" KROKIET - VERIFIER TUNING 3.4.2");
+    println!(" KROKIET - VERIFIER TUNING 3.4.4");
     println!("============================================================");
     println!("Ruta solicitada : {}", path.display());
     println!("Modo solicitado : {}", parsed.mode.as_str());
@@ -133,6 +133,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("------------------------------------------------------------");
         println!(" MODO DE RESCATE");
+        if report.initial_pairwise_blocked_promotion {
+            println!("Motivo rescate  : conflicto entre agregado y confirmacion pareada");
+        }
     }
     println!("Rondas base     : {}", report.initial_rounds);
     println!(
@@ -169,6 +172,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("------------------------------------------------------------");
         println!(" CONFIRMACION PAREADA");
         for comparison in &report.pairwise {
+            let decision = if comparison.promoted {
+                "PROMUEVE".to_owned()
+            } else if comparison.promotion_blocked_by_aggregate {
+                format!(
+                    "BLOQUEADA (margen agregado {:.2}%)",
+                    comparison.challenger_slowdown_vs_fastest * 100.0
+                )
+            } else {
+                "MANTIENE".to_owned()
+            };
             println!(
                 " {:>2} vs {:>2}: ratio {:>6.3} | victorias decisivas {}/{} | {}",
                 comparison.incumbent_workers,
@@ -176,11 +189,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 comparison.median_ratio,
                 comparison.decisive_challenger_wins,
                 comparison.pairs,
-                if comparison.promoted {
-                    "PROMUEVE"
-                } else {
-                    "MANTIENE"
-                },
+                decision,
             );
         }
     }
@@ -197,9 +206,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Aviso decision  : la confirmacion pareada cambio {} -> {} worker(s)",
             report.aggregate_selected_workers, report.profile.workers
         );
+    }
+    if report.pairwise_blocked_promotion {
         println!(
-            "Diagnostico     : comparar ejecuciones antes de promover este resultado"
+            "Conflicto       : pareada intento promover fuera del margen agregado del 5%"
         );
+        println!("Diagnostico     : pasada invalida; requiere rescate consistente");
     }
     println!(
         "Rendimiento     : {:.1} MiB/s",
@@ -221,6 +233,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "MAD global      : {:.2}% (diagnostico)",
         report.profile.global_relative_mad * 100.0
     );
+    if report.profile.global_relative_mad > 0.12 {
+        println!(
+            "Aviso entorno  : ruido global > 12%; confianza maxima limitada a media"
+        );
+    }
     println!(
         "Estabilidad     : {}",
         report.profile.stability.label_es()
@@ -230,10 +247,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match persistence {
         CalibrationPersistence::InvalidNotStored => {
             println!("Perfil          : NO GUARDADO");
-            println!(
-                "Motivo          : MAD seleccionado o MAD decision supera el limite de {:.0}%",
-                12.0
-            );
+            if report.pairwise_blocked_promotion {
+                println!(
+                    "Motivo          : conflicto pareado/agregado persiste incluso tras rescate"
+                );
+            } else {
+                println!(
+                    "Motivo          : MAD seleccionado o MAD decision supera el limite de {:.0}%",
+                    12.0
+                );
+            }
         }
         CalibrationPersistence::Stored => {
             println!("Perfil          : GUARDADO");
