@@ -1,0 +1,371 @@
+#![cfg_attr(test, allow(dead_code, unused_imports))]
+
+// Standalone calibration executable for Krokiet's exact verifier.
+//
+// Cargo also compiles binary targets as test crates during `cargo test`. The
+// duplicate-engine sources contain tests that expect Krokiet's main crate layout,
+// so these source modules are included only for the normal executable build.
+
+#[cfg(not(test))]
+use std::env;
+#[cfg(not(test))]
+use std::ffi::OsString;
+#[cfg(not(test))]
+use std::path::PathBuf;
+#[cfg(not(test))]
+use std::process::ExitCode;
+
+#[cfg(not(test))]
+use czkawka_core::common::config_cache_path::{get_config_cache_path, set_config_cache_path};
+
+#[cfg(not(test))]
+#[path = "../duplicate_engine/types.rs"]
+mod types;
+#[cfg(not(test))]
+#[path = "../duplicate_engine/verify.rs"]
+mod verify;
+#[cfg(not(test))]
+#[path = "../duplicate_engine/tuning.rs"]
+mod tuning;
+
+#[cfg(not(test))]
+use tuning::{
+    CalibrationMode, CalibrationOptions, CalibrationPersistence, CalibrationStability,
+    calibrate_and_store_mode, storage_key_for_path,
+};
+
+#[cfg(not(test))]
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("ERROR: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_args(env::args_os().skip(1).collect())?;
+    let path = parsed.path.unwrap_or(env::current_dir()?);
+
+    if !path.is_dir() {
+        return Err(format!(
+            "la ruta no existe o no es un directorio: {}",
+            path.display()
+        )
+        .into());
+    }
+
+    let _ = set_config_cache_path("Czkawka", "Krokiet");
+    let store_path = if let Some(path) = parsed.tuning_store_path {
+        path
+    } else {
+        let config = get_config_cache_path().ok_or(
+            "Krokiet no pudo obtener su directorio de cache/configuracion",
+        )?;
+        config.cache_folder.join("verifier-tuning.json")
+    };
+
+    println!("============================================================");
+    println!(" KROKIET - VERIFIER TUNING 3.4.4");
+    println!("============================================================");
+    println!("Ruta solicitada : {}", path.display());
+    println!("Modo solicitado : {}", parsed.mode.as_str());
+    println!("Arquitectura    : calibracion independiente del scan");
+    println!("Perfil destino  : {}", store_path.display());
+    println!();
+
+    let canonical_requested = std::fs::canonicalize(&path)?;
+    let storage_key = storage_key_for_path(&canonical_requested)?;
+    println!("Ruta canonica   : {}", canonical_requested.display());
+    println!("Storage key     : {storage_key}");
+    println!();
+
+    let options = CalibrationOptions::default();
+    let run = calibrate_and_store_mode(
+        &canonical_requested,
+        &store_path,
+        options,
+        parsed.mode,
+    )?;
+    let persistence = run.persistence.clone();
+    let report = run.report;
+
+    println!("Modo utilizado  : {}", run.mode.as_str());
+    match run.mode {
+        CalibrationMode::Synthetic => {
+            println!("Dataset         : sintetico temporal");
+            println!("Escritura target: si (solo dataset temporal de calibracion)");
+        }
+        CalibrationMode::ReadOnly => {
+            println!("Dataset         : archivos existentes");
+            println!("Escritura target: NO");
+            println!("Nota            : cada archivo seleccionado se abre con dos handles de lectura");
+            println!(
+                "Datos unicos    : {:.1} MiB",
+                report.bytes_per_run as f64 / 2.0 / 1024.0 / 1024.0
+            );
+            if let Some(fingerprint) = report.dataset_fingerprint {
+                println!("Dataset ID      : fnv1a64-{fingerprint:016x}");
+            }
+        }
+        CalibrationMode::Auto => unreachable!("auto always resolves to a concrete mode"),
+    }
+    println!("CPU logicos     : {}", report.profile.logical_cpus);
+    println!("Grupos          : {}", report.groups);
+    println!(
+        "Lectura/ronda   : {:.1} MiB",
+        report.bytes_per_run as f64 / 1024.0 / 1024.0
+    );
+    if report.rescue_attempted {
+        println!(
+            "Ventana inicial : {:.0} ms",
+            report.initial_target_sample_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "Resultado inicial: {}",
+            report
+                .initial_stability
+                .map(CalibrationStability::label_es)
+                .unwrap_or("desconocida")
+        );
+        println!("------------------------------------------------------------");
+        println!(" MODO DE RESCATE");
+        if report.initial_pairwise_blocked_promotion {
+            println!("Motivo rescate  : conflicto entre agregado y confirmacion pareada");
+        }
+    }
+    println!("Rondas base     : {}", report.initial_rounds);
+    println!(
+        "Ventana/sample  : {:.0} ms",
+        report.target_sample_time.as_secs_f64() * 1000.0
+    );
+    if report.rechecked_workers.is_empty() {
+        println!("Recheck         : no necesario");
+    } else {
+        println!(
+            "Recheck         : {} ronda(s) extra para {:?}",
+            report.recheck_rounds, report.rechecked_workers
+        );
+    }
+    println!(
+        "Final pareada   : {} ronda(s) para {:?}",
+        report.pair_rounds, report.paired_workers
+    );
+    println!();
+
+    for measurement in &report.measurements {
+        println!(
+            "workers-{:>2}: {:>10.3?} | {:>9.1} MiB/s | n={:<2} | runs={:<3} | MAD {:>5.1}%",
+            measurement.workers,
+            measurement.median,
+            measurement.median_mib_per_second,
+            measurement.samples,
+            measurement.verification_runs,
+            measurement.relative_mad * 100.0,
+        );
+    }
+
+    if !report.pairwise.is_empty() {
+        println!("------------------------------------------------------------");
+        println!(" CONFIRMACION PAREADA");
+        for comparison in &report.pairwise {
+            let decision = if comparison.promoted {
+                "PROMUEVE".to_owned()
+            } else if comparison.promotion_blocked_by_aggregate {
+                format!(
+                    "BLOQUEADA (margen agregado {:.2}%)",
+                    comparison.challenger_slowdown_vs_fastest * 100.0
+                )
+            } else {
+                "MANTIENE".to_owned()
+            };
+            println!(
+                " {:>2} vs {:>2}: ratio {:>6.3} | victorias decisivas {}/{} | {}",
+                comparison.incumbent_workers,
+                comparison.challenger_workers,
+                comparison.median_ratio,
+                comparison.decisive_challenger_wins,
+                comparison.pairs,
+                decision,
+            );
+        }
+    }
+
+    println!("------------------------------------------------------------");
+    println!("Seleccion inicial: {} worker(s)", report.initial_selected_workers);
+    println!(
+        "Seleccion agregada: {} worker(s)",
+        report.aggregate_selected_workers
+    );
+    println!("Seleccion       : {} worker(s)", report.profile.workers);
+    if report.pairwise_overrode_aggregate {
+        println!(
+            "Aviso decision  : la confirmacion pareada cambio {} -> {} worker(s)",
+            report.aggregate_selected_workers, report.profile.workers
+        );
+    }
+    if report.pairwise_blocked_promotion {
+        println!(
+            "Conflicto       : pareada intento promover fuera del margen agregado del 5%"
+        );
+        println!("Diagnostico     : pasada invalida; requiere rescate consistente");
+    }
+    println!(
+        "Rendimiento     : {:.1} MiB/s",
+        report.profile.median_mib_per_second
+    );
+    println!(
+        "Margen al mejor : {:.2}%",
+        report.profile.selected_slowdown_vs_fastest * 100.0
+    );
+    println!(
+        "MAD seleccionado: {:.2}%",
+        report.profile.relative_mad * 100.0
+    );
+    println!(
+        "MAD decision    : {:.2}%",
+        report.profile.decision_relative_mad * 100.0
+    );
+    println!(
+        "MAD global      : {:.2}% (diagnostico)",
+        report.profile.global_relative_mad * 100.0
+    );
+    if report.profile.global_relative_mad > 0.12 {
+        println!(
+            "Aviso entorno  : ruido global > 12%; confianza maxima limitada a media"
+        );
+    }
+    println!(
+        "Estabilidad     : {}",
+        report.profile.stability.label_es()
+    );
+
+    let invalid = report.profile.stability == CalibrationStability::Invalid;
+    match persistence {
+        CalibrationPersistence::InvalidNotStored => {
+            println!("Perfil          : NO GUARDADO");
+            if report.pairwise_blocked_promotion {
+                println!(
+                    "Motivo          : conflicto pareado/agregado persiste incluso tras rescate"
+                );
+            } else {
+                println!(
+                    "Motivo          : MAD seleccionado o MAD decision supera el limite de {:.0}%",
+                    12.0
+                );
+            }
+        }
+        CalibrationPersistence::Stored => {
+            println!("Perfil          : GUARDADO");
+            println!("Perfil activo   : {} worker(s)", report.profile.workers);
+            println!("Archivo         : {}", store_path.display());
+        }
+        CalibrationPersistence::RetainedExisting { workers, stability } => {
+            println!("Perfil          : ANTERIOR CONSERVADO");
+            println!(
+                "Perfil medido   : {} worker(s), estabilidad {}",
+                report.profile.workers,
+                report.profile.stability.label_es()
+            );
+            println!(
+                "Perfil activo   : {} worker(s), estabilidad {}",
+                workers,
+                stability.label_es()
+            );
+            println!(
+                "Motivo          : la nueva calibracion no mejora la confianza del perfil existente"
+            );
+            println!("Archivo         : {}", store_path.display());
+        }
+    }
+
+    println!("============================================================");
+
+    if invalid {
+        return Err("verifier calibration is too unstable; profile was not stored".into());
+    }
+
+    Ok(())
+}
+
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct ParsedArgs {
+    path: Option<PathBuf>,
+    tuning_store_path: Option<PathBuf>,
+    mode: CalibrationMode,
+}
+
+#[cfg(not(test))]
+fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, Box<dyn std::error::Error>> {
+    let mut path = None;
+    let mut tuning_store_path = None;
+    let mut mode = CalibrationMode::Auto;
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        let value = args[index].to_string_lossy();
+        match value.as_ref() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--tuning-store" => {
+                index += 1;
+                let raw = args
+                    .get(index)
+                    .ok_or("--tuning-store necesita una ruta de archivo")?;
+                tuning_store_path = Some(PathBuf::from(raw));
+            }
+            "--mode" => {
+                index += 1;
+                let raw = args.get(index).ok_or("--mode necesita synthetic, readonly o auto")?;
+                mode = match raw.to_string_lossy().as_ref() {
+                    "synthetic" => CalibrationMode::Synthetic,
+                    "readonly" => CalibrationMode::ReadOnly,
+                    "auto" => CalibrationMode::Auto,
+                    other => {
+                        return Err(format!(
+                            "modo desconocido: {other}; usa synthetic, readonly o auto"
+                        )
+                        .into());
+                    }
+                };
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("opcion desconocida: {option}").into());
+            }
+            _ => {
+                if path.is_some() {
+                    return Err("solo puedes indicar una ruta de almacenamiento".into());
+                }
+                path = Some(PathBuf::from(&args[index]));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ParsedArgs {
+        path,
+        tuning_store_path,
+        mode,
+    })
+}
+
+#[cfg(not(test))]
+fn print_usage() {
+    println!(
+        "Uso:\n\
+         \n\
+         krokiet-verifier-tune [opciones] [carpeta]\n\
+         \n\
+         Opciones:\n\
+           --mode <modo>           synthetic | readonly | auto (por defecto: auto)\n\
+           --tuning-store <ruta>   Fuerza el archivo de perfiles\n\
+           -h, --help              Muestra esta ayuda\n"
+    );
+}
