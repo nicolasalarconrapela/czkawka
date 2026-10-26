@@ -37,11 +37,13 @@ impl DuplicateEngine for CzkawkaEngine {
         );
         let mut finder = DuplicateFinder::new(params);
         finder.set_included_paths(request.paths.clone());
+        finder.set_excluded_paths(request.excluded_paths.clone());
+        finder.set_excluded_items(request.excluded_items.clone());
         finder.set_recursive_search(request.recursive);
         finder.set_minimal_file_size(request.min_size);
         finder.set_maximal_file_size(request.max_size.unwrap_or(u64::MAX));
         finder.set_exclude_other_filesystems(request.one_file_system);
-        finder.set_hide_hard_links(true);
+        finder.set_hide_hard_links(request.hide_hard_links);
         finder.set_use_cache(request.use_cache);
 
         let stop_flag = Arc::new(AtomicBool::new(false));

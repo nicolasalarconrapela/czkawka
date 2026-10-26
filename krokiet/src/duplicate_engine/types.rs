@@ -63,11 +63,18 @@ impl DuplicateGroup {
 #[derive(Clone, Debug)]
 pub(crate) struct DuplicateScanRequest {
     pub paths: Vec<PathBuf>,
+    pub excluded_paths: Vec<PathBuf>,
+    /// Krokiet-style wildcard exclusions, e.g. `*/.git/*`.
+    ///
+    /// The Czkawka adapter passes these through unchanged. The fclones adapter
+    /// converts the same wildcard semantics into regular expressions.
+    pub excluded_items: Vec<String>,
     pub recursive: bool,
     pub min_size: u64,
     pub max_size: Option<u64>,
     pub use_cache: bool,
     pub one_file_system: bool,
+    pub hide_hard_links: bool,
 }
 
 #[cfg(feature = "fast_duplicates")]
@@ -75,6 +82,8 @@ impl DuplicateScanRequest {
     pub(crate) fn for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
             paths: paths.into_iter().collect(),
+            excluded_paths: Vec::new(),
+            excluded_items: Vec::new(),
             recursive: true,
             // fclones defaults to 1 byte and this also avoids treating every empty
             // file as a duplicate in the initial engine-comparison tests.
@@ -82,6 +91,7 @@ impl DuplicateScanRequest {
             max_size: None,
             use_cache: false,
             one_file_system: false,
+            hide_hard_links: true,
         }
     }
 

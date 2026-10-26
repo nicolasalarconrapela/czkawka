@@ -8,6 +8,8 @@ mod duplicate;
 mod empty_files;
 mod empty_folders;
 mod exif_remover;
+#[cfg(feature = "fast_duplicates")]
+mod fast_duplicate_gui;
 mod invalid_symlinks;
 mod same_music;
 mod similar_images;
