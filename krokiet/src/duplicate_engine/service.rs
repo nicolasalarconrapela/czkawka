@@ -1,9 +1,14 @@
 //! Integration boundary for duplicate scanning.
 //!
-//! This module deliberately owns orchestration, not detection details. Future CLI
-//! and GUI callers can submit one request here without knowing whether candidates
-//! came from Czkawka or fclones, how verifier workers were selected, or whether a
-//! stored tuning profile was reused.
+//! The fast path is intentionally split in two independent operations:
+//! - calibration discovers and persists the best exact-verifier worker count for
+//!   a storage;
+//! - scanning reuses that profile and never calibrates inline.
+//!
+//! If profile resolution fails during a scan, correctness is preserved by the
+//! universal one-worker fallback. The scan service owns orchestration only:
+//! candidate detection stays in fclones/Czkawka, calibration stays in `tuning`,
+//! and byte-for-byte confirmation stays in `verify`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -255,93 +260,120 @@ where
     match options.engine {
         DuplicateServiceEngine::Czkawka => {
             let result = CzkawkaEngine.scan(request)?;
-            Ok(DuplicateScanExecution {
-                result,
-                verifier_workers: None,
-                storage_tuning: Vec::new(),
-                profile_lookup_elapsed: Duration::ZERO,
-                verification_elapsed: Duration::ZERO,
-                total_elapsed: total_started.elapsed(),
-            })
+            Ok(execution_without_verification(result, total_started))
         }
         DuplicateServiceEngine::Fast => {
-            let mut result = FclonesEngine.scan(request)?;
-
-            // A calibration interrupted by Ctrl+C/crash can leave synthetic
-            // files behind. They are implementation detail, never user data, so
-            // they must not appear as duplicate candidates even before cleanup
-            // gets a chance to reclaim their disk space.
-            remove_internal_tuning_candidates(&mut result);
-
-            if result.groups.is_empty() {
-                return Ok(DuplicateScanExecution {
-                    result,
-                    verifier_workers: None,
-                    storage_tuning: Vec::new(),
-                    profile_lookup_elapsed: Duration::ZERO,
-                    verification_elapsed: Duration::ZERO,
-                    total_elapsed: total_started.elapsed(),
-                });
-            }
-
-            let store_path = options.tuning_store_path.as_deref().ok_or_else(|| {
-                DuplicateEngineError::Configuration(
-                    "fast duplicate service requires a verifier tuning store path".to_string(),
-                )
-            })?;
-
-            let profile_lookup_started = Instant::now();
-            let (storage_tuning, verifier_workers) =
-                match candidate_storage_representatives(&result) {
-                    Ok(representatives) => {
-                        let mut traces = Vec::with_capacity(representatives.len());
-
-                        for (storage_key, representative) in representatives {
-                            let trace = match resolve(&representative, store_path) {
-                                Ok(resolution) => trace_from_resolution(resolution),
-                                Err(error) => fallback_trace(
-                                    storage_key,
-                                    TuningFallbackReason::TuningUnavailable,
-                                    Some(error.to_string()),
-                                ),
-                            };
-                            traces.push(trace);
-                        }
-
-                        let workers = traces
-                            .iter()
-                            .map(|trace| trace.workers)
-                            .min()
-                            .unwrap_or(SAFE_FALLBACK_WORKERS)
-                            .max(1);
-
-                        (traces, workers)
-                    }
-                    Err(error) => (
-                        vec![fallback_trace(
-                            "unavailable".to_string(),
-                            TuningFallbackReason::StorageIdentificationFailed,
-                            Some(error.to_string()),
-                        )],
-                        SAFE_FALLBACK_WORKERS,
-                    ),
-                };
-            let profile_lookup_elapsed = profile_lookup_started.elapsed();
-
-            let verification_started = Instant::now();
-            verify_result_with_workers(&mut result, verifier_workers)?;
-            let verification_elapsed = verification_started.elapsed();
-
-            Ok(DuplicateScanExecution {
-                result,
-                verifier_workers: Some(verifier_workers),
-                storage_tuning,
-                profile_lookup_elapsed,
-                verification_elapsed,
-                total_elapsed: total_started.elapsed(),
-            })
+            run_fast_scan(request, options, total_started, &mut resolve)
         }
     }
+}
+
+fn run_fast_scan<F>(
+    request: &DuplicateScanRequest,
+    options: &DuplicateScanServiceOptions,
+    total_started: Instant,
+    resolve: &mut F,
+) -> Result<DuplicateScanExecution, DuplicateEngineError>
+where
+    F: FnMut(&Path, &Path) -> io::Result<VerifierScanResolution>,
+{
+    let mut result = FclonesEngine.scan(request)?;
+
+    // A calibration interrupted by Ctrl+C/crash can leave synthetic files
+    // behind. They are implementation detail, never user data.
+    remove_internal_tuning_candidates(&mut result);
+
+    if result.groups.is_empty() {
+        return Ok(execution_without_verification(result, total_started));
+    }
+
+    let store_path = required_tuning_store_path(options)?;
+    let profile_lookup_started = Instant::now();
+    let (storage_tuning, verifier_workers) =
+        resolve_verifier_workers(&result, store_path, resolve);
+    let profile_lookup_elapsed = profile_lookup_started.elapsed();
+
+    let verification_started = Instant::now();
+    verify_result_with_workers(&mut result, verifier_workers)?;
+    let verification_elapsed = verification_started.elapsed();
+
+    Ok(DuplicateScanExecution {
+        result,
+        verifier_workers: Some(verifier_workers),
+        storage_tuning,
+        profile_lookup_elapsed,
+        verification_elapsed,
+        total_elapsed: total_started.elapsed(),
+    })
+}
+
+fn required_tuning_store_path(
+    options: &DuplicateScanServiceOptions,
+) -> Result<&Path, DuplicateEngineError> {
+    options.tuning_store_path.as_deref().ok_or_else(|| {
+        DuplicateEngineError::Configuration(
+            "fast duplicate service requires a verifier tuning store path".to_string(),
+        )
+    })
+}
+
+fn execution_without_verification(
+    result: DuplicateScanResult,
+    total_started: Instant,
+) -> DuplicateScanExecution {
+    DuplicateScanExecution {
+        result,
+        verifier_workers: None,
+        storage_tuning: Vec::new(),
+        profile_lookup_elapsed: Duration::ZERO,
+        verification_elapsed: Duration::ZERO,
+        total_elapsed: total_started.elapsed(),
+    }
+}
+
+fn resolve_verifier_workers<F>(
+    result: &DuplicateScanResult,
+    store_path: &Path,
+    resolve: &mut F,
+) -> (Vec<StorageTuningTrace>, usize)
+where
+    F: FnMut(&Path, &Path) -> io::Result<VerifierScanResolution>,
+{
+    let representatives = match candidate_storage_representatives(result) {
+        Ok(representatives) => representatives,
+        Err(error) => {
+            return (
+                vec![fallback_trace(
+                    "unavailable".to_string(),
+                    TuningFallbackReason::StorageIdentificationFailed,
+                    Some(error.to_string()),
+                )],
+                SAFE_FALLBACK_WORKERS,
+            );
+        }
+    };
+
+    let mut traces = Vec::with_capacity(representatives.len());
+    for (storage_key, representative) in representatives {
+        let trace = match resolve(&representative, store_path) {
+            Ok(resolution) => trace_from_resolution(resolution),
+            Err(error) => fallback_trace(
+                storage_key,
+                TuningFallbackReason::TuningUnavailable,
+                Some(error.to_string()),
+            ),
+        };
+        traces.push(trace);
+    }
+
+    let workers = traces
+        .iter()
+        .map(|trace| trace.workers)
+        .min()
+        .unwrap_or(SAFE_FALLBACK_WORKERS)
+        .max(1);
+
+    (traces, workers)
 }
 
 fn remove_internal_tuning_candidates(result: &mut DuplicateScanResult) {
@@ -766,8 +798,6 @@ mod tests {
         assert_eq!(execution.verifier_workers, Some(1));
         assert_eq!(execution.storage_tuning[0].workers, 1);
     }
-
-
 
     #[test]
     fn e2e_profile_reentry_persisted_profile_then_real_scan() {

@@ -1,17 +1,19 @@
-//! Experimental duplicate-engine abstraction.
+//! Fast duplicate-engine support for Krokiet.
 //!
-//! Phase 1 deliberately does not replace the GUI's current `DuplicateFinder` path.
-//! It gives us two independently testable engines with one result format, so we can
-//! prove correctness before switching anything user-visible.
+//! The goal is deliberately narrow: accelerate compatible content/hash scans
+//! with fclones while preserving Krokiet's existing behavior everywhere else.
 //!
-//! Migration plan:
-//! 1. Keep `connect_scan/duplicate.rs` as the production path while tests mature.
-//! 2. Add a service boundary that owns engine selection, verifier tuning and exact
-//!    verification without changing the GUI path yet.
-//! 3. Reach settings/progress/cancellation parity in this abstraction.
-//! 4. Route command/UI callers through the service boundary.
-//! 5. Remove only the duplicated direct `DuplicateFinder` plumbing from the GUI
-//!    layer; keep `CzkawkaEngine` as a reference/fallback for comparison.
+//! Production design:
+//! 1. fclones discovers duplicate candidates for compatible Hash scans.
+//! 2. verifier tuning is calibrated independently per storage and persisted.
+//! 3. normal scans reuse the stored profile; calibration never runs inline.
+//! 4. `ExactVerifier` performs the final byte-for-byte confirmation.
+//! 5. a failed/unavailable tuning resolution falls back to one verifier worker.
+//! 6. unsupported scan modes/settings continue through the existing Czkawka path.
+//!
+//! `CzkawkaEngine` and result comparison remain useful as a reference/fallback
+//! and as regression-test infrastructure; the objective is not to reimplement
+//! all of `DuplicateFinder` inside fclones.
 
 mod compare;
 mod czkawka;
