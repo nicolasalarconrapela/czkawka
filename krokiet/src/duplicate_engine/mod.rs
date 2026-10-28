@@ -15,18 +15,24 @@
 //! and as regression-test infrastructure; the objective is not to reimplement
 //! all of `DuplicateFinder` inside fclones.
 
+#[cfg(feature = "fast_duplicates")]
 mod compare;
+#[cfg(feature = "fast_duplicates")]
 mod czkawka;
 #[cfg(feature = "fast_duplicates")]
 mod fclones;
 #[cfg(feature = "fast_duplicates")]
 mod service;
+#[cfg(feature = "fast_duplicates")]
 mod types;
 #[cfg(feature = "fast_duplicates")]
 mod tuning;
+#[cfg(feature = "fast_duplicates")]
 mod verify;
 
+#[cfg(feature = "fast_duplicates")]
 pub(crate) use compare::{DuplicateComparison, compare_results};
+#[cfg(feature = "fast_duplicates")]
 pub(crate) use czkawka::CzkawkaEngine;
 #[cfg(feature = "fast_duplicates")]
 pub(crate) use fclones::FclonesEngine;
@@ -39,6 +45,7 @@ pub(crate) use service::{
     TuningFallbackReason, TuningSource, decide_profile_flow, inspect_request_profiles,
     run_duplicate_scan,
 };
+#[cfg(feature = "fast_duplicates")]
 pub(crate) use types::{DuplicateEngine, DuplicateFile, DuplicateGroup, DuplicateScanRequest, DuplicateScanResult};
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
@@ -55,9 +62,10 @@ pub(crate) use tuning::{
 #[cfg(feature = "fast_duplicates")]
 #[allow(unused_imports)]
 pub(crate) use verify::{ExactVerifierExecutor, verify_result_with_workers};
+#[cfg(feature = "fast_duplicates")]
 pub(crate) use verify::{verify_group, verify_result};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fast_duplicates"))]
 mod tests {
     use std::fs;
     use std::path::Path;

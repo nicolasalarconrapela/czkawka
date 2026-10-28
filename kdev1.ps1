@@ -31,8 +31,9 @@ param(
     [Parameter(Position = 1)]
     [string]$TestName = "",
 
-    # Compile tests with the experimental Fast Engine feature.
-    # Keep this enabled for ALL Fast Engine tests if you want maximum cache reuse.
+    # Compile/run Krokiet with the experimental Fast Engine feature.
+    # Applies to run/build/check/timings and tests.
+    # Keep this enabled consistently for Fast Engine work to maximize cache reuse.
     [switch]$FastEngine,
 
     # Benchmarks should use the release test profile. This is a different
@@ -502,17 +503,26 @@ try {
 
         "run" {
 
+            $devFeatureList = @("winit_femtovg")
+            if ($FastEngine) {
+                $devFeatureList += "fast_duplicates"
+            }
+            $devFeatures = $devFeatureList -join ","
+
             Show-Header `
                 "RUN" `
                 "fastdev" `
-                "winit_femtovg"
+                $devFeatures
+
+            Write-Host " Fast Engine : $($FastEngine.IsPresent)"
+            Write-Host ""
 
             & cargo @cargoConfigArgs run `
                 -p krokiet `
                 --bin krokiet `
                 --profile fastdev `
                 --no-default-features `
-                --features winit_femtovg
+                --features $devFeatures
 
             $exitCode = $LASTEXITCODE
         }
@@ -524,17 +534,26 @@ try {
 
         "build" {
 
+            $devFeatureList = @("winit_femtovg")
+            if ($FastEngine) {
+                $devFeatureList += "fast_duplicates"
+            }
+            $devFeatures = $devFeatureList -join ","
+
             Show-Header `
                 "BUILD" `
                 "fastdev" `
-                "winit_femtovg"
+                $devFeatures
+
+            Write-Host " Fast Engine : $($FastEngine.IsPresent)"
+            Write-Host ""
 
             & cargo @cargoConfigArgs build `
                 -p krokiet `
                 --bin krokiet `
                 --profile fastdev `
                 --no-default-features `
-                --features winit_femtovg
+                --features $devFeatures
 
             $exitCode = $LASTEXITCODE
 
@@ -553,17 +572,26 @@ try {
 
         "check" {
 
+            $devFeatureList = @("winit_femtovg")
+            if ($FastEngine) {
+                $devFeatureList += "fast_duplicates"
+            }
+            $devFeatures = $devFeatureList -join ","
+
             Show-Header `
                 "CHECK" `
                 "fastdev" `
-                "winit_femtovg"
+                $devFeatures
+
+            Write-Host " Fast Engine : $($FastEngine.IsPresent)"
+            Write-Host ""
 
             & cargo @cargoConfigArgs check `
                 -p krokiet `
                 --bin krokiet `
                 --profile fastdev `
                 --no-default-features `
-                --features winit_femtovg
+                --features $devFeatures
 
             $exitCode = $LASTEXITCODE
         }
@@ -833,7 +861,12 @@ try {
                 $testLog = Join-Path $localConfigDir ("krokiet-test-{0}.log" -f $PID)
                 Remove-Item -LiteralPath $testLog -Force -ErrorAction SilentlyContinue
 
-                & cargo @cargoConfigArgs @cargoTestArgs -- @testRunnerArgs 2>&1 |
+                # IMPORTANT: do not merge stderr into the PowerShell pipeline here.
+                # Windows PowerShell 5.1 turns redirected native stderr into ErrorRecord
+                # objects; with $ErrorActionPreference = "Stop" that aborts on normal
+                # Cargo progress such as "Compiling ...". Cargo/test stdout contains
+                # the harness summary we need for the zero-test guard.
+                & cargo @cargoConfigArgs @cargoTestArgs -- @testRunnerArgs |
                     Tee-Object -FilePath $testLog
 
                 $cargoTestExitCode = $LASTEXITCODE
@@ -1022,17 +1055,26 @@ try {
 
         "timings" {
 
+            $devFeatureList = @("winit_femtovg")
+            if ($FastEngine) {
+                $devFeatureList += "fast_duplicates"
+            }
+            $devFeatures = $devFeatureList -join ","
+
             Show-Header `
                 "FASTDEV TIMINGS" `
                 "fastdev" `
-                "winit_femtovg"
+                $devFeatures
+
+            Write-Host " Fast Engine : $($FastEngine.IsPresent)"
+            Write-Host ""
 
             & cargo @cargoConfigArgs build `
                 -p krokiet `
                 --bin krokiet `
                 --profile fastdev `
                 --no-default-features `
-                --features winit_femtovg `
+                --features $devFeatures `
                 --timings
 
             $exitCode = $LASTEXITCODE

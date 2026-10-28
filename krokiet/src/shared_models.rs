@@ -17,10 +17,14 @@ use czkawka_core::tools::similar_videos::SimilarVideos;
 use czkawka_core::tools::temporary::Temporary;
 use czkawka_core::tools::video_optimizer::VideoOptimizer;
 
+#[cfg(feature = "fast_duplicates")]
+use crate::connect_scan::fast_duplicate_gui::FastDuplicateState;
 use crate::ActiveTab;
 
 pub struct SharedModels {
     pub shared_duplication_state: Option<DuplicateFinder>,
+    #[cfg(feature = "fast_duplicates")]
+    pub(crate) shared_fast_duplication_state: Option<FastDuplicateState>,
     pub shared_empty_folders_state: Option<EmptyFolder>,
     pub shared_empty_files_state: Option<EmptyFiles>,
     pub shared_temporary_files_state: Option<Temporary>,
@@ -40,6 +44,8 @@ impl SharedModels {
     pub fn new() -> Self {
         Self {
             shared_duplication_state: None,
+            #[cfg(feature = "fast_duplicates")]
+            shared_fast_duplication_state: None,
             shared_empty_folders_state: None,
             shared_empty_files_state: None,
             shared_temporary_files_state: None,
@@ -62,6 +68,16 @@ impl SharedModels {
 
     pub(crate) fn save_results(&self, active_tab: ActiveTab, chosen_dir: &str) -> Result<(), String> {
         let cd = chosen_dir;
+
+        #[cfg(feature = "fast_duplicates")]
+        if active_tab == ActiveTab::DuplicateFiles
+            && let Some(state) = self.shared_fast_duplication_state.as_ref()
+        {
+            return state
+                .save_all_in_one(cd)
+                .map_err(|e| format!("Failed to save Fast Engine duplicate results, reason {e}"));
+        }
+
         let result = match active_tab {
             ActiveTab::DuplicateFiles => self.shared_duplication_state.as_ref().map(|x| x.save_all_in_one(cd, "results_duplicates")),
             ActiveTab::EmptyFolders => self.shared_empty_folders_state.as_ref().map(|x| x.save_all_in_one(cd, "results_empty_directories")),
@@ -92,6 +108,11 @@ impl SharedModels {
     }
 
     pub(crate) fn get_use_reference_folders(&self, active_tab: ActiveTab) -> bool {
+        #[cfg(feature = "fast_duplicates")]
+        if active_tab == ActiveTab::DuplicateFiles && self.shared_fast_duplication_state.is_some() {
+            return false;
+        }
+
         let used_reference_folder = match active_tab {
             ActiveTab::DuplicateFiles => self.shared_duplication_state.as_ref().map(|e| e.get_use_reference_folders()),
             ActiveTab::EmptyFolders => self.shared_empty_folders_state.as_ref().map(|e| e.get_use_reference_folders()),

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "fast_duplicates")]
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use czkawka_core::common::config_cache_path::get_config_cache_path;
@@ -22,6 +24,13 @@ use rayon::prelude::*;
 use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel, Weak};
 
 use crate::common::{MAX_INT_DATA_DUPLICATE_FILES, MAX_STR_DATA_DUPLICATE_FILES, split_u64_into_i32s};
+#[cfg(feature = "fast_duplicates")]
+use crate::connect_scan::fast_duplicate_gui::{
+    FastDuplicateState, FastGuiScanPlan, duplicate_result_into_gui_groups,
+    fast_execution_messages, gui_group_stats, plan_fast_duplicate_scan, prepare_fast_profiles,
+};
+#[cfg(feature = "fast_duplicates")]
+use crate::duplicate_engine::{DuplicateScanRequest, DuplicateScanServiceOptions, run_duplicate_scan};
 use crate::connect_scan::{
     MessagesData, ScanData, get_dt_timestamp_string, get_text_messages, insert_data_to_model, insert_data_to_model_with_thumbnail, reset_selection_at_end,
     set_common_settings,
@@ -43,123 +52,363 @@ struct DuplicateMediaOptions {
     show_side_preview: bool,
 }
 
-// TODO(fast-duplicate-engine): connect the validated fast path to the GUI.
+// Fast Engine production routing is deliberately selective.
 //
-// Keep the scope narrow: compatible Hash scans may use
-// fclones -> persisted verifier profile -> ExactVerifier. Modes/settings that
-// the fast path cannot preserve must continue through the existing
-// `DuplicateFinder` path instead of being silently ignored.
+// Compatible Hash/Blake3 scans use:
+// fclones -> persisted per-storage verifier profile -> ExactVerifier -> GUI.
 //
-// Calibration remains an independent operation. A normal scan only reuses a
-// stored per-storage profile; if profile resolution fails, the verifier uses
-// the universal safe one-worker fallback.
+// Unsupported settings continue through the original `DuplicateFinder` path.
+// Calibration remains a separate one-off operation performed before the normal
+// scan; the scan itself only reuses the stored profile or falls back safely.
 
 pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
     thread::Builder::new()
         .stack_size(DEFAULT_THREAD_SIZE)
         .spawn(move || {
-            let hash_type = sd.combo_box_items.duplicates_hash_type.value;
-            let check_method = sd.combo_box_items.duplicates_check_method.value;
+            #[cfg(feature = "fast_duplicates")]
+            {
+                let check_method = sd.combo_box_items.duplicates_check_method.value;
+                let hash_type = sd.combo_box_items.duplicates_hash_type.value;
+                if let FastGuiScanPlan::Fast(request) =
+                    plan_fast_duplicate_scan(check_method, hash_type, &sd.custom_settings)
+                {
+                    match run_fast_duplicate_scan(&request, &sd) {
+                        Ok(output) => {
+                            let fast_state =
+                                FastDuplicateState::from_gui_groups(&output.vector, &request);
+                            {
+                                let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+                                shared.shared_duplication_state = None;
+                                shared.shared_fast_duplication_state = Some(fast_state);
+                            }
 
-            let params = DuplicateFinderParameters::new(
-                check_method,
-                hash_type,
-                sd.custom_settings.duplicate_use_prehash,
-                sd.custom_settings.duplicate_minimal_hash_cache_size as u64,
-                sd.custom_settings.duplicate_minimal_prehash_cache_size as u64,
-                sd.custom_settings.duplicates_sub_name_case_sensitive,
-            );
-            let mut tool = DuplicateFinder::new(params);
-
-            set_common_settings(&mut tool, &sd.custom_settings, &sd.stop_flag);
-            tool.search(&sd.stop_flag, Some(&sd.progress_sender));
-            let (critical, messages) = get_text_messages(&tool, &sd.basic_settings);
-
-            let mut vector;
-            if tool.get_use_reference() {
-                match tool.get_params().check_method {
-                    CheckingMethod::Hash => {
-                        vector = tool
-                            .get_files_with_identical_hashes_referenced()
-                            .values()
-                            .flatten()
-                            .cloned()
-                            .map(|(original, other)| (Some(original), other))
-                            .collect::<Vec<_>>();
+                            a.upgrade_in_event_loop(move |app| {
+                                write_duplicate_results(
+                                    &app,
+                                    output.vector,
+                                    output.media_data,
+                                    output.messages_data,
+                                    output.info,
+                                    sd,
+                                    false,
+                                    output.duplicates_number,
+                                    output.groups_number,
+                                    output.lost_space,
+                                );
+                            })
+                            .expect("Failed to publish Fast Engine duplicate results");
+                            return;
+                        }
+                        Err(FastDuplicateRunError::Cancelled) => {
+                            {
+                                let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+                                shared.shared_duplication_state = None;
+                                shared.shared_fast_duplication_state = None;
+                            }
+                            finish_cancelled_fast_scan(a);
+                            return;
+                        }
+                        Err(FastDuplicateRunError::Failed(error)) => {
+                            run_legacy_duplicate_scan(
+                                a,
+                                sd,
+                                Some(format!(
+                                    "Fast Engine fallo ({error}). Se ha usado automaticamente el motor Czkawka."
+                                )),
+                            );
+                            return;
+                        }
                     }
-                    CheckingMethod::Name | CheckingMethod::Size | CheckingMethod::SizeName => {
-                        let values: Vec<_> = match tool.get_params().check_method {
-                            CheckingMethod::Name => tool.get_files_with_identical_name_referenced().values().cloned().collect(),
-                            CheckingMethod::Size => tool.get_files_with_identical_size_referenced().values().cloned().collect(),
-                            CheckingMethod::SizeName => tool.get_files_with_identical_size_names_referenced().values().cloned().collect(),
-                            _ => unreachable!("Invalid check method."),
-                        };
-                        vector = values.into_iter().map(|(original, other)| (Some(original), other)).collect::<Vec<_>>();
-                    }
-                    _ => unreachable!("Invalid check method."),
-                }
-            } else {
-                match tool.get_params().check_method {
-                    CheckingMethod::Hash => {
-                        vector = tool.get_files_sorted_by_hash().values().flatten().cloned().map(|items| (None, items)).collect::<Vec<_>>();
-                    }
-                    CheckingMethod::Name | CheckingMethod::Size | CheckingMethod::SizeName => {
-                        let values: Vec<_> = match tool.get_params().check_method {
-                            CheckingMethod::Name => tool.get_files_sorted_by_names().values().cloned().collect(),
-                            CheckingMethod::Size => tool.get_files_sorted_by_size().values().cloned().collect(),
-                            CheckingMethod::SizeName => tool.get_files_sorted_by_size_name().values().cloned().collect(),
-                            _ => unreachable!("Invalid check method."),
-                        };
-                        vector = values.into_iter().map(|items| (None, items)).collect::<Vec<_>>();
-                    }
-                    _ => unreachable!("Invalid check method."),
                 }
             }
 
-            for (_first, vec) in &mut vector {
-                vec.par_sort_unstable_by(|a, b| split_path_compare(a.path.as_path(), b.path.as_path()));
-            }
-
-            // Read media metadata and build small thumbnails while we are still on
-            // the worker thread. Slint Image itself is not Send, so we keep the
-            // thumbnails as SharedPixelBuffer here and turn them into Image objects
-            // only after returning to the UI event loop.
-            //
-            // Hash groups are byte-identical: one thumbnail decode/generation is
-            // reused for every copy in the group. Name/Size/SizeName groups are not
-            // guaranteed to be identical, so every media file is handled individually.
-            let media_options = DuplicateMediaOptions {
-                show_preview_column: sd.custom_settings.duplicate_show_preview_column,
-                show_duration_column: sd.custom_settings.duplicate_show_duration_column,
-                show_side_preview: sd.custom_settings.duplicate_image_preview,
-            };
-            let media_data = collect_media_data(
-                &vector,
-                check_method,
-                &sd.stop_flag,
-                sd.custom_settings.video_thumbnails_percentage,
-                media_options,
-            );
-
-            let info = tool.get_information();
-            let stopped_search = tool.get_stopped_search();
-            let (duplicates_number, groups_number, lost_space) = match tool.get_check_method() {
-                CheckingMethod::Hash => (info.number_of_duplicated_files_by_hash, info.number_of_groups_by_hash, info.lost_space_by_hash),
-                CheckingMethod::Name => (info.number_of_duplicated_files_by_name, info.number_of_groups_by_name, 0),
-                CheckingMethod::Size => (info.number_of_duplicated_files_by_size, info.number_of_groups_by_size, info.lost_space_by_size),
-                CheckingMethod::SizeName => (info.number_of_duplicated_files_by_size_name, info.number_of_groups_by_size_name, info.lost_space_by_size),
-                _ => unreachable!("invalid check method {:?}", tool.get_check_method()),
-            };
-            sd.shared_models.lock().expect("Mutex poisoned").shared_duplication_state = Some(tool);
-
-            let messages_data = MessagesData { critical, messages };
-
-            a.upgrade_in_event_loop(move |app| {
-                write_duplicate_results(&app, vector, media_data, messages_data, info, sd, stopped_search, duplicates_number, groups_number, lost_space);
-            })
+            run_legacy_duplicate_scan(a, sd, None);
         })
         .expect("Cannot start thread - not much we can do here");
 }
+
+fn run_legacy_duplicate_scan(
+    a: Weak<MainWindow>,
+    sd: ScanData,
+    fast_fallback_message: Option<String>,
+) {
+    let hash_type = sd.combo_box_items.duplicates_hash_type.value;
+    let check_method = sd.combo_box_items.duplicates_check_method.value;
+
+    let params = DuplicateFinderParameters::new(
+        check_method,
+        hash_type,
+        sd.custom_settings.duplicate_use_prehash,
+        sd.custom_settings.duplicate_minimal_hash_cache_size as u64,
+        sd.custom_settings.duplicate_minimal_prehash_cache_size as u64,
+        sd.custom_settings.duplicates_sub_name_case_sensitive,
+    );
+    let mut tool = DuplicateFinder::new(params);
+
+    set_common_settings(&mut tool, &sd.custom_settings, &sd.stop_flag);
+    tool.search(&sd.stop_flag, Some(&sd.progress_sender));
+    let (critical, mut messages) = get_text_messages(&tool, &sd.basic_settings);
+
+    if let Some(fallback) = fast_fallback_message {
+        if messages.is_empty() {
+            messages = fallback;
+        } else {
+            messages = format!("{fallback}\n{messages}");
+        }
+    }
+
+    let mut vector;
+    if tool.get_use_reference() {
+        match tool.get_params().check_method {
+            CheckingMethod::Hash => {
+                vector = tool
+                    .get_files_with_identical_hashes_referenced()
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .map(|(original, other)| (Some(original), other))
+                    .collect::<Vec<_>>();
+            }
+            CheckingMethod::Name | CheckingMethod::Size | CheckingMethod::SizeName => {
+                let values: Vec<_> = match tool.get_params().check_method {
+                    CheckingMethod::Name => tool
+                        .get_files_with_identical_name_referenced()
+                        .values()
+                        .cloned()
+                        .collect(),
+                    CheckingMethod::Size => tool
+                        .get_files_with_identical_size_referenced()
+                        .values()
+                        .cloned()
+                        .collect(),
+                    CheckingMethod::SizeName => tool
+                        .get_files_with_identical_size_names_referenced()
+                        .values()
+                        .cloned()
+                        .collect(),
+                    _ => unreachable!("Invalid check method."),
+                };
+                vector = values
+                    .into_iter()
+                    .map(|(original, other)| (Some(original), other))
+                    .collect::<Vec<_>>();
+            }
+            _ => unreachable!("Invalid check method."),
+        }
+    } else {
+        match tool.get_params().check_method {
+            CheckingMethod::Hash => {
+                vector = tool
+                    .get_files_sorted_by_hash()
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .map(|items| (None, items))
+                    .collect::<Vec<_>>();
+            }
+            CheckingMethod::Name | CheckingMethod::Size | CheckingMethod::SizeName => {
+                let values: Vec<_> = match tool.get_params().check_method {
+                    CheckingMethod::Name => {
+                        tool.get_files_sorted_by_names().values().cloned().collect()
+                    }
+                    CheckingMethod::Size => {
+                        tool.get_files_sorted_by_size().values().cloned().collect()
+                    }
+                    CheckingMethod::SizeName => tool
+                        .get_files_sorted_by_size_name()
+                        .values()
+                        .cloned()
+                        .collect(),
+                    _ => unreachable!("Invalid check method."),
+                };
+                vector = values.into_iter().map(|items| (None, items)).collect::<Vec<_>>();
+            }
+            _ => unreachable!("Invalid check method."),
+        }
+    }
+
+    for (_first, vec) in &mut vector {
+        vec.par_sort_unstable_by(|a, b| split_path_compare(a.path.as_path(), b.path.as_path()));
+    }
+
+    let media_options = DuplicateMediaOptions {
+        show_preview_column: sd.custom_settings.duplicate_show_preview_column,
+        show_duration_column: sd.custom_settings.duplicate_show_duration_column,
+        show_side_preview: sd.custom_settings.duplicate_image_preview,
+    };
+    let media_data = collect_media_data(
+        &vector,
+        check_method,
+        &sd.stop_flag,
+        sd.custom_settings.video_thumbnails_percentage,
+        media_options,
+    );
+
+    let info = tool.get_information();
+    let stopped_search = tool.get_stopped_search();
+    let (duplicates_number, groups_number, lost_space) = match tool.get_check_method() {
+        CheckingMethod::Hash => (
+            info.number_of_duplicated_files_by_hash,
+            info.number_of_groups_by_hash,
+            info.lost_space_by_hash,
+        ),
+        CheckingMethod::Name => (
+            info.number_of_duplicated_files_by_name,
+            info.number_of_groups_by_name,
+            0,
+        ),
+        CheckingMethod::Size => (
+            info.number_of_duplicated_files_by_size,
+            info.number_of_groups_by_size,
+            info.lost_space_by_size,
+        ),
+        CheckingMethod::SizeName => (
+            info.number_of_duplicated_files_by_size_name,
+            info.number_of_groups_by_size_name,
+            info.lost_space_by_size,
+        ),
+        _ => unreachable!("invalid check method {:?}", tool.get_check_method()),
+    };
+
+    {
+        let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+        #[cfg(feature = "fast_duplicates")]
+        {
+            shared.shared_fast_duplication_state = None;
+        }
+        shared.shared_duplication_state = Some(tool);
+    }
+
+    let messages_data = MessagesData { critical, messages };
+
+    a.upgrade_in_event_loop(move |app| {
+        write_duplicate_results(
+            &app,
+            vector,
+            media_data,
+            messages_data,
+            info,
+            sd,
+            stopped_search,
+            duplicates_number,
+            groups_number,
+            lost_space,
+        );
+    })
+    .expect("Failed to publish Czkawka duplicate results");
+}
+
+#[cfg(feature = "fast_duplicates")]
+#[derive(Debug)]
+enum FastDuplicateRunError {
+    Cancelled,
+    Failed(String),
+}
+
+#[cfg(feature = "fast_duplicates")]
+struct FastDuplicateOutput {
+    vector: Vec<(Option<DuplicateEntry>, Vec<DuplicateEntry>)>,
+    media_data: HashMap<PathBuf, MediaRowData>,
+    messages_data: MessagesData,
+    info: duplicate::Info,
+    duplicates_number: usize,
+    groups_number: usize,
+    lost_space: u64,
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn run_fast_duplicate_scan(
+    request: &DuplicateScanRequest,
+    sd: &ScanData,
+) -> Result<FastDuplicateOutput, FastDuplicateRunError> {
+    sd.stop_flag.store(false, Ordering::Relaxed);
+
+    let tuning_store_path = fast_tuning_store_path()
+        .map_err(FastDuplicateRunError::Failed)?;
+
+    // Calibration is a separate operation. It runs before the scan service and
+    // therefore is not included in detector/verifier scan timing.
+    let calibration_notes = prepare_fast_profiles(request, &tuning_store_path);
+    if sd.stop_flag.load(Ordering::Relaxed) {
+        return Err(FastDuplicateRunError::Cancelled);
+    }
+
+    let options = DuplicateScanServiceOptions::fast(tuning_store_path);
+    let execution = run_duplicate_scan(request, &options)
+        .map_err(|error| FastDuplicateRunError::Failed(error.to_string()))?;
+
+    // fclones 0.35.0 has no cancellation hook inside group_files(). Honor Stop
+    // at the first controlled boundary after detection/verification.
+    if sd.stop_flag.load(Ordering::Relaxed) {
+        return Err(FastDuplicateRunError::Cancelled);
+    }
+
+    let messages = fast_execution_messages(&execution, &calibration_notes);
+    let scanning_time = execution.total_elapsed;
+    let mut vector = duplicate_result_into_gui_groups(execution.result)
+        .map_err(|error| FastDuplicateRunError::Failed(format!("{error:?}")))?;
+
+    for (_first, vec) in &mut vector {
+        vec.par_sort_unstable_by(|a, b| split_path_compare(a.path.as_path(), b.path.as_path()));
+    }
+
+    let media_options = DuplicateMediaOptions {
+        show_preview_column: sd.custom_settings.duplicate_show_preview_column,
+        show_duration_column: sd.custom_settings.duplicate_show_duration_column,
+        show_side_preview: sd.custom_settings.duplicate_image_preview,
+    };
+    let media_data = collect_media_data(
+        &vector,
+        CheckingMethod::Hash,
+        &sd.stop_flag,
+        sd.custom_settings.video_thumbnails_percentage,
+        media_options,
+    );
+
+    if sd.stop_flag.load(Ordering::Relaxed) {
+        return Err(FastDuplicateRunError::Cancelled);
+    }
+
+    let (duplicates_number, groups_number, lost_space) = gui_group_stats(&vector);
+    let mut info = duplicate::Info::default();
+    info.number_of_duplicated_files_by_hash = duplicates_number;
+    info.number_of_groups_by_hash = groups_number;
+    info.lost_space_by_hash = lost_space;
+    info.scanning_time = scanning_time;
+
+    Ok(FastDuplicateOutput {
+        vector,
+        media_data,
+        messages_data: MessagesData {
+            critical: None,
+            messages,
+        },
+        info,
+        duplicates_number,
+        groups_number,
+        lost_space,
+    })
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn fast_tuning_store_path() -> Result<PathBuf, String> {
+    get_config_cache_path()
+        .map(|config| config.cache_folder.join("verifier-tuning.json"))
+        .ok_or_else(|| "Krokiet no pudo obtener su directorio de cache/configuracion para verifier-tuning.json".to_string())
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn finish_cancelled_fast_scan(a: Weak<MainWindow>) {
+    a.upgrade_in_event_loop(move |app| {
+        app.set_duplicate_files_model(Rc::new(VecModel::default()).into());
+        app.global::<GuiState>()
+            .set_info_text("Fast Engine: scan cancelado.".into());
+        app.invoke_scan_ended("Scan stopped.".into());
+        reset_selection_at_end(&app, ActiveTab::DuplicateFiles);
+    })
+    .expect("Failed to finish cancelled Fast Engine scan");
+}
+
 fn write_duplicate_results(
     app: &MainWindow,
     vector: Vec<(Option<DuplicateEntry>, Vec<DuplicateEntry>)>,
