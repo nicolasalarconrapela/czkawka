@@ -15,6 +15,23 @@ use crate::duplicate_engine::{
 use crate::settings::model::SettingsCustom;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DuplicateEnginePreference {
+    Auto,
+    Czkawka,
+    Fast,
+}
+
+impl DuplicateEnginePreference {
+    pub(crate) fn from_config(value: &str) -> Self {
+        match value {
+            "czkawka" => Self::Czkawka,
+            "fast" => Self::Fast,
+            _ => Self::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FastGuiUnsupportedSetting {
     NonHashCheckingMethod,
     NonBlake3Hash,
@@ -22,6 +39,19 @@ pub(crate) enum FastGuiUnsupportedSetting {
     ReferencePaths,
     AllowedExtensions,
     ExcludedExtensions,
+}
+
+impl FastGuiUnsupportedSetting {
+    pub(crate) fn label_es(self) -> &'static str {
+        match self {
+            Self::NonHashCheckingMethod => "Fast Engine requiere el metodo Hash",
+            Self::NonBlake3Hash => "Fast Engine requiere Blake3",
+            Self::CustomLegacyHashTuning => "Fast Engine no admite los ajustes hash avanzados de Czkawka",
+            Self::ReferencePaths => "Fast Engine no admite carpetas de referencia",
+            Self::AllowedExtensions => "Fast Engine no admite todavia el filtro de extensiones permitidas",
+            Self::ExcludedExtensions => "Fast Engine no admite todavia el filtro de extensiones excluidas",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -402,6 +432,19 @@ mod tests {
         settings.allowed_extensions.clear();
         settings.excluded_extensions.clear();
         settings
+    }
+
+    #[test]
+    fn engine_preference_parses_persisted_values() {
+        assert_eq!(DuplicateEnginePreference::from_config("auto"), DuplicateEnginePreference::Auto);
+        assert_eq!(DuplicateEnginePreference::from_config("czkawka"), DuplicateEnginePreference::Czkawka);
+        assert_eq!(DuplicateEnginePreference::from_config("fast"), DuplicateEnginePreference::Fast);
+        assert_eq!(DuplicateEnginePreference::from_config("unknown"), DuplicateEnginePreference::Auto);
+    }
+
+    #[test]
+    fn unsupported_fast_reason_has_user_message() {
+        assert!(FastGuiUnsupportedSetting::NonBlake3Hash.label_es().contains("Blake3"));
     }
 
     #[test]

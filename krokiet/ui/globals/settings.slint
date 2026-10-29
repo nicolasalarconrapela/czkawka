@@ -77,6 +77,10 @@ export global Settings {
     in-out property <bool> similar_images_sub_ignore_same_resolution: false;
 
     // Duplicates
+    // Duplicate engine selection. Persisted by Rust as auto/czkawka/fast.
+    in-out property <[string]> duplicates_sub_engine: ["Automatic", "Czkawka", "Fast Engine"];
+    in-out property <int> duplicates_sub_engine_index: 0;
+    in-out property <string> duplicates_sub_engine_value: "Automatic";
     in-out property <[string]> duplicates_sub_check_method: ["Hash", "Size", "Name", "Size and Name"];
     in-out property <int> duplicates_sub_check_method_index: 0;
     in-out property <string> duplicates_sub_check_method_value: "Hash";

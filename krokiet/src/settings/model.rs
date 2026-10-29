@@ -108,6 +108,8 @@ pub struct SettingsCustom {
     pub similar_images_sub_ignore_same_resolution: bool,
     #[serde(default = "default_image_similarity")]
     pub similar_images_sub_similarity: i32,
+    #[serde(default = "default_duplicates_engine")]
+    pub duplicates_sub_engine: String,
     #[serde(default = "default_duplicates_check_method")]
     pub duplicates_sub_check_method: String,
     #[serde(default = "default_duplicates_hash_type")]
@@ -471,6 +473,9 @@ fn default_video_thumbnails_grid_tiles_per_side() -> u8 {
     2
 }
 
+fn default_duplicates_engine() -> String {
+    "auto".to_string()
+}
 fn default_duplicates_check_method() -> String {
     "hash".to_string()
 }

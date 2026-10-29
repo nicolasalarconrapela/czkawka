@@ -26,7 +26,7 @@ use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, Share
 use crate::common::{MAX_INT_DATA_DUPLICATE_FILES, MAX_STR_DATA_DUPLICATE_FILES, split_u64_into_i32s};
 #[cfg(feature = "fast_duplicates")]
 use crate::connect_scan::fast_duplicate_gui::{
-    FastDuplicateState, FastGuiScanPlan, duplicate_result_into_gui_groups,
+    DuplicateEnginePreference, FastDuplicateState, FastGuiScanPlan, duplicate_result_into_gui_groups,
     fast_execution_messages, gui_group_stats, plan_fast_duplicate_scan, prepare_fast_profiles,
 };
 #[cfg(feature = "fast_duplicates")]
@@ -67,59 +67,84 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
         .spawn(move || {
             #[cfg(feature = "fast_duplicates")]
             {
+                let preference = DuplicateEnginePreference::from_config(&sd.custom_settings.duplicates_sub_engine);
+                if preference == DuplicateEnginePreference::Czkawka {
+                    run_legacy_duplicate_scan(a, sd, None);
+                    return;
+                }
+
                 let check_method = sd.combo_box_items.duplicates_check_method.value;
                 let hash_type = sd.combo_box_items.duplicates_hash_type.value;
-                if let FastGuiScanPlan::Fast(request) =
-                    plan_fast_duplicate_scan(check_method, hash_type, &sd.custom_settings)
-                {
-                    match run_fast_duplicate_scan(&request, &sd) {
-                        Ok(output) => {
-                            let fast_state =
-                                FastDuplicateState::from_gui_groups(&output.vector, &request);
-                            {
-                                let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
-                                shared.shared_duplication_state = None;
-                                shared.shared_fast_duplication_state = Some(fast_state);
-                            }
+                match plan_fast_duplicate_scan(check_method, hash_type, &sd.custom_settings) {
+                    FastGuiScanPlan::Fast(request) => {
+                        match run_fast_duplicate_scan(&request, &sd) {
+                            Ok(output) => {
+                                let fast_state = FastDuplicateState::from_gui_groups(&output.vector, &request);
+                                {
+                                    let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+                                    shared.shared_duplication_state = None;
+                                    shared.shared_fast_duplication_state = Some(fast_state);
+                                }
 
-                            a.upgrade_in_event_loop(move |app| {
-                                write_duplicate_results(
-                                    &app,
-                                    output.vector,
-                                    output.media_data,
-                                    output.messages_data,
-                                    output.info,
-                                    sd,
-                                    false,
-                                    output.duplicates_number,
-                                    output.groups_number,
-                                    output.lost_space,
-                                );
-                            })
-                            .expect("Failed to publish Fast Engine duplicate results");
-                            return;
-                        }
-                        Err(FastDuplicateRunError::Cancelled) => {
-                            {
-                                let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
-                                shared.shared_duplication_state = None;
-                                shared.shared_fast_duplication_state = None;
+                                a.upgrade_in_event_loop(move |app| {
+                                    write_duplicate_results(
+                                        &app,
+                                        output.vector,
+                                        output.media_data,
+                                        output.messages_data,
+                                        output.info,
+                                        sd,
+                                        false,
+                                        output.duplicates_number,
+                                        output.groups_number,
+                                        output.lost_space,
+                                    );
+                                })
+                                .expect("Failed to publish Fast Engine duplicate results");
+                                return;
                             }
-                            finish_cancelled_fast_scan(a);
-                            return;
+                            Err(FastDuplicateRunError::Cancelled) => {
+                                {
+                                    let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+                                    shared.shared_duplication_state = None;
+                                    shared.shared_fast_duplication_state = None;
+                                }
+                                finish_cancelled_fast_scan(a);
+                                return;
+                            }
+                            Err(FastDuplicateRunError::Failed(error)) => {
+                                if preference == DuplicateEnginePreference::Fast {
+                                    finish_fast_scan_error(a, sd, format!("Fast Engine fallo: {error}"));
+                                } else {
+                                    run_legacy_duplicate_scan(
+                                        a,
+                                        sd,
+                                        Some(format!(
+                                            "Fast Engine fallo ({error}). Se ha usado automaticamente el motor Czkawka."
+                                        )),
+                                    );
+                                }
+                                return;
+                            }
                         }
-                        Err(FastDuplicateRunError::Failed(error)) => {
-                            run_legacy_duplicate_scan(
+                    }
+                    FastGuiScanPlan::Legacy(reason) => {
+                        if preference == DuplicateEnginePreference::Fast {
+                            finish_fast_scan_error(
                                 a,
                                 sd,
-                                Some(format!(
-                                    "Fast Engine fallo ({error}). Se ha usado automaticamente el motor Czkawka."
-                                )),
+                                format!("Fast Engine no puede ejecutar este escaneo: {}.", reason.label_es()),
                             );
                             return;
                         }
                     }
                 }
+            }
+
+            #[cfg(not(feature = "fast_duplicates"))]
+            if sd.custom_settings.duplicates_sub_engine == "fast" {
+                finish_fast_scan_unavailable(a, sd);
+                return;
             }
 
             run_legacy_duplicate_scan(a, sd, None);
@@ -407,6 +432,38 @@ fn finish_cancelled_fast_scan(a: Weak<MainWindow>) {
         reset_selection_at_end(&app, ActiveTab::DuplicateFiles);
     })
     .expect("Failed to finish cancelled Fast Engine scan");
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn finish_fast_scan_error(a: Weak<MainWindow>, sd: ScanData, message: String) {
+    {
+        let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+        shared.shared_duplication_state = None;
+        shared.shared_fast_duplication_state = None;
+    }
+    a.upgrade_in_event_loop(move |app| {
+        app.set_duplicate_files_model(Rc::new(VecModel::default()).into());
+        app.global::<GuiState>().set_info_text(message.clone().into());
+        app.invoke_scan_ended(message.into());
+        reset_selection_at_end(&app, ActiveTab::DuplicateFiles);
+    })
+    .expect("Failed to report forced Fast Engine scan error");
+}
+
+#[cfg(not(feature = "fast_duplicates"))]
+fn finish_fast_scan_unavailable(a: Weak<MainWindow>, sd: ScanData) {
+    {
+        let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+        shared.shared_duplication_state = None;
+    }
+    a.upgrade_in_event_loop(move |app| {
+        let message = "Fast Engine no esta disponible en esta compilacion. Inicia Krokiet con -FastEngine.";
+        app.set_duplicate_files_model(Rc::new(VecModel::default()).into());
+        app.global::<GuiState>().set_info_text(message.into());
+        app.invoke_scan_ended(message.into());
+        reset_selection_at_end(&app, ActiveTab::DuplicateFiles);
+    })
+    .expect("Failed to report unavailable Fast Engine");
 }
 
 fn write_duplicate_results(

@@ -161,6 +161,13 @@ export component ToolSettings {
             SubsettingsHeader { }
 
             ComboBoxWrapper {
+                text: "Engine";
+                model: Settings.duplicates_sub_engine;
+                current_index <=> Settings.duplicates_sub_engine_index;
+                current_value <=> Settings.duplicates_sub_engine_value;
+            }
+
+            ComboBoxWrapper {
                 text: Translations.subsettings_duplicates_check_method_text;
                 model: Settings.duplicates_sub_check_method;
                 current_index <=> Settings.duplicates_sub_check_method_index;

@@ -451,6 +451,13 @@ pub(crate) fn set_settings_to_gui(app: &MainWindow, custom_settings: &SettingsCu
     settings.set_duplicate_minimal_prehash_cache_size(custom_settings.duplicate_minimal_prehash_cache_size.to_string().into());
     settings.set_delete_outdated_cache_entries(custom_settings.delete_outdated_cache_entries);
     settings.set_hide_hard_links(custom_settings.hide_hard_links);
+    let (duplicate_engine_index, duplicate_engine_value) = match custom_settings.duplicates_sub_engine.as_str() {
+        "czkawka" => (1, "Czkawka"),
+        "fast" => (2, "Fast Engine"),
+        _ => (0, "Automatic"),
+    };
+    settings.set_duplicates_sub_engine_index(duplicate_engine_index);
+    settings.set_duplicates_sub_engine_value(duplicate_engine_value.into());
     settings.set_duplicates_sub_name_case_sensitive(custom_settings.duplicates_sub_name_case_sensitive);
     settings.set_similar_images_show_image_preview(custom_settings.similar_images_show_image_preview);
     settings.set_video_thumbnails_preview(custom_settings.video_thumbnails_preview);
@@ -741,6 +748,12 @@ pub(crate) fn collect_settings(app: &MainWindow) -> SettingsCustom {
     let similar_images_sub_ignore_same_resolution = settings.get_similar_images_sub_ignore_same_resolution();
     let similar_images_sub_similarity = settings.get_similar_images_sub_current_similarity().round() as i32;
 
+    let duplicates_sub_engine = match settings.get_duplicates_sub_engine_index() {
+        1 => "czkawka",
+        2 => "fast",
+        _ => "auto",
+    }
+    .to_string();
     let duplicates_sub_check_method = combo_box_items.duplicates_check_method.config_name.clone();
     let duplicates_sub_available_hash_type = combo_box_items.duplicates_hash_type.config_name.clone();
     let biggest_files_sub_method = combo_box_items.biggest_files_method.config_name.clone();
@@ -894,6 +907,7 @@ pub(crate) fn collect_settings(app: &MainWindow) -> SettingsCustom {
         similar_images_sub_ignore_same_size,
         similar_images_sub_ignore_same_resolution,
         similar_images_sub_similarity,
+        duplicates_sub_engine,
         duplicates_sub_check_method,
         duplicates_sub_available_hash_type,
         duplicates_sub_name_case_sensitive,
