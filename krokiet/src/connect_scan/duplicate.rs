@@ -130,11 +130,7 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
                     }
                     FastGuiScanPlan::Legacy(reason) => {
                         if preference == DuplicateEnginePreference::Fast {
-                            finish_fast_scan_error(
-                                a,
-                                sd,
-                                format!("Fast Engine no puede ejecutar este escaneo: {}.", reason.label_es()),
-                            );
+                            finish_fast_incompatible_scan(a, sd, reason.label_es());
                             return;
                         }
                     }
@@ -432,6 +428,38 @@ fn finish_cancelled_fast_scan(a: Weak<MainWindow>) {
         reset_selection_at_end(&app, ActiveTab::DuplicateFiles);
     })
     .expect("Failed to finish cancelled Fast Engine scan");
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn finish_fast_incompatible_scan(a: Weak<MainWindow>, sd: ScanData, reason: &str) {
+    {
+        let mut shared = sd.shared_models.lock().expect("Mutex poisoned");
+        shared.shared_duplication_state = None;
+        shared.shared_fast_duplication_state = None;
+    }
+
+    let message = format!(
+        "Fast Engine no es compatible con la configuracion seleccionada.\n\n\
+Actualmente Fast Engine requiere:\n\
+- Metodo: Hash\n\
+- Hash: Blake3\n\n\
+Motivo: {reason}.\n\n\
+Cambie la configuracion o seleccione Automatic/Czkawka."
+    );
+
+    a.upgrade_in_event_loop(move |app| {
+        app.set_duplicate_files_model(Rc::new(VecModel::default()).into());
+        app.global::<GuiState>().set_info_text(message.clone().into());
+
+        // End the attempted scan first so the UI is no longer left in the
+        // scanning state, then surface the incompatibility in the native
+        // Krokiet modal instead of leaving it only in the bottom status line.
+        app.invoke_scan_ended(message.clone().into());
+        app.invoke_show_error_popup(message.into());
+
+        reset_selection_at_end(&app, ActiveTab::DuplicateFiles);
+    })
+    .expect("Failed to report incompatible forced Fast Engine scan");
 }
 
 #[cfg(feature = "fast_duplicates")]
