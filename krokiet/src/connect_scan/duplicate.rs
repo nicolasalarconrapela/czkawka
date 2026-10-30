@@ -27,7 +27,7 @@ use crate::common::{MAX_INT_DATA_DUPLICATE_FILES, MAX_STR_DATA_DUPLICATE_FILES, 
 #[cfg(feature = "fast_duplicates")]
 use crate::connect_scan::fast_duplicate_gui::{
     DuplicateEnginePreference, FastDuplicateState, FastGuiScanPlan, duplicate_result_into_gui_groups,
-    fast_execution_messages, gui_group_stats, plan_fast_duplicate_scan, prepare_fast_profiles,
+    effective_duplicate_matching, fast_execution_messages, gui_group_stats, plan_fast_duplicate_scan, prepare_fast_profiles,
 };
 #[cfg(feature = "fast_duplicates")]
 use crate::duplicate_engine::{DuplicateScanRequest, DuplicateScanServiceOptions, run_duplicate_scan};
@@ -73,8 +73,11 @@ pub(crate) fn scan_duplicates(a: Weak<MainWindow>, sd: ScanData) {
                     return;
                 }
 
-                let check_method = sd.combo_box_items.duplicates_check_method.value;
-                let hash_type = sd.combo_box_items.duplicates_hash_type.value;
+                let (check_method, hash_type) = effective_duplicate_matching(
+                    preference,
+                    sd.combo_box_items.duplicates_check_method.value,
+                    sd.combo_box_items.duplicates_hash_type.value,
+                );
                 match plan_fast_duplicate_scan(check_method, hash_type, &sd.custom_settings) {
                     FastGuiScanPlan::Fast(request) => {
                         match run_fast_duplicate_scan(&request, &sd) {
@@ -451,9 +454,6 @@ Cambie la configuracion o seleccione Automatic/Czkawka."
         app.set_duplicate_files_model(Rc::new(VecModel::default()).into());
         app.global::<GuiState>().set_info_text(message.clone().into());
 
-        // End the attempted scan first so the UI is no longer left in the
-        // scanning state, then surface the incompatibility in the native
-        // Krokiet modal instead of leaving it only in the bottom status line.
         app.invoke_scan_ended(message.clone().into());
         app.invoke_show_error_popup(message.into());
 

@@ -31,6 +31,24 @@ impl DuplicateEnginePreference {
     }
 }
 
+/// Resolves the effective duplicate matching mode exposed to the scanner.
+///
+/// Fast Engine has a deliberately narrow contract: Hash + Blake3. The UI
+/// mirrors this by hiding the legacy selectors while Fast is selected, and
+/// this backend guard makes the same rule authoritative even when an old
+/// preset still contains Size/Name or another hash.
+pub(crate) fn effective_duplicate_matching(
+    preference: DuplicateEnginePreference,
+    check_method: CheckingMethod,
+    hash_type: HashType,
+) -> (CheckingMethod, HashType) {
+    if preference == DuplicateEnginePreference::Fast {
+        (CheckingMethod::Hash, HashType::Blake3)
+    } else {
+        (check_method, hash_type)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FastGuiUnsupportedSetting {
     NonHashCheckingMethod,
@@ -440,6 +458,30 @@ mod tests {
         assert_eq!(DuplicateEnginePreference::from_config("czkawka"), DuplicateEnginePreference::Czkawka);
         assert_eq!(DuplicateEnginePreference::from_config("fast"), DuplicateEnginePreference::Fast);
         assert_eq!(DuplicateEnginePreference::from_config("unknown"), DuplicateEnginePreference::Auto);
+    }
+
+    #[test]
+    fn forced_fast_engine_uses_hash_and_blake3_regardless_of_saved_legacy_values() {
+        assert_eq!(
+            effective_duplicate_matching(
+                DuplicateEnginePreference::Fast,
+                CheckingMethod::Size,
+                HashType::Crc32,
+            ),
+            (CheckingMethod::Hash, HashType::Blake3),
+        );
+    }
+
+    #[test]
+    fn automatic_engine_preserves_user_matching_selection() {
+        assert_eq!(
+            effective_duplicate_matching(
+                DuplicateEnginePreference::Auto,
+                CheckingMethod::Size,
+                HashType::Crc32,
+            ),
+            (CheckingMethod::Size, HashType::Crc32),
+        );
     }
 
     #[test]

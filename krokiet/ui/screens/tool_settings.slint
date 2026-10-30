@@ -167,7 +167,11 @@ export component ToolSettings {
                 current_value <=> Settings.duplicates_sub_engine_value;
             }
 
+            // Fast Engine deliberately exposes only its supported contract.
+            // Saved legacy values are preserved and become visible again when
+            // switching back to Automatic or Czkawka.
             ComboBoxWrapper {
+                visible: Settings.duplicates_sub_engine_index != 2;
                 text: Translations.subsettings_duplicates_check_method_text;
                 model: Settings.duplicates_sub_check_method;
                 current_index <=> Settings.duplicates_sub_check_method_index;
@@ -175,13 +179,25 @@ export component ToolSettings {
             }
 
             ComboBoxWrapper {
+                visible: Settings.duplicates_sub_engine_index != 2;
                 text: Translations.subsettings_images_duplicates_hash_type_text;
                 model: Settings.duplicates_sub_available_hash_type;
                 current_index <=> Settings.duplicates_sub_available_hash_type_index;
                 current_value <=> Settings.duplicates_sub_available_hash_type_value;
             }
 
+            LabelText {
+                visible: Settings.duplicates_sub_engine_index == 2;
+                label_text: Translations.subsettings_duplicates_check_method_text + ": Hash";
+            }
+
+            LabelText {
+                visible: Settings.duplicates_sub_engine_index == 2;
+                label_text: Translations.subsettings_images_duplicates_hash_type_text + ": Blake3";
+            }
+
             CheckBoxWrapper {
+                visible: Settings.duplicates_sub_engine_index != 2;
                 text: Translations.subsettings_duplicates_name_case_sensitive_text;
                 checked <=> Settings.duplicates_sub_name_case_sensitive;
                 height: 25px;
