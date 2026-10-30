@@ -167,6 +167,13 @@ export component ToolSettings {
                 current_value <=> Settings.duplicates_sub_engine_value;
             }
 
+            Button {
+                text: "Calibrar Fast Engine";
+                clicked => {
+                    Callabler.calibrate_fast_engine();
+                }
+            }
+
             // Fast Engine deliberately exposes only its supported contract.
             // Saved legacy values are preserved and become visible again when
             // switching back to Automatic or Czkawka.

@@ -39,8 +39,8 @@ export global Callabler {
     callback delete_selected_items();
     callback trash_selected_items();
     callback select_items(SelectMode);
-    callback update_select_buttons(); // rebuild select popup list after settings change
-    callback populate_custom_select_columns(); // Rust fills GuiState.custom_select_columns for active tab
+    callback update_select_buttons();
+    callback populate_custom_select_columns();
     callback update_custom_select_column(UpdateCustomSelectColumnRequest);
     callback select_items_custom_columns(SelectItemsCustomColumnsRequest);
     callback validate_regex(string) -> bool;
@@ -57,6 +57,9 @@ export global Callabler {
     callback changed_language();
     callback similar_videos_audio_preset_changed();
     callback similar_videos_visual_preset_changed();
+
+    // Fast duplicate engine
+    callback calibrate_fast_engine();
 
     callback tab_changed();
 

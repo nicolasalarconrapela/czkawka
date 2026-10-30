@@ -17,12 +17,19 @@ mod similar_videos;
 mod temporary_files;
 mod video_optimizer;
 
+#[cfg(feature = "fast_duplicates")]
+use std::collections::BTreeMap;
+#[cfg(feature = "fast_duplicates")]
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use chrono::{Local, TimeZone, Utc};
 use crossbeam_channel::Sender;
+#[cfg(feature = "fast_duplicates")]
+use czkawka_core::common::config_cache_path::get_config_cache_path;
 use czkawka_core::common::progress_data::ProgressData;
 use czkawka_core::common::tool_data::CommonData;
 use czkawka_core::helpers::messages::MessageLimit;
@@ -49,7 +56,12 @@ use crate::connect_scan::video_optimizer::scan_video_optimizer;
 use crate::settings::model::{BasicSettings, ComboBoxItems, SettingsCustom};
 use crate::settings::{collect_base_settings, collect_combo_box_settings, collect_settings};
 use crate::shared_models::SharedModels;
-use crate::{ActiveTab, GuiState, MainWindow, ProgressToSend, SingleMainListModel, flk};
+#[cfg(feature = "fast_duplicates")]
+use crate::duplicate_engine::{
+    CalibrationMode, CalibrationOptions, CalibrationStability, calibrate_and_store_mode,
+    storage_key_for_path,
+};
+use crate::{ActiveTab, Callabler, GuiState, MainWindow, ProgressToSend, SingleMainListModel, flk};
 
 pub struct ScanData {
     pub progress_sender: Sender<ProgressData>,
@@ -136,6 +148,177 @@ pub(crate) fn connect_scan_button(
             ActiveTab::Settings | ActiveTab::About => panic!("Button should be disabled"),
         }
     });
+
+    connect_fast_engine_calibrator(app);
+}
+
+
+fn connect_fast_engine_calibrator(app: &MainWindow) {
+    let weak = app.as_weak();
+
+    app.global::<Callabler>().on_calibrate_fast_engine(move || {
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+
+        #[cfg(not(feature = "fast_duplicates"))]
+        {
+            let message =
+                "Fast Engine no esta disponible en esta compilacion. Inicia Krokiet con -FastEngine.";
+            app.global::<GuiState>().set_info_text(message.into());
+            app.invoke_show_error_popup(message.into());
+            return;
+        }
+
+        #[cfg(feature = "fast_duplicates")]
+        {
+            if app.get_scanning() || app.get_processing() {
+                let message = "No se puede calibrar Fast Engine mientras hay otra operacion en curso.";
+                app.global::<GuiState>().set_info_text(message.into());
+                app.invoke_show_error_popup(message.into());
+                return;
+            }
+
+            let settings = collect_settings(&app);
+            if settings.included_paths.is_empty() {
+                let message = "Añade al menos una ruta incluida antes de calibrar Fast Engine.";
+                app.global::<GuiState>().set_info_text(message.into());
+                app.invoke_show_error_popup(message.into());
+                return;
+            }
+
+            let Some(config) = get_config_cache_path() else {
+                let message =
+                    "Krokiet no pudo obtener su directorio de cache para verifier-tuning.json.";
+                app.global::<GuiState>().set_info_text(message.into());
+                app.invoke_show_error_popup(message.into());
+                return;
+            };
+
+            let store_path = config.cache_folder.join("verifier-tuning.json");
+            let included_paths = settings.included_paths.clone();
+            let event_loop = app.as_weak();
+
+            app.set_processing(true);
+            app.set_progress_datas(ProgressToSend {
+                all_progress: 0,
+                current_progress: -1,
+                current_progress_size: -1,
+                step_name: "Calibrando Fast Engine".into(),
+            });
+            app.set_text_summary_text("Calibrando Fast Engine...".into());
+            app.global::<GuiState>()
+                .set_info_text("Calibracion manual de Fast Engine en curso...".into());
+
+            thread::Builder::new()
+                .name("krokiet-fast-calibration".to_string())
+                .spawn(move || {
+                    let result = calibrate_fast_engine_paths(&included_paths, &store_path);
+
+                    event_loop
+                        .upgrade_in_event_loop(move |app| {
+                            app.set_processing(false);
+
+                            match result {
+                                Ok(message) => {
+                                    app.set_text_summary_text(message.clone().into());
+                                    app.global::<GuiState>().set_info_text(message.into());
+                                }
+                                Err(message) => {
+                                    app.set_text_summary_text("Calibracion Fast Engine fallida.".into());
+                                    app.global::<GuiState>().set_info_text(message.clone().into());
+                                    app.invoke_show_error_popup(message.into());
+                                }
+                            }
+                        })
+                        .expect("Failed to publish Fast Engine calibration result");
+                })
+                .expect("Cannot start Fast Engine calibration thread");
+        }
+    });
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path) -> Result<String, String> {
+    let mut storages = BTreeMap::<String, PathBuf>::new();
+    let mut path_errors = Vec::new();
+
+    for path in paths {
+        let calibration_path = calibration_directory_for(path);
+        match storage_key_for_path(&calibration_path) {
+            Ok(storage_key) => {
+                storages.entry(storage_key).or_insert(calibration_path);
+            }
+            Err(error) => path_errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+
+    if storages.is_empty() {
+        let detail = if path_errors.is_empty() {
+            "no se encontro ningun almacenamiento calibrable".to_string()
+        } else {
+            path_errors.join("\n")
+        };
+        return Err(format!("Fast Engine no pudo iniciar la calibracion.\n\n{detail}"));
+    }
+
+    let mut successes = Vec::new();
+    let mut failures = path_errors;
+
+    for (storage_key, directory) in storages {
+        match calibrate_and_store_mode(
+            &directory,
+            store_path,
+            CalibrationOptions::default(),
+            CalibrationMode::Auto,
+        ) {
+            Ok(run) if run.report.profile.stability != CalibrationStability::Invalid => {
+                successes.push(format!(
+                    "{} -> {} worker(s), estabilidad {}",
+                    storage_key,
+                    run.report.profile.workers,
+                    run.report.profile.stability.label_es()
+                ));
+            }
+            Ok(run) => failures.push(format!(
+                "{} -> calibracion inestable ({} worker(s), no se guarda como perfil util)",
+                storage_key, run.report.profile.workers
+            )),
+            Err(error) => failures.push(format!("{storage_key} -> {error}")),
+        }
+    }
+
+    if successes.is_empty() {
+        return Err(format!(
+            "Fast Engine no pudo completar una calibracion valida.\n\n{}",
+            failures.join("\n")
+        ));
+    }
+
+    let mut message = format!(
+        "Calibracion Fast Engine completada.\nPerfiles: {}\n{}",
+        successes.len(),
+        successes.join("\n")
+    );
+
+    if !failures.is_empty() {
+        message.push_str("\n\nIncidencias:\n");
+        message.push_str(&failures.join("\n"));
+    }
+
+    message.push_str(&format!("\n\nPerfil: {}", store_path.display()));
+    Ok(message)
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn calibration_directory_for(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    }
 }
 
 fn get_dt_timestamp_string(timestamp: u64) -> String {
