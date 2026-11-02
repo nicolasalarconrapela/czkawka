@@ -213,7 +213,7 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
             thread::Builder::new()
                 .name("krokiet-fast-calibration".to_string())
                 .spawn(move || {
-                    let result = calibrate_fast_engine_paths(&included_paths, &store_path);
+                    let result = calibrate_fast_engine_paths(&included_paths, &store_path, &event_loop);
 
                     event_loop
                         .upgrade_in_event_loop(move |app| {
@@ -239,7 +239,7 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
 }
 
 #[cfg(feature = "fast_duplicates")]
-fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path) -> Result<String, String> {
+fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop: &slint::Weak<MainWindow>) -> Result<String, String> {
     let mut storages = BTreeMap::<String, PathBuf>::new();
     let mut path_errors = Vec::new();
 
@@ -262,10 +262,20 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path) -> Result<S
         return Err(format!("Fast Engine no pudo iniciar la calibracion.\n\n{detail}"));
     }
 
+    let total_storages = storages.len();
     let mut successes = Vec::new();
     let mut failures = path_errors;
 
-    for (storage_key, directory) in storages {
+    for (index, (storage_key, directory)) in storages.into_iter().enumerate() {
+        publish_fast_calibration_progress(
+            event_loop,
+            index,
+            total_storages,
+            &storage_key,
+            &directory,
+            false,
+        );
+
         match calibrate_and_store_mode(
             &directory,
             store_path,
@@ -286,6 +296,15 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path) -> Result<S
             )),
             Err(error) => failures.push(format!("{storage_key} -> {error}")),
         }
+
+        publish_fast_calibration_progress(
+            event_loop,
+            index + 1,
+            total_storages,
+            &storage_key,
+            &directory,
+            true,
+        );
     }
 
     if successes.is_empty() {
@@ -308,6 +327,55 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path) -> Result<S
 
     message.push_str(&format!("\n\nPerfil: {}", store_path.display()));
     Ok(message)
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn publish_fast_calibration_progress(
+    event_loop: &slint::Weak<MainWindow>,
+    completed_storages: usize,
+    total_storages: usize,
+    storage_key: &str,
+    directory: &Path,
+    completed_current: bool,
+) {
+    let total = total_storages.max(1);
+    let overall_percent = ((completed_storages.saturating_mul(100)) / total).min(100) as i32;
+    let current_number = if completed_current {
+        completed_storages.min(total)
+    } else {
+        (completed_storages + 1).min(total)
+    };
+
+    let step_name = if completed_current {
+        format!(
+            "Fast Engine - volumen {current_number}/{total} completado: {storage_key}"
+        )
+    } else {
+        format!(
+            "Calibrando Fast Engine - volumen {current_number}/{total}: {}",
+            directory.display()
+        )
+    };
+
+    let summary = if completed_current {
+        format!(
+            "Calibracion Fast Engine: {completed_storages}/{total} volumen(es) completado(s)"
+        )
+    } else {
+        format!(
+            "Calibrando Fast Engine: volumen {current_number}/{total}"
+        )
+    };
+
+    let _ = event_loop.upgrade_in_event_loop(move |app| {
+        app.set_progress_datas(ProgressToSend {
+            all_progress: overall_percent,
+            current_progress: -1,
+            current_progress_size: -1,
+            step_name: step_name.into(),
+        });
+        app.set_text_summary_text(summary.into());
+    });
 }
 
 #[cfg(feature = "fast_duplicates")]
