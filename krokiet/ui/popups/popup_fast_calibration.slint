@@ -10,6 +10,8 @@ export component PopupFastCalibration inherits Rectangle {
     private property <string> status_text: "";
     private property <string> detail_text: "";
     private property <int> progress_percent: 0;
+    private property <int> visual_progress: 0;
+    private property <bool> running: false;
 
     private property <length> popup_width: min(520px, root.width - 30px);
     private property <length> popup_height: 235px;
@@ -66,11 +68,11 @@ export component PopupFastCalibration inherits Rectangle {
 
                     ProgressIndicator {
                         height: 12px;
-                        progress: max(0, min(100, root.progress_percent)) / 100.0;
+                        progress: max(0, min(100, root.visual_progress)) / 100.0;
                     }
 
                     Text {
-                        text: max(0, min(100, root.progress_percent)) + "%";
+                        text: root.progress_percent >= 100 ? "100%" : "Calibrando...";
                         font-size: FontSizes.normal;
                         horizontal-alignment: TextHorizontalAlignment.center;
                     }
@@ -88,10 +90,26 @@ export component PopupFastCalibration inherits Rectangle {
         }
     }
 
+    timer := Timer {
+        interval: 180ms;
+        running: root.running;
+        triggered => {
+            if (root.progress_percent >= 100) {
+                root.visual_progress = 100;
+            } else if (root.visual_progress < 92) {
+                root.visual_progress += 2;
+            } else {
+                root.visual_progress = 12;
+            }
+        }
+    }
+
     show_popup(status, detail, progress) => {
         root.status_text = status;
         root.detail_text = detail;
         root.progress_percent = progress;
+        root.visual_progress = max(5, progress);
+        root.running = true;
         popup_window.show();
     }
 
@@ -99,9 +117,13 @@ export component PopupFastCalibration inherits Rectangle {
         root.status_text = status;
         root.detail_text = detail;
         root.progress_percent = progress;
+        if (progress > root.visual_progress) {
+            root.visual_progress = progress;
+        }
     }
 
     close_popup => {
+        root.running = false;
         popup_window.close();
     }
 }

@@ -43,6 +43,7 @@ import { PopupRenameFile } from "popups/popup_rename_file.slint";
 import { PopupError } from "popups/popup_error.slint";
 
 import { PopupFastCalibration } from "popups/popup_fast_calibration.slint";
+import { PopupFastCalibrationResult } from "popups/popup_fast_calibration_result.slint";
 
 import { PopupSave } from "popups/popup_save.slint";
 
@@ -107,6 +108,7 @@ export component MainWindow inherits Window {
     callback update_fast_calibration_popup(string, string, int);
 
     callback hide_fast_calibration_popup();
+    callback show_fast_calibration_result_popup(bool, string, string);
 
     title <=> Translations.main_window_title_text;
 
@@ -595,6 +597,16 @@ export component MainWindow inherits Window {
 
     }
 
+    fast_calibration_result_popup_window := PopupFastCalibrationResult {
+
+        height: root.height;
+
+        width: root.width;
+
+        x: 0.0; y: 0.0;
+
+    }
+
     save_popup_window := PopupSave {
 
         height: root.height;
@@ -956,6 +968,12 @@ export component MainWindow inherits Window {
     hide_fast_calibration_popup => {
 
         fast_calibration_popup_window.close_popup();
+
+    }
+
+    show_fast_calibration_result_popup(success, headline, detail) => {
+
+        fast_calibration_result_popup_window.show_popup(success, headline, detail);
 
     }
 

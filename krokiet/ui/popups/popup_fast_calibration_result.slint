@@ -1,0 +1,90 @@
+import { Button, ScrollView } from "std-widgets.slint";
+import { ColorPalette } from "../globals/color_palette.slint";
+import { FontSizes } from "../globals/fonts.slint";
+
+export component PopupFastCalibrationResult inherits Rectangle {
+    callback show_popup(bool, string, string);
+    callback close_popup();
+
+    private property <bool> success: true;
+    private property <string> headline: "";
+    private property <string> detail: "";
+
+    private property <length> popup_width: min(560px, root.width - 30px);
+    private property <length> popup_height: min(360px, root.height - 30px);
+
+    popup_window := PopupWindow {
+        width: popup_width;
+        height: popup_height;
+        x: (parent.width - popup_width) / 2.0;
+        y: (parent.height - popup_height) / 2.0;
+        close-policy: PopupClosePolicy.no-auto-close;
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            border-radius: 10px;
+            border-color: ColorPalette.popup_border_color;
+            border-width: 2px;
+            background: ColorPalette.popup_background;
+            clip: true;
+
+            VerticalLayout {
+                Rectangle {
+                    vertical-stretch: 0;
+                    min-height: 44px;
+                    background: ColorPalette.popup_background_title_line;
+
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: root.success ? "Calibracion completada" : "Calibracion fallida";
+                        font-size: FontSizes.normal;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        vertical-alignment: TextVerticalAlignment.center;
+                    }
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 14px;
+
+                        Text {
+                            text: root.headline;
+                            font-size: FontSizes.normal;
+                            horizontal-alignment: TextHorizontalAlignment.center;
+                            wrap: TextWrap.word-wrap;
+                        }
+
+                        Text {
+                            text: root.detail;
+                            font-size: FontSizes.small;
+                            wrap: TextWrap.word-wrap;
+                        }
+
+                        Rectangle { }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding: 12px;
+                    Rectangle { }
+                    Button {
+                        text: "Cerrar";
+                        clicked => { root.close_popup(); }
+                    }
+                }
+            }
+        }
+    }
+
+    show_popup(success, headline, detail) => {
+        root.success = success;
+        root.headline = headline;
+        root.detail = detail;
+        popup_window.show();
+    }
+
+    close_popup => { popup_window.close(); }
+}

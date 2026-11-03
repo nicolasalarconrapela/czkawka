@@ -227,13 +227,22 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
 
                             match result {
                                 Ok(message) => {
-                                    app.set_text_summary_text(message.clone().into());
-                                    app.global::<GuiState>().set_info_text(message.into());
+                                    app.set_text_summary_text("Calibracion Fast Engine completada".into());
+                                    app.global::<GuiState>().set_info_text(message.clone().into());
+                                    app.invoke_show_fast_calibration_result_popup(
+                                        true,
+                                        "Fast Engine ya tiene un perfil de calibracion disponible.".into(),
+                                        message.into(),
+                                    );
                                 }
                                 Err(message) => {
-                                    app.set_text_summary_text("Calibracion Fast Engine fallida.".into());
+                                    app.set_text_summary_text("Calibracion Fast Engine fallida".into());
                                     app.global::<GuiState>().set_info_text(message.clone().into());
-                                    app.invoke_show_error_popup(message.into());
+                                    app.invoke_show_fast_calibration_result_popup(
+                                        false,
+                                        "No se pudo completar una calibracion util.".into(),
+                                        message.into(),
+                                    );
                                 }
                             }
                         })
