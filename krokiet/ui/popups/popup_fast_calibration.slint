@@ -1,0 +1,107 @@
+import { ProgressIndicator } from "std-widgets.slint";
+import { ColorPalette } from "../globals/color_palette.slint";
+import { FontSizes } from "../globals/fonts.slint";
+
+export component PopupFastCalibration inherits Rectangle {
+    callback show_popup(string, string, int);
+    callback update_popup(string, string, int);
+    callback close_popup();
+
+    private property <string> status_text: "";
+    private property <string> detail_text: "";
+    private property <int> progress_percent: 0;
+
+    private property <length> popup_width: min(520px, root.width - 30px);
+    private property <length> popup_height: 235px;
+
+    popup_window := PopupWindow {
+        width: popup_width;
+        height: popup_height;
+        x: (parent.width - popup_width) / 2.0;
+        y: (parent.height - popup_height) / 2.0;
+        close-policy: PopupClosePolicy.no-auto-close;
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            border-radius: 10px;
+            border-color: ColorPalette.popup_border_color;
+            border-width: 2px;
+            background: ColorPalette.popup_background;
+            clip: true;
+
+            VerticalLayout {
+                Rectangle {
+                    vertical-stretch: 0;
+                    min-height: 42px;
+                    background: ColorPalette.popup_background_title_line;
+
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Calibrando Fast Engine";
+                        font-size: FontSizes.normal;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        vertical-alignment: TextVerticalAlignment.center;
+                    }
+                }
+
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 14px;
+
+                    Text {
+                        text: root.status_text;
+                        font-size: FontSizes.normal;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        wrap: TextWrap.word-wrap;
+                    }
+
+                    Text {
+                        text: root.detail_text;
+                        font-size: FontSizes.small;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        wrap: TextWrap.word-wrap;
+                    }
+
+                    ProgressIndicator {
+                        height: 12px;
+                        progress: max(0, min(100, root.progress_percent)) / 100.0;
+                    }
+
+                    Text {
+                        text: max(0, min(100, root.progress_percent)) + "%";
+                        font-size: FontSizes.normal;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                    }
+
+                    Text {
+                        text: "La calibracion esta midiendo el rendimiento del verificador. No cierres Krokiet hasta que termine.";
+                        font-size: FontSizes.small;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        wrap: TextWrap.word-wrap;
+                    }
+
+                    Rectangle { }
+                }
+            }
+        }
+    }
+
+    show_popup(status, detail, progress) => {
+        root.status_text = status;
+        root.detail_text = detail;
+        root.progress_percent = progress;
+        popup_window.show();
+    }
+
+    update_popup(status, detail, progress) => {
+        root.status_text = status;
+        root.detail_text = detail;
+        root.progress_percent = progress;
+    }
+
+    close_popup => {
+        popup_window.close();
+    }
+}

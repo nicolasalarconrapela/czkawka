@@ -209,6 +209,11 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
             app.set_text_summary_text("Calibrando Fast Engine...".into());
             app.global::<GuiState>()
                 .set_info_text("Calibracion manual de Fast Engine en curso...".into());
+            app.invoke_show_fast_calibration_popup(
+                "Preparando calibracion...".into(),
+                "Identificando los volumenes incluidos.".into(),
+                0,
+            );
 
             thread::Builder::new()
                 .name("krokiet-fast-calibration".to_string())
@@ -218,6 +223,7 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
                     event_loop
                         .upgrade_in_event_loop(move |app| {
                             app.set_processing(false);
+                            app.invoke_hide_fast_calibration_popup();
 
                             match result {
                                 Ok(message) => {
@@ -367,14 +373,21 @@ fn publish_fast_calibration_progress(
         )
     };
 
+    let storage_key = storage_key.to_string();
+
     let _ = event_loop.upgrade_in_event_loop(move |app| {
         app.set_progress_datas(ProgressToSend {
             all_progress: overall_percent,
             current_progress: -1,
             current_progress_size: -1,
-            step_name: step_name.into(),
+            step_name: step_name.clone().into(),
         });
         app.set_text_summary_text(summary.into());
+        app.invoke_update_fast_calibration_popup(
+            step_name.into(),
+            storage_key.into(),
+            overall_percent,
+        );
     });
 }
 

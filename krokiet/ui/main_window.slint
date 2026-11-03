@@ -42,6 +42,8 @@ import { PopupRenameFile } from "popups/popup_rename_file.slint";
 
 import { PopupError } from "popups/popup_error.slint";
 
+import { PopupFastCalibration } from "popups/popup_fast_calibration.slint";
+
 import { PopupSave } from "popups/popup_save.slint";
 
 import { PopupSortResults } from "popups/popup_sort.slint";
@@ -99,6 +101,12 @@ export component MainWindow inherits Window {
     callback show_rename_single_file_popup(int, string); // Single-row rename, Rust -> Slint - (row_idx, current_name) prefilled into the popup
 
     callback show_error_popup(string); // Generic error message popup, Rust -> Slint
+
+    callback show_fast_calibration_popup(string, string, int);
+
+    callback update_fast_calibration_popup(string, string, int);
+
+    callback hide_fast_calibration_popup();
 
     title <=> Translations.main_window_title_text;
 
@@ -577,6 +585,16 @@ export component MainWindow inherits Window {
 
     }
 
+    fast_calibration_popup_window := PopupFastCalibration {
+
+        height: root.height;
+
+        width: root.width;
+
+        x: 0.0; y: 0.0;
+
+    }
+
     save_popup_window := PopupSave {
 
         height: root.height;
@@ -920,6 +938,24 @@ export component MainWindow inherits Window {
     show_error_popup(message) => {
 
         error_popup_window.show_popup(message);
+
+    }
+
+    show_fast_calibration_popup(status, detail, progress) => {
+
+        fast_calibration_popup_window.show_popup(status, detail, progress);
+
+    }
+
+    update_fast_calibration_popup(status, detail, progress) => {
+
+        fast_calibration_popup_window.update_popup(status, detail, progress);
+
+    }
+
+    hide_fast_calibration_popup => {
+
+        fast_calibration_popup_window.close_popup();
 
     }
 
