@@ -1,0 +1,93 @@
+import { Button, ScrollView } from "std-widgets.slint";
+import { ColorPalette } from "../globals/color_palette.slint";
+import { FontSizes } from "../globals/fonts.slint";
+
+export component PopupFastCalibrationDelete inherits Rectangle {
+    callback show_popup(string);
+    callback close_popup();
+    callback confirm_requested();
+
+    private property <string> detail: "";
+    private property <length> popup_width: min(550px, root.width - 30px);
+    private property <length> popup_height: min(350px, root.height - 30px);
+
+    popup_window := PopupWindow {
+        width: popup_width;
+        height: popup_height;
+        x: (parent.width - popup_width) / 2.0;
+        y: (parent.height - popup_height) / 2.0;
+        close-policy: PopupClosePolicy.no-auto-close;
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            border-radius: 10px;
+            border-color: ColorPalette.popup_border_color;
+            border-width: 2px;
+            background: ColorPalette.popup_background;
+            clip: true;
+
+            VerticalLayout {
+                Rectangle {
+                    vertical-stretch: 0;
+                    min-height: 44px;
+                    background: ColorPalette.popup_background_title_line;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Eliminar calibracion Fast Engine";
+                        font-size: FontSizes.normal;
+                        horizontal-alignment: TextHorizontalAlignment.center;
+                        vertical-alignment: TextVerticalAlignment.center;
+                    }
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        Text {
+                            text: "Se eliminaran solamente los perfiles de los volumenes de las rutas incluidas. Los demas perfiles se conservaran.";
+                            font-size: FontSizes.normal;
+                            wrap: TextWrap.word-wrap;
+                        }
+                        Text {
+                            text: root.detail;
+                            font-size: FontSizes.small;
+                            wrap: TextWrap.word-wrap;
+                        }
+                        Text {
+                            text: "Podras volver a calibrar con el boton Calibrar / recalibrar Fast Engine.";
+                            font-size: FontSizes.small;
+                            wrap: TextWrap.word-wrap;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancelar";
+                        clicked => { root.close_popup(); }
+                    }
+                    Button {
+                        text: "Eliminar perfiles";
+                        clicked => {
+                            root.close_popup();
+                            root.confirm_requested();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    show_popup(detail) => {
+        root.detail = detail;
+        popup_window.show();
+    }
+
+    close_popup => { popup_window.close(); }
+}

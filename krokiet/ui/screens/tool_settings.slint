@@ -168,9 +168,16 @@ export component ToolSettings {
             }
 
             Button {
-                text: "Calibrar Fast Engine";
+                text: "Calibrar / recalibrar Fast Engine";
                 clicked => {
                     Callabler.calibrate_fast_engine();
+                }
+            }
+
+            Button {
+                text: "Eliminar calibracion Fast Engine";
+                clicked => {
+                    Callabler.request_delete_fast_engine_calibration();
                 }
             }
 

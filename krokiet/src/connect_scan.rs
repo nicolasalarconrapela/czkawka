@@ -58,7 +58,7 @@ use crate::settings::{collect_base_settings, collect_combo_box_settings, collect
 use crate::shared_models::SharedModels;
 #[cfg(feature = "fast_duplicates")]
 use crate::duplicate_engine::{
-    CalibrationMode, CalibrationOptions, CalibrationStability, calibrate_and_store_mode,
+    CalibrationMode, CalibrationOptions, CalibrationStability, VerifierTuningStore, calibrate_and_store_mode,
     storage_key_for_path,
 };
 use crate::{ActiveTab, Callabler, GuiState, MainWindow, ProgressToSend, SingleMainListModel, flk};
@@ -150,6 +150,7 @@ pub(crate) fn connect_scan_button(
     });
 
     connect_fast_engine_calibrator(app);
+    connect_fast_engine_profile_deletion(app);
 }
 
 
@@ -604,4 +605,127 @@ where
     component.set_save_also_as_json(custom_settings.save_also_as_json);
     component.set_delete_outdated_cache(custom_settings.delete_outdated_cache_entries);
     component.set_hide_hard_links(custom_settings.hide_hard_links);
+}
+
+
+/// Deletion is scoped to the storage IDs represented by the current included paths.
+/// Never delete the entire tuning store: profiles for other volumes must survive.
+fn connect_fast_engine_profile_deletion(app: &MainWindow) {
+    let weak_preview = app.as_weak();
+    app.global::<Callabler>()
+        .on_request_delete_fast_engine_calibration(move || {
+            let Some(app) = weak_preview.upgrade() else { return; };
+            if app.get_scanning() || app.get_processing() {
+                app.invoke_show_error_popup(
+                    "No se pueden eliminar perfiles durante una operacion en curso.".into(),
+                );
+                return;
+            }
+            #[cfg(not(feature = "fast_duplicates"))]
+            {
+                app.invoke_show_error_popup(
+                    "Fast Engine no esta disponible en esta compilacion.".into(),
+                );
+            }
+            #[cfg(feature = "fast_duplicates")]
+            {
+                let settings = collect_settings(&app);
+                match included_fast_storage_keys(&settings.included_paths) {
+                    Ok(keys) => {
+                        if keys.is_empty() {
+                            app.invoke_show_error_popup(
+                                "Anade una ruta incluida antes de eliminar calibraciones.".into(),
+                            );
+                            return;
+                        }
+                        let description = keys.iter().cloned().collect::<Vec<_>>().join("\n");
+                        app.invoke_show_fast_calibration_delete_popup(
+                            format!("Volumenes seleccionados ({}):\n{}", keys.len(), description).into(),
+                        );
+                    }
+                    Err(error) => app.invoke_show_error_popup(error.into()),
+                }
+            }
+        });
+
+    let weak_confirm = app.as_weak();
+    app.global::<Callabler>()
+        .on_confirm_delete_fast_engine_calibration(move || {
+            let Some(app) = weak_confirm.upgrade() else { return; };
+            if app.get_scanning() || app.get_processing() {
+                app.invoke_show_error_popup(
+                    "No se pueden eliminar perfiles durante una operacion en curso.".into(),
+                );
+                return;
+            }
+            #[cfg(not(feature = "fast_duplicates"))]
+            {
+                app.invoke_show_error_popup(
+                    "Fast Engine no esta disponible en esta compilacion.".into(),
+                );
+            }
+            #[cfg(feature = "fast_duplicates")]
+            {
+                let settings = collect_settings(&app);
+                let result = (|| -> Result<String, String> {
+                    let keys = included_fast_storage_keys(&settings.included_paths)?;
+                    if keys.is_empty() {
+                        return Err("No hay volumenes incluidos para eliminar.".to_string());
+                    }
+                    let config = get_config_cache_path().ok_or_else(||
+                        "No se pudo localizar la cache de Krokiet.".to_string()
+                    )?;
+                    let store_path = config.cache_folder.join("verifier-tuning.json");
+                    let original = VerifierTuningStore::load(&store_path)
+                        .map_err(|error| format!("No se pudo leer el perfil: {error}"))?;
+                    let mut retained = VerifierTuningStore::default();
+                    let mut removed = 0_usize;
+                    for profile in original.profiles() {
+                        if keys.contains(&profile.storage_key) {
+                            removed += 1;
+                        } else {
+                            retained.upsert(profile.clone());
+                        }
+                    }
+                    if removed > 0 {
+                        retained.save(&store_path)
+                            .map_err(|error| format!("No se pudo guardar el perfil: {error}"))?;
+                    }
+                    Ok(format!(
+                        "Perfiles eliminados: {removed}\nVolumenes seleccionados: {}\n\nRuta: {}\n\nPuedes ejecutar Calibrar / recalibrar Fast Engine.",
+                        keys.len(), store_path.display()
+                    ))
+                })();
+
+                match result {
+                    Ok(message) => {
+                        app.set_text_summary_text("Perfiles de calibracion actualizados".into());
+                        app.global::<GuiState>().set_info_text(message.clone().into());
+                        app.invoke_show_fast_calibration_result_popup(
+                            3, "Se han actualizado las calibraciones guardadas.".into(), message.into(),
+                        );
+                    }
+                    Err(message) => {
+                        app.global::<GuiState>().set_info_text(message.clone().into());
+                        app.invoke_show_fast_calibration_result_popup(
+                            1, "No se pudo eliminar la calibracion.".into(), message.into(),
+                        );
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn included_fast_storage_keys(
+    paths: &[PathBuf],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for path in paths {
+        let directory = calibration_directory_for(path);
+        let key = storage_key_for_path(&directory)
+            .map_err(|error| format!("No se pudo identificar el volumen de {}: {error}", path.display()))?;
+        keys.insert(key);
+    }
+    Ok(keys)
 }

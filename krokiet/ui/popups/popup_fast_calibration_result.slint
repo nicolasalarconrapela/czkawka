@@ -6,7 +6,7 @@ export component PopupFastCalibrationResult inherits Rectangle {
     callback show_popup(int, string, string);
     callback close_popup();
 
-    // 0 = success, 1 = failure, 2 = cancelled
+    // 0 = success, 1 = failure, 2 = cancelled, 3 = profiles removed
     private property <int> result_kind: 0;
     private property <string> headline: "";
     private property <string> detail: "";
@@ -39,7 +39,7 @@ export component PopupFastCalibrationResult inherits Rectangle {
                     Text {
                         width: parent.width;
                         height: parent.height;
-                        text: root.result_kind == 0 ? "Calibracion completada" : root.result_kind == 2 ? "Calibracion cancelada" : "Calibracion fallida";
+                        text: root.result_kind == 0 ? "Calibracion completada" : root.result_kind == 2 ? "Calibracion cancelada" : root.result_kind == 3 ? "Calibracion eliminada" : "Calibracion fallida";
                         font-size: FontSizes.normal;
                         horizontal-alignment: TextHorizontalAlignment.center;
                         vertical-alignment: TextVerticalAlignment.center;
