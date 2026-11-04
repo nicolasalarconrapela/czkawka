@@ -153,8 +153,34 @@ pub(crate) fn connect_scan_button(
 }
 
 
+
+#[cfg(feature = "fast_duplicates")]
+enum FastCalibrationOutcome {
+    Completed(String),
+    Failed(String),
+    Cancelled(String),
+}
+
 fn connect_fast_engine_calibrator(app: &MainWindow) {
+    let active_cancel = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
+
+    {
+        let active_cancel = active_cancel.clone();
+        app.global::<Callabler>()
+            .on_cancel_fast_engine_calibration(move || {
+                let flag = active_cancel
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().cloned());
+
+                if let Some(flag) = flag {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            });
+    }
+
     let weak = app.as_weak();
+    let active_cancel_for_start = active_cancel.clone();
 
     app.global::<Callabler>().on_calibrate_fast_engine(move || {
         let Some(app) = weak.upgrade() else {
@@ -196,8 +222,15 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
             };
 
             let store_path = config.cache_folder.join("verifier-tuning.json");
+            let store_preexisted = store_path.exists();
+            let store_backup = std::fs::read(&store_path).ok();
             let included_paths = settings.included_paths.clone();
             let event_loop = app.as_weak();
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+
+            if let Ok(mut guard) = active_cancel_for_start.lock() {
+                *guard = Some(cancel_flag.clone());
+            }
 
             app.set_processing(true);
             app.set_progress_datas(ProgressToSend {
@@ -215,32 +248,70 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
                 0,
             );
 
+            let active_cancel_after = active_cancel_for_start.clone();
+
             thread::Builder::new()
                 .name("krokiet-fast-calibration".to_string())
                 .spawn(move || {
-                    let result = calibrate_fast_engine_paths(&included_paths, &store_path, &event_loop);
+                    let outcome = calibrate_fast_engine_paths(
+                        &included_paths,
+                        &store_path,
+                        &event_loop,
+                        &cancel_flag,
+                    );
+
+                    if matches!(outcome, FastCalibrationOutcome::Cancelled(_)) {
+                        restore_fast_calibration_store(
+                            &store_path,
+                            store_preexisted,
+                            store_backup.as_deref(),
+                        );
+                    }
+
+                    if let Ok(mut guard) = active_cancel_after.lock() {
+                        *guard = None;
+                    }
 
                     event_loop
                         .upgrade_in_event_loop(move |app| {
                             app.set_processing(false);
                             app.invoke_hide_fast_calibration_popup();
 
-                            match result {
-                                Ok(message) => {
-                                    app.set_text_summary_text("Calibracion Fast Engine completada".into());
-                                    app.global::<GuiState>().set_info_text(message.clone().into());
+                            match outcome {
+                                FastCalibrationOutcome::Completed(message) => {
+                                    app.set_text_summary_text(
+                                        "Calibracion Fast Engine completada".into(),
+                                    );
+                                    app.global::<GuiState>()
+                                        .set_info_text(message.clone().into());
                                     app.invoke_show_fast_calibration_result_popup(
-                                        true,
-                                        "Fast Engine ya tiene un perfil de calibracion disponible.".into(),
+                                        0,
+                                        "Fast Engine ya tiene un perfil de calibracion disponible."
+                                            .into(),
                                         message.into(),
                                     );
                                 }
-                                Err(message) => {
-                                    app.set_text_summary_text("Calibracion Fast Engine fallida".into());
-                                    app.global::<GuiState>().set_info_text(message.clone().into());
+                                FastCalibrationOutcome::Failed(message) => {
+                                    app.set_text_summary_text(
+                                        "Calibracion Fast Engine fallida".into(),
+                                    );
+                                    app.global::<GuiState>()
+                                        .set_info_text(message.clone().into());
                                     app.invoke_show_fast_calibration_result_popup(
-                                        false,
+                                        1,
                                         "No se pudo completar una calibracion util.".into(),
+                                        message.into(),
+                                    );
+                                }
+                                FastCalibrationOutcome::Cancelled(message) => {
+                                    app.set_text_summary_text(
+                                        "Calibracion Fast Engine cancelada".into(),
+                                    );
+                                    app.global::<GuiState>()
+                                        .set_info_text(message.clone().into());
+                                    app.invoke_show_fast_calibration_result_popup(
+                                        2,
+                                        "La calibracion se cancelo de forma segura.".into(),
                                         message.into(),
                                     );
                                 }
@@ -254,11 +325,39 @@ fn connect_fast_engine_calibrator(app: &MainWindow) {
 }
 
 #[cfg(feature = "fast_duplicates")]
-fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop: &slint::Weak<MainWindow>) -> Result<String, String> {
+fn restore_fast_calibration_store(
+    store_path: &Path,
+    store_preexisted: bool,
+    backup: Option<&[u8]>,
+) {
+    match backup {
+        Some(bytes) => {
+            let _ = std::fs::write(store_path, bytes);
+        }
+        None if !store_preexisted => {
+            let _ = std::fs::remove_file(store_path);
+        }
+        None => {}
+    }
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn calibrate_fast_engine_paths(
+    paths: &[PathBuf],
+    store_path: &Path,
+    event_loop: &slint::Weak<MainWindow>,
+    cancel_flag: &AtomicBool,
+) -> FastCalibrationOutcome {
     let mut storages = BTreeMap::<String, PathBuf>::new();
     let mut path_errors = Vec::new();
 
     for path in paths {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return FastCalibrationOutcome::Cancelled(
+                "La calibracion fue cancelada antes de comenzar las mediciones.".to_string(),
+            );
+        }
+
         let calibration_path = calibration_directory_for(path);
         match storage_key_for_path(&calibration_path) {
             Ok(storage_key) => {
@@ -274,7 +373,9 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop:
         } else {
             path_errors.join("\n")
         };
-        return Err(format!("Fast Engine no pudo iniciar la calibracion.\n\n{detail}"));
+        return FastCalibrationOutcome::Failed(format!(
+            "Fast Engine no pudo iniciar la calibracion.\n\n{detail}"
+        ));
     }
 
     let total_storages = storages.len();
@@ -282,6 +383,14 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop:
     let mut failures = path_errors;
 
     for (index, (storage_key, directory)) in storages.into_iter().enumerate() {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return FastCalibrationOutcome::Cancelled(format!(
+                "Cancelada antes de calibrar el volumen {}/{}.\nNo se conservaron cambios nuevos en el perfil.",
+                index + 1,
+                total_storages
+            ));
+        }
+
         publish_fast_calibration_progress(
             event_loop,
             index,
@@ -291,12 +400,22 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop:
             false,
         );
 
-        match calibrate_and_store_mode(
+        let calibration_result = calibrate_and_store_mode(
             &directory,
             store_path,
             CalibrationOptions::default(),
             CalibrationMode::Auto,
-        ) {
+        );
+
+        if cancel_flag.load(Ordering::Relaxed) {
+            return FastCalibrationOutcome::Cancelled(format!(
+                "Cancelada tras finalizar de forma segura la medicion del volumen {}/{}.\nNo se conservaron cambios nuevos en el perfil.",
+                index + 1,
+                total_storages
+            ));
+        }
+
+        match calibration_result {
             Ok(run) if run.report.profile.stability != CalibrationStability::Invalid => {
                 successes.push(format!(
                     "{} -> {} worker(s), estabilidad {}",
@@ -323,7 +442,7 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop:
     }
 
     if successes.is_empty() {
-        return Err(format!(
+        return FastCalibrationOutcome::Failed(format!(
             "Fast Engine no pudo completar una calibracion valida.\n\n{}",
             failures.join("\n")
         ));
@@ -341,7 +460,7 @@ fn calibrate_fast_engine_paths(paths: &[PathBuf], store_path: &Path, event_loop:
     }
 
     message.push_str(&format!("\n\nPerfil: {}", store_path.display()));
-    Ok(message)
+    FastCalibrationOutcome::Completed(message)
 }
 
 #[cfg(feature = "fast_duplicates")]

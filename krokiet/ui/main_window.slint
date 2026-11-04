@@ -108,7 +108,7 @@ export component MainWindow inherits Window {
     callback update_fast_calibration_popup(string, string, int);
 
     callback hide_fast_calibration_popup();
-    callback show_fast_calibration_result_popup(bool, string, string);
+    callback show_fast_calibration_result_popup(int, string, string);
 
     title <=> Translations.main_window_title_text;
 
@@ -594,6 +594,10 @@ export component MainWindow inherits Window {
         width: root.width;
 
         x: 0.0; y: 0.0;
+
+        cancel_requested => {
+            Callabler.cancel_fast_engine_calibration();
+        }
 
     }
 

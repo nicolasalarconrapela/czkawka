@@ -1,4 +1,4 @@
-import { ProgressIndicator } from "std-widgets.slint";
+import { Button, ProgressIndicator } from "std-widgets.slint";
 import { ColorPalette } from "../globals/color_palette.slint";
 import { FontSizes } from "../globals/fonts.slint";
 
@@ -6,15 +6,17 @@ export component PopupFastCalibration inherits Rectangle {
     callback show_popup(string, string, int);
     callback update_popup(string, string, int);
     callback close_popup();
+    callback cancel_requested();
 
     private property <string> status_text: "";
     private property <string> detail_text: "";
     private property <int> progress_percent: 0;
     private property <int> visual_progress: 0;
     private property <bool> running: false;
+    private property <bool> cancelling: false;
 
     private property <length> popup_width: min(520px, root.width - 30px);
-    private property <length> popup_height: 235px;
+    private property <length> popup_height: min(340px, root.height - 20px);
 
     popup_window := PopupWindow {
         width: popup_width;
@@ -72,7 +74,7 @@ export component PopupFastCalibration inherits Rectangle {
                     }
 
                     Text {
-                        text: root.progress_percent >= 100 ? "100%" : "Calibrando...";
+                        text: root.visual_progress >= 100 ? "100%" : root.visual_progress + "% (estimado)";
                         font-size: FontSizes.normal;
                         horizontal-alignment: TextHorizontalAlignment.center;
                     }
@@ -84,22 +86,36 @@ export component PopupFastCalibration inherits Rectangle {
                         wrap: TextWrap.word-wrap;
                     }
 
-                    Rectangle { }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle { horizontal-stretch: 1; }
+
+                        Button {
+                            enabled: !root.cancelling;
+                            text: root.cancelling ? "Cancelando..." : "Cancelar";
+                            clicked => {
+                                root.cancelling = true;
+                                root.status_text = "Cancelando calibracion...";
+                                root.detail_text = "La cancelacion se aplicara en cuanto termine la medicion segura en curso.";
+                                root.cancel_requested();
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     timer := Timer {
-        interval: 180ms;
-        running: root.running;
+        interval: 500ms;
+        running: root.running && !root.cancelling;
         triggered => {
             if (root.progress_percent >= 100) {
                 root.visual_progress = 100;
-            } else if (root.visual_progress < 92) {
+            } else if (root.visual_progress < 80) {
                 root.visual_progress += 2;
-            } else {
-                root.visual_progress = 12;
+            } else if (root.visual_progress < 95) {
+                root.visual_progress += 1;
             }
         }
     }
@@ -108,7 +124,8 @@ export component PopupFastCalibration inherits Rectangle {
         root.status_text = status;
         root.detail_text = detail;
         root.progress_percent = progress;
-        root.visual_progress = max(5, progress);
+        root.visual_progress = max(0, progress);
+        root.cancelling = false;
         root.running = true;
         popup_window.show();
     }
@@ -120,10 +137,14 @@ export component PopupFastCalibration inherits Rectangle {
         if (progress > root.visual_progress) {
             root.visual_progress = progress;
         }
+        if (progress >= 100) {
+            root.visual_progress = 100;
+        }
     }
 
     close_popup => {
         root.running = false;
+        root.cancelling = false;
         popup_window.close();
     }
 }

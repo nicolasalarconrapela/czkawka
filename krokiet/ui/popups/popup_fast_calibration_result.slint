@@ -3,10 +3,11 @@ import { ColorPalette } from "../globals/color_palette.slint";
 import { FontSizes } from "../globals/fonts.slint";
 
 export component PopupFastCalibrationResult inherits Rectangle {
-    callback show_popup(bool, string, string);
+    callback show_popup(int, string, string);
     callback close_popup();
 
-    private property <bool> success: true;
+    // 0 = success, 1 = failure, 2 = cancelled
+    private property <int> result_kind: 0;
     private property <string> headline: "";
     private property <string> detail: "";
 
@@ -38,7 +39,7 @@ export component PopupFastCalibrationResult inherits Rectangle {
                     Text {
                         width: parent.width;
                         height: parent.height;
-                        text: root.success ? "Calibracion completada" : "Calibracion fallida";
+                        text: root.result_kind == 0 ? "Calibracion completada" : root.result_kind == 2 ? "Calibracion cancelada" : "Calibracion fallida";
                         font-size: FontSizes.normal;
                         horizontal-alignment: TextHorizontalAlignment.center;
                         vertical-alignment: TextVerticalAlignment.center;
@@ -79,8 +80,8 @@ export component PopupFastCalibrationResult inherits Rectangle {
         }
     }
 
-    show_popup(success, headline, detail) => {
-        root.success = success;
+    show_popup(result_kind, headline, detail) => {
+        root.result_kind = result_kind;
         root.headline = headline;
         root.detail = detail;
         popup_window.show();
