@@ -1,9 +1,9 @@
-﻿param()
+param()
 
 $ErrorActionPreference = 'Stop'
 
 Write-Host '============================================================'
-Write-Host ' KROKIET - CALIBRATION PROFILE MANAGEMENT VALIDATION'
+Write-Host ' KROKIET - CALIBRATION PROFILE SAFETY VALIDATION'
 Write-Host '============================================================'
 
 $files = @(
@@ -27,19 +27,20 @@ $tools = Get-Content '.\krokiet\ui\screens\tool_settings.slint' -Raw
 $callabler = Get-Content '.\krokiet\ui\globals\callabler.slint' -Raw
 $window = Get-Content '.\krokiet\ui\main_window.slint' -Raw
 $deletePopup = Get-Content '.\krokiet\ui\popups\popup_fast_calibration_delete.slint' -Raw
-$resultPopup = Get-Content '.\krokiet\ui\popups\popup_fast_calibration_result.slint' -Raw
 
 $checks = @(
-    @{ Data = $tools; Value = 'request_delete_fast_engine_calibration()'; Name = 'Delete button' },
-    @{ Data = $tools; Value = 'calibrate_fast_engine()'; Name = 'Recalibrate button' },
-    @{ Data = $callabler; Value = 'callback confirm_delete_fast_engine_calibration()'; Name = 'Confirmation callback' },
-    @{ Data = $window; Value = 'fast_calibration_delete_popup_window := PopupFastCalibrationDelete'; Name = 'Deletion popup in main window' },
-    @{ Data = $window; Value = 'Callabler.confirm_delete_fast_engine_calibration()'; Name = 'Confirm handler wired' },
-    @{ Data = $deletePopup; Value = 'confirm_requested()'; Name = 'Confirmation modal connected' },
-    @{ Data = $scan; Value = 'on_confirm_delete_fast_engine_calibration'; Name = 'Rust deletion handler connected' },
-    @{ Data = $scan; Value = 'keys.contains(&profile.storage_key)'; Name = 'Deletion scoped to selected volumes' },
-    @{ Data = $scan; Value = 'retained.upsert(profile.clone())'; Name = 'Other volume profiles retained' },
-    @{ Data = $resultPopup; Value = 'Calibracion eliminada'; Name = 'Deletion result state' }
+    @{ Data = $tools; Value = 'enabled: root.has_saved_fast_profile;'; Name = 'Delete button disabled without matching profile' },
+    @{ Data = $tools; Value = 'Callabler.has_fast_engine_calibration()'; Name = 'Button state refreshed' },
+    @{ Data = $callabler; Value = 'callback has_fast_engine_calibration() -> bool;'; Name = 'Availability callback declared' },
+    @{ Data = $scan; Value = 'on_has_fast_engine_calibration'; Name = 'Rust checks persisted profile availability' },
+    @{ Data = $scan; Value = 'saved_fast_storage_keys(&settings.included_paths)'; Name = 'Only persisted included profiles considered' },
+    @{ Data = $scan; Value = 'pending_preview.lock()'; Name = 'Confirmation snapshot stored' },
+    @{ Data = $scan; Value = 'pending_confirm.lock()'; Name = 'Confirmation required before deletion' },
+    @{ Data = $scan; Value = 'keys.contains(&profile.storage_key)'; Name = 'Only selected volumes deleted' },
+    @{ Data = $scan; Value = 'retained.upsert(profile.clone())'; Name = 'Other volumes preserved' },
+    @{ Data = $deletePopup; Value = 'text: "Cancelar";'; Name = 'Confirmation can be rejected' },
+    @{ Data = $deletePopup; Value = 'text: "Eliminar perfiles";'; Name = 'Explicit destructive confirmation' },
+    @{ Data = $window; Value = 'Callabler.confirm_delete_fast_engine_calibration()'; Name = 'Confirmation wired in main window' }
 )
 
 foreach ($check in $checks) {
@@ -61,4 +62,4 @@ Write-Host '[3/3] Legacy compilation'
 & .\kdev.ps1 check
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host 'CALIBRATION PROFILE MANAGEMENT VALIDATION: OK'
+Write-Host 'CALIBRATION PROFILE SAFETY VALIDATION: OK'

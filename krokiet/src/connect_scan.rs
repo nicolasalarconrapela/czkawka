@@ -608,10 +608,35 @@ where
 }
 
 
-/// Deletion is scoped to the storage IDs represented by the current included paths.
-/// Never delete the entire tuning store: profiles for other volumes must survive.
+/// Deletion is scoped to persisted profiles matching the included storage volumes.
+/// The confirmation list is a snapshot of actual saved profiles, not every included path.
 fn connect_fast_engine_profile_deletion(app: &MainWindow) {
+    #[cfg(feature = "fast_duplicates")]
+    let pending_delete = Arc::new(Mutex::new(None::<std::collections::BTreeSet<String>>));
+
+    let weak_check = app.as_weak();
+    app.global::<Callabler>()
+        .on_has_fast_engine_calibration(move || {
+            #[cfg(feature = "fast_duplicates")]
+            {
+                let Some(app) = weak_check.upgrade() else { return false; };
+                if app.get_scanning() || app.get_processing() {
+                    return false;
+                }
+                let settings = collect_settings(&app);
+                saved_fast_storage_keys(&settings.included_paths)
+                    .is_ok_and(|keys| !keys.is_empty())
+            }
+            #[cfg(not(feature = "fast_duplicates"))]
+            {
+                let _ = &weak_check;
+                false
+            }
+        });
+
     let weak_preview = app.as_weak();
+    #[cfg(feature = "fast_duplicates")]
+    let pending_preview = pending_delete.clone();
     app.global::<Callabler>()
         .on_request_delete_fast_engine_calibration(move || {
             let Some(app) = weak_preview.upgrade() else { return; };
@@ -629,26 +654,35 @@ fn connect_fast_engine_profile_deletion(app: &MainWindow) {
             }
             #[cfg(feature = "fast_duplicates")]
             {
+                // Discard any previous confirmation, including one cancelled in the UI.
+                if let Ok(mut pending) = pending_preview.lock() {
+                    *pending = None;
+                }
                 let settings = collect_settings(&app);
-                match included_fast_storage_keys(&settings.included_paths) {
-                    Ok(keys) => {
-                        if keys.is_empty() {
-                            app.invoke_show_error_popup(
-                                "Anade una ruta incluida antes de eliminar calibraciones.".into(),
-                            );
-                            return;
-                        }
+                match saved_fast_storage_keys(&settings.included_paths) {
+                    Ok(keys) if !keys.is_empty() => {
                         let description = keys.iter().cloned().collect::<Vec<_>>().join("\n");
+                        if let Ok(mut pending) = pending_preview.lock() {
+                            *pending = Some(keys.clone());
+                        }
                         app.invoke_show_fast_calibration_delete_popup(
-                            format!("Volumenes seleccionados ({}):\n{}", keys.len(), description).into(),
+                            format!(
+                                "Se eliminaran {} perfil(es) guardado(s):\n\n{}\n\nEsta accion no se puede deshacer. Los otros volumenes se conservaran.",
+                                keys.len(), description
+                            ).into(),
                         );
                     }
+                    Ok(_) => app.invoke_show_error_popup(
+                        "No hay perfiles de Fast Engine guardados para las rutas incluidas.".into(),
+                    ),
                     Err(error) => app.invoke_show_error_popup(error.into()),
                 }
             }
         });
 
     let weak_confirm = app.as_weak();
+    #[cfg(feature = "fast_duplicates")]
+    let pending_confirm = pending_delete;
     app.global::<Callabler>()
         .on_confirm_delete_fast_engine_calibration(move || {
             let Some(app) = weak_confirm.upgrade() else { return; };
@@ -666,12 +700,14 @@ fn connect_fast_engine_profile_deletion(app: &MainWindow) {
             }
             #[cfg(feature = "fast_duplicates")]
             {
-                let settings = collect_settings(&app);
+                // Confirmation is only valid following a preview. Never delete on
+                // a stray callback without a live snapshot of the selected profiles.
+                let keys = pending_confirm.lock().ok().and_then(|mut pending| pending.take());
+                let Some(keys) = keys else {
+                    app.invoke_show_error_popup("No hay ninguna eliminacion confirmada.".into());
+                    return;
+                };
                 let result = (|| -> Result<String, String> {
-                    let keys = included_fast_storage_keys(&settings.included_paths)?;
-                    if keys.is_empty() {
-                        return Err("No hay volumenes incluidos para eliminar.".to_string());
-                    }
                     let config = get_config_cache_path().ok_or_else(||
                         "No se pudo localizar la cache de Krokiet.".to_string()
                     )?;
@@ -687,13 +723,14 @@ fn connect_fast_engine_profile_deletion(app: &MainWindow) {
                             retained.upsert(profile.clone());
                         }
                     }
-                    if removed > 0 {
-                        retained.save(&store_path)
-                            .map_err(|error| format!("No se pudo guardar el perfil: {error}"))?;
+                    if removed == 0 {
+                        return Err("Los perfiles seleccionados ya no estan disponibles.".to_string());
                     }
+                    retained.save(&store_path)
+                        .map_err(|error| format!("No se pudo guardar el perfil: {error}"))?;
                     Ok(format!(
-                        "Perfiles eliminados: {removed}\nVolumenes seleccionados: {}\n\nRuta: {}\n\nPuedes ejecutar Calibrar / recalibrar Fast Engine.",
-                        keys.len(), store_path.display()
+                        "Perfiles eliminados: {removed}\n\nRuta: {}\n\nPuedes ejecutar Calibrar / recalibrar Fast Engine.",
+                        store_path.display()
                     ))
                 })();
 
@@ -702,7 +739,7 @@ fn connect_fast_engine_profile_deletion(app: &MainWindow) {
                         app.set_text_summary_text("Perfiles de calibracion actualizados".into());
                         app.global::<GuiState>().set_info_text(message.clone().into());
                         app.invoke_show_fast_calibration_result_popup(
-                            3, "Se han actualizado las calibraciones guardadas.".into(), message.into(),
+                            3, "Calibraciones eliminadas correctamente.".into(), message.into(),
                         );
                     }
                     Err(message) => {
@@ -714,6 +751,24 @@ fn connect_fast_engine_profile_deletion(app: &MainWindow) {
                 }
             }
         });
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn saved_fast_storage_keys(paths: &[PathBuf]) -> Result<std::collections::BTreeSet<String>, String> {
+    let keys = included_fast_storage_keys(paths)?;
+    if keys.is_empty() {
+        return Ok(keys);
+    }
+    let config = get_config_cache_path()
+        .ok_or_else(|| "No se pudo localizar la cache de Krokiet.".to_string())?;
+    let store_path = config.cache_folder.join("verifier-tuning.json");
+    let store = VerifierTuningStore::load(&store_path)
+        .map_err(|error| format!("No se pudo leer el perfil: {error}"))?;
+    Ok(store.profiles().iter()
+        .filter(|profile| keys.contains(&profile.storage_key)
+            && profile.stability != CalibrationStability::Invalid)
+        .map(|profile| profile.storage_key.clone())
+        .collect())
 }
 
 #[cfg(feature = "fast_duplicates")]

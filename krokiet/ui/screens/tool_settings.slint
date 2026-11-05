@@ -90,6 +90,21 @@ component SliderWrapper inherits HorizontalLayout {
 }
 
 export component ToolSettings {
+    private property <bool> has_saved_fast_profile: false;
+
+    // Refresh when the selected directories or persisted profiles change.
+    // Polling also catches changes performed by a separate tuning process.
+    calibration_profile_timer := Timer {
+        interval: 1500ms;
+        running: GuiState.active_tab == ActiveTab.DuplicateFiles;
+        triggered => {
+            root.has_saved_fast_profile = Callabler.has_fast_engine_calibration();
+        }
+    }
+
+    init => {
+        root.has_saved_fast_profile = Callabler.has_fast_engine_calibration();
+    }
     ScrollView {
         VerticalLayout {
             visible: GuiState.active_tab == ActiveTab.SimilarImages;
@@ -176,6 +191,7 @@ export component ToolSettings {
 
             Button {
                 text: "Eliminar calibracion Fast Engine";
+                enabled: root.has_saved_fast_profile;
                 clicked => {
                     Callabler.request_delete_fast_engine_calibration();
                 }
