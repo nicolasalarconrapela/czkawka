@@ -55,6 +55,7 @@ pub(crate) use tuning::{
     VerifierTuningFallbackReason, VerifierTuningPlan, VerifierTuningProfile,
     VerifierTuningResolution, VerifierTuningStore, SAFE_FALLBACK_WORKERS,
     calibrate_and_store, calibrate_and_store_mode, calibrate_and_store_readonly,
+    with_calibration_ui_control,
     calibrate_directory, calibrate_directory_readonly, find_writable_calibration_directory,
     resolve_scan_tuning_for_path, resolve_tuning_for_path, storage_key_for_path,
     tuning_plan_for_path,

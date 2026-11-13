@@ -59,7 +59,7 @@ use crate::shared_models::SharedModels;
 #[cfg(feature = "fast_duplicates")]
 use crate::duplicate_engine::{
     CalibrationMode, CalibrationOptions, CalibrationStability, VerifierTuningStore, calibrate_and_store_mode,
-    storage_key_for_path,
+    storage_key_for_path, with_calibration_ui_control,
 };
 use crate::{ActiveTab, Callabler, GuiState, MainWindow, ProgressToSend, SingleMainListModel, flk};
 
@@ -347,7 +347,7 @@ fn calibrate_fast_engine_paths(
     paths: &[PathBuf],
     store_path: &Path,
     event_loop: &slint::Weak<MainWindow>,
-    cancel_flag: &AtomicBool,
+    cancel_flag: &Arc<AtomicBool>,
 ) -> FastCalibrationOutcome {
     let mut storages = BTreeMap::<String, PathBuf>::new();
     let mut path_errors = Vec::new();
@@ -401,11 +401,28 @@ fn calibrate_fast_engine_paths(
             false,
         );
 
-        let calibration_result = calibrate_and_store_mode(
-            &directory,
-            store_path,
-            CalibrationOptions::default(),
-            CalibrationMode::Auto,
+        let current_event_loop = event_loop.clone();
+        let progress_storage_key = storage_key.clone();
+        let progress_directory = directory.clone();
+        let calibration_result = with_calibration_ui_control(
+            Arc::clone(cancel_flag),
+            move |percent, stage| {
+                publish_fast_calibration_stage_progress(
+                    &current_event_loop,
+                    index,
+                    total_storages,
+                    &progress_storage_key,
+                    &progress_directory,
+                    percent,
+                    stage,
+                );
+            },
+            || calibrate_and_store_mode(
+                &directory,
+                store_path,
+                CalibrationOptions::default(),
+                CalibrationMode::Auto,
+            ),
         );
 
         if cancel_flag.load(Ordering::Relaxed) {
@@ -429,6 +446,12 @@ fn calibrate_fast_engine_paths(
                 "{} -> calibracion inestable ({} worker(s), no se guarda como perfil util)",
                 storage_key, run.report.profile.workers
             )),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                return FastCalibrationOutcome::Cancelled(format!(
+                    "Cancelada durante el volumen {}/{}. No se conservaron cambios nuevos en el perfil.",
+                    index + 1, total_storages
+                ));
+            }
             Err(error) => failures.push(format!("{storage_key} -> {error}")),
         }
 
@@ -462,6 +485,35 @@ fn calibrate_fast_engine_paths(
 
     message.push_str(&format!("\n\nPerfil: {}", store_path.display()));
     FastCalibrationOutcome::Completed(message)
+}
+
+#[cfg(feature = "fast_duplicates")]
+fn publish_fast_calibration_stage_progress(
+    event_loop: &slint::Weak<MainWindow>,
+    completed_storages: usize,
+    total_storages: usize,
+    storage_key: &str,
+    directory: &Path,
+    percent: i32,
+    stage: &str,
+) {
+    let total = total_storages.max(1);
+    let global_percent = ((completed_storages.saturating_mul(100)
+        + percent.clamp(0, 99) as usize) / total).min(99) as i32;
+    let status = format!(
+        "Fast Engine - volumen {}/{}: {stage}", completed_storages + 1, total
+    );
+    let detail = format!("{} - {storage_key}", directory.display());
+    let _ = event_loop.upgrade_in_event_loop(move |app| {
+        app.set_progress_datas(ProgressToSend {
+            all_progress: global_percent,
+            current_progress: -1,
+            current_progress_size: -1,
+            step_name: status.clone().into(),
+        });
+        app.set_text_summary_text(status.clone().into());
+        app.invoke_update_fast_calibration_popup(status.into(), detail.into(), global_percent);
+    });
 }
 
 #[cfg(feature = "fast_duplicates")]

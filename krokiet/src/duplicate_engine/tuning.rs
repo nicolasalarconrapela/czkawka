@@ -889,6 +889,8 @@ pub(crate) fn calibrate_and_store_mode(
     options: CalibrationOptions,
     mode: CalibrationMode,
 ) -> io::Result<CalibrationRun> {
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(2, "Identificando almacenamiento");
     validate_options(options)?;
     let canonical = fs::canonicalize(directory)?;
     if !fs::metadata(&canonical)?.is_dir() {
@@ -989,6 +991,8 @@ where
     F: FnOnce(&Path, CalibrationOptions) -> io::Result<CalibrationReport>,
 {
     let report = calibrate(directory, options)?;
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(96, "Guardando perfil");
     if report.profile.stability == CalibrationStability::Invalid {
         return Err(io::Error::other(
             "verifier calibration is too unstable; profile was not stored",
@@ -997,6 +1001,7 @@ where
 
     let mut store = VerifierTuningStore::load(store_path)?;
     if store.upsert_calibrated_if_preferred(report.profile.clone()) {
+        calibration_ui_checkpoint()?;
         store.save(store_path)?;
     }
     Ok(report)
@@ -1016,12 +1021,15 @@ where
     F: FnOnce(&Path, CalibrationOptions) -> io::Result<CalibrationReport>,
 {
     let report = calibrate(directory, options)?;
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(96, "Guardando perfil");
     if report.profile.stability == CalibrationStability::Invalid {
         return Ok((report, CalibrationPersistence::InvalidNotStored));
     }
 
     let mut store = VerifierTuningStore::load(store_path)?;
     if store.upsert_calibrated_if_preferred(report.profile.clone()) {
+        calibration_ui_checkpoint()?;
         store.save(store_path)?;
         return Ok((report, CalibrationPersistence::Stored));
     }
@@ -1247,6 +1255,8 @@ fn calibrate_directory_with_executor_factory<F>(
 where
     F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
 {
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(4, "Preparando archivos de medicion");
     let calibrated_path = canonical_calibration_directory(directory)?;
     let (logical_cpus, candidates) = calibration_shape(options);
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
@@ -1276,6 +1286,8 @@ fn calibrate_directory_readonly_with_executor_factory<F>(
 where
     F: FnMut(usize) -> io::Result<ExactVerifierExecutor>,
 {
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(4, "Preparando archivos de medicion");
     let calibrated_path = canonical_calibration_directory(directory)?;
     let (logical_cpus, candidates) = calibration_shape(options);
     let largest_candidate = candidates.iter().copied().max().unwrap_or(1);
@@ -1310,6 +1322,7 @@ where
 {
     let mut executors = HashMap::with_capacity(candidates.len());
     for &workers in &candidates {
+        calibration_ui_checkpoint()?;
         let executor = make_executor(workers).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -1319,6 +1332,8 @@ where
         executors.insert(workers, executor);
     }
 
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(8, "Calentamiento ExactVerifier");
     let mut warm = dataset.result.clone();
     executors
         .get(&1)
@@ -1329,6 +1344,8 @@ where
     let storage_key = storage_key_for_path(calibrated_path).map_err(|error| {
         io::Error::new(error.kind(), format!("stage=identify-calibration-storage: {error}"))
     })?;
+    calibration_ui_checkpoint()?;
+    calibration_ui_begin_pass(false, candidates.len(), options);
     let initial_report = run_calibration_pass(
         calibrated_path,
         &storage_key,
@@ -1348,6 +1365,8 @@ where
     rescue_options.target_sample_time = rescue_target_sample_time(options.target_sample_time);
     rescue_options.pair_rounds = rescue_pair_rounds(options.pair_rounds);
 
+    calibration_ui_checkpoint()?;
+    calibration_ui_begin_pass(true, candidates.len(), rescue_options);
     let mut rescue_report = run_calibration_pass(
         calibrated_path,
         &storage_key,
@@ -1590,6 +1609,7 @@ fn measure_candidate_window(
     let mut verification_runs = 0_usize;
 
     while verification_runs == 0 || measured < target_sample_time {
+        calibration_ui_checkpoint()?;
         // Result cloning is intentionally outside the timed verifier interval.
         let mut result = dataset.result.clone();
         let started = Instant::now();
@@ -1611,6 +1631,7 @@ fn measure_candidate_window(
     let normalized = Duration::from_secs_f64(
         measured.as_secs_f64() / verification_runs.max(1) as f64,
     );
+    calibration_ui_measured_window();
     Ok((normalized, verification_runs))
 }
 
@@ -2224,6 +2245,7 @@ impl CalibrationDataset {
         let mut groups = Vec::with_capacity(group_count);
 
         for group_index in 0..group_count {
+            calibration_ui_checkpoint()?;
             let left = root.join(format!("group-{group_index:03}-a.bin"));
             let right = root.join(format!("group-{group_index:03}-b.bin"));
             write_identical_pair(
@@ -2284,6 +2306,7 @@ impl CalibrationDataset {
         let mut bytes_per_run = 0_u64;
 
         for (path, size) in candidates {
+            calibration_ui_checkpoint()?;
             // Using the same existing path twice is intentional. The exact verifier
             // opens two independent read handles and performs its normal byte loop,
             // while the calibration remains strictly read-only and does not require
@@ -2360,6 +2383,7 @@ fn collect_readonly_files(
     let mut files = Vec::new();
 
     while let Some(directory) = pending.pop() {
+        calibration_ui_checkpoint()?;
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
@@ -2369,6 +2393,7 @@ fn collect_readonly_files(
         entries.sort_by_key(|entry| entry.path());
 
         for entry in entries {
+            calibration_ui_checkpoint()?;
             if files.len() >= READONLY_MAX_DISCOVERED_FILES {
                 return Ok(files);
             }
@@ -2446,6 +2471,7 @@ fn write_identical_pair(left: &Path, right: &Path, size: u64, seed: u64) -> io::
     let mut remaining = size;
 
     while remaining > 0 {
+        calibration_ui_checkpoint()?;
         let amount = remaining.min(WRITE_BUFFER as u64) as usize;
         fill_pseudorandom(&mut buffer[..amount], &mut state);
         left_writer.write_all(&buffer[..amount])?;
@@ -3894,5 +3920,156 @@ mod tests {
             println!("Perfil        : GUARDABLE");
         }
         println!("============================================================");
+    }
+}
+
+
+// GUI instrumentation is intentionally thread-local: scan and CLI callers retain
+// their existing behavior without requiring a cancellation parameter everywhere.
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct CalibrationUiContext {
+    cancelled: Arc<AtomicBool>,
+    notify: Box<dyn Fn(i32, &'static str)>,
+    last_percent: i32,
+    start: i32,
+    span: i32,
+    completed: u64,
+    estimated_total: u64,
+}
+
+thread_local! {
+    static CALIBRATION_UI_CONTEXT: RefCell<Option<CalibrationUiContext>> = const { RefCell::new(None) };
+}
+
+struct CalibrationUiGuard(Option<CalibrationUiContext>);
+impl Drop for CalibrationUiGuard {
+    fn drop(&mut self) {
+        CALIBRATION_UI_CONTEXT.with(|slot| { *slot.borrow_mut() = self.0.take(); });
+    }
+}
+
+pub(crate) fn with_calibration_ui_control<T>(
+    cancelled: Arc<AtomicBool>,
+    notify: impl Fn(i32, &'static str) + 'static,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let previous = CALIBRATION_UI_CONTEXT.with(|slot| slot.replace(Some(CalibrationUiContext {
+        cancelled,
+        notify: Box::new(notify),
+        last_percent: 0,
+        start: 10,
+        span: 55,
+        completed: 0,
+        estimated_total: 1,
+    })));
+    let _guard = CalibrationUiGuard(previous);
+    calibration_ui_checkpoint()?;
+    calibration_ui_progress(0, "Preparando calibracion");
+    operation()
+}
+
+fn calibration_ui_checkpoint() -> io::Result<()> {
+    let cancelled = CALIBRATION_UI_CONTEXT.with(|slot| {
+        slot.borrow().as_ref().map(|ctx| Arc::clone(&ctx.cancelled))
+    });
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "calibration cancelled by user"));
+    }
+    Ok(())
+}
+
+fn calibration_ui_progress(value: i32, stage: &'static str) {
+    CALIBRATION_UI_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            let pct = value.max(ctx.last_percent).min(99);
+            ctx.last_percent = pct;
+            (ctx.notify)(pct, stage);
+        }
+    });
+}
+
+fn calibration_ui_begin_pass(rescue: bool, candidates: usize, options: CalibrationOptions) {
+    CALIBRATION_UI_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            ctx.start = if rescue { 70 } else { 10 };
+            ctx.span = if rescue { 24 } else { 59 };
+            ctx.completed = 0;
+            // Upper estimate; actual rechecks/pairwise may be skipped.
+            ctx.estimated_total = candidates.saturating_mul(options.rounds)
+                .saturating_add(candidates.saturating_mul(options.recheck_rounds))
+                .saturating_add(candidates.saturating_sub(1)
+                    .saturating_mul(options.pair_rounds).saturating_mul(2))
+                .max(1) as u64;
+        }
+    });
+    calibration_ui_progress(if rescue { 70 } else { 10 },
+        if rescue { "Rescate de calibracion" } else { "Mediciones iniciales" });
+}
+
+fn calibration_ui_measured_window() {
+    CALIBRATION_UI_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            ctx.completed = ctx.completed.saturating_add(1);
+            let fraction = ctx.completed.saturating_mul(ctx.span as u64) / ctx.estimated_total;
+            let pct = ctx.start.saturating_add(fraction.min(ctx.span as u64) as i32)
+                .max(ctx.last_percent).min(94);
+            // Avoid flooding Slint with notifications for unchanged percentages.
+            if pct > ctx.last_percent {
+                ctx.last_percent = pct;
+                (ctx.notify)(pct, "Medicion ExactVerifier completada");
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod cooperative_ui_tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn cancel_produces_interrupted_and_restores_context() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let error = with_calibration_ui_control(flag, |_, _| {}, calibration_ui_checkpoint)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(calibration_ui_checkpoint().is_ok());
+    }
+
+    #[test]
+    fn progress_is_monotonic_and_never_reaches_100() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&observed);
+        with_calibration_ui_control(flag, move |pct, _| captured.borrow_mut().push(pct), || {
+            calibration_ui_begin_pass(false, 2, CalibrationOptions::default());
+            for _ in 0..100 { calibration_ui_measured_window(); }
+            calibration_ui_begin_pass(true, 2, CalibrationOptions::default());
+            calibration_ui_measured_window();
+            calibration_ui_progress(96, "Guardando perfil");
+            Ok(())
+        }).unwrap();
+        let data = observed.borrow();
+        assert!(data.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(data.iter().all(|pct| (0..=99).contains(pct)));
+    }
+
+    #[test]
+    fn cancellation_stops_persistence_before_writing_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("profile.json");
+        let flag = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&flag);
+        let result = with_calibration_ui_control(flag, move |_, _| { signal.store(true, Ordering::Relaxed); }, || {
+            calibration_ui_progress(96, "Guardando perfil");
+            calibration_ui_checkpoint()?;
+            fs::write(&store, b"should not exist")?;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!tmp.path().join("profile.json").exists());
     }
 }

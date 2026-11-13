@@ -11,8 +11,6 @@ export component PopupFastCalibration inherits Rectangle {
     private property <string> status_text: "";
     private property <string> detail_text: "";
     private property <int> progress_percent: 0;
-    private property <int> visual_progress: 0;
-    private property <bool> running: false;
     private property <bool> cancelling: false;
 
     private property <length> popup_width: min(520px, root.width - 30px);
@@ -39,7 +37,6 @@ export component PopupFastCalibration inherits Rectangle {
                     vertical-stretch: 0;
                     min-height: 42px;
                     background: ColorPalette.popup_background_title_line;
-
                     Text {
                         width: parent.width;
                         height: parent.height;
@@ -53,50 +50,43 @@ export component PopupFastCalibration inherits Rectangle {
                 VerticalLayout {
                     padding: 18px;
                     spacing: 14px;
-
                     Text {
                         text: root.status_text;
                         font-size: FontSizes.normal;
                         horizontal-alignment: TextHorizontalAlignment.center;
                         wrap: TextWrap.word-wrap;
                     }
-
                     Text {
                         text: root.detail_text;
                         font-size: FontSizes.small;
                         horizontal-alignment: TextHorizontalAlignment.center;
                         wrap: TextWrap.word-wrap;
                     }
-
                     ProgressIndicator {
                         height: 12px;
-                        progress: max(0, min(100, root.visual_progress)) / 100.0;
+                        progress: max(0, min(100, root.progress_percent)) / 100.0;
                     }
-
                     Text {
-                        text: root.visual_progress >= 100 ? "100%" : root.visual_progress + "% (estimado)";
+                        text: root.progress_percent + "% (mediciones estimadas)";
                         font-size: FontSizes.normal;
                         horizontal-alignment: TextHorizontalAlignment.center;
                     }
-
                     Text {
-                        text: "La calibracion esta midiendo el rendimiento del verificador. No cierres Krokiet hasta que termine.";
+                        text: "El avance se calcula a partir de mediciones completadas; puede acelerarse al cerrar cada etapa.";
                         font-size: FontSizes.small;
                         horizontal-alignment: TextHorizontalAlignment.center;
                         wrap: TextWrap.word-wrap;
                     }
-
                     HorizontalLayout {
                         spacing: 10px;
                         Rectangle { horizontal-stretch: 1; }
-
                         Button {
                             enabled: !root.cancelling;
                             text: root.cancelling ? "Cancelando..." : "Cancelar";
                             clicked => {
                                 root.cancelling = true;
                                 root.status_text = "Cancelando calibracion...";
-                                root.detail_text = "La cancelacion se aplicara en cuanto termine la medicion segura en curso.";
+                                root.detail_text = "Se detendra al finalizar la verificacion activa.";
                                 root.cancel_requested();
                             }
                         }
@@ -106,44 +96,23 @@ export component PopupFastCalibration inherits Rectangle {
         }
     }
 
-    timer := Timer {
-        interval: 500ms;
-        running: root.running && !root.cancelling;
-        triggered => {
-            if (root.progress_percent >= 100) {
-                root.visual_progress = 100;
-            } else if (root.visual_progress < 80) {
-                root.visual_progress += 2;
-            } else if (root.visual_progress < 95) {
-                root.visual_progress += 1;
-            }
-        }
-    }
-
     show_popup(status, detail, progress) => {
         root.status_text = status;
         root.detail_text = detail;
         root.progress_percent = progress;
-        root.visual_progress = max(0, progress);
         root.cancelling = false;
-        root.running = true;
         popup_window.show();
     }
 
     update_popup(status, detail, progress) => {
-        root.status_text = status;
-        root.detail_text = detail;
-        root.progress_percent = progress;
-        if (progress > root.visual_progress) {
-            root.visual_progress = progress;
-        }
-        if (progress >= 100) {
-            root.visual_progress = 100;
+        if (!root.cancelling) {
+            root.status_text = status;
+            root.detail_text = detail;
+            root.progress_percent = max(root.progress_percent, progress);
         }
     }
 
     close_popup => {
-        root.running = false;
         root.cancelling = false;
         popup_window.close();
     }
